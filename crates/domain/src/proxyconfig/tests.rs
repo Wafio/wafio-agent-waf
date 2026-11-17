@@ -221,6 +221,6 @@ fn decoder_semantics() {
     let e = parse_proxy_config(br#"{"timeouts":{"connect_ms":"x"}}"#).unwrap_err();
     assert_eq!(
         e.0,
-        "proxy_config: json: cannot unmarshal string into Go struct field ProxyConfig.timeouts.connect_ms of type int"
+        "proxy_config: timeouts.connect_ms: expected an integer, got a string"
     );
 }

@@ -2,7 +2,7 @@
 //! URL parser for the parts the origin check reads (bytetext has no URL parser).
 
 use crate::ip_address::parse_ip_address;
-use crate::json_text::{self, Value, key_matches};
+use crate::json_text::{self, Value, key_matches, type_mismatch_text};
 use crate::text_helpers::{quote, to_lowercase, trim_whitespace};
 
 /// A websocket section error (user-facing message).
@@ -54,13 +54,7 @@ fn decode_rules(members: &[(Vec<u8>, Value)]) -> Result<WebSocketRules, String> 
     let mut first: Option<String> = None;
     let mut type_err = |v: &Value, field: &str, ty: &str| {
         if first.is_none() {
-            let what = match v {
-                Value::Number(n) => format!("number {}", String::from_utf8_lossy(n)),
-                o => o.type_name().to_string(),
-            };
-            first = Some(format!(
-                "json: cannot unmarshal {what} into Go struct field .{field} of type {ty}"
-            ));
+            first = Some(type_mismatch_text(field, &v.kind_text(), ty));
         }
     };
     let int =
@@ -210,8 +204,8 @@ pub fn check_websocket_rules(data: &[u8]) -> Result<(), WebSocketConfigError> {
         Value::Object(m) => m,
         other => {
             return fail(format!(
-                "websocket: invalid rules_json: json: cannot unmarshal {} into Go value of type map[string]json.RawMessage",
-                other.type_name()
+                "websocket: invalid rules_json: {}",
+                type_mismatch_text("", other.type_name(), "object")
             ));
         }
     };

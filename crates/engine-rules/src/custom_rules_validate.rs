@@ -362,7 +362,7 @@ pub fn check_tuning_rule(t: &TuningRule) -> Result<(), String> {
         "" | "semantic" | "crs" | "both"
     ) {
         return Err(format!(
-            "invalid engine {} (semantic|crs|both)",
+            "invalid engine {} (semantic)",
             quote(t.engine.as_bytes())
         ));
     }

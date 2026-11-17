@@ -8,7 +8,7 @@ use crate::iprep::{
     to_ipv4_octets,
 };
 use std::sync::{Arc, RwLock};
-use wafio_domain::json_text::{Value, key_matches, parse};
+use wafio_domain::json_text::{Value, key_matches, parse, type_mismatch_text};
 
 pub struct BotRangeSource {
     pub name: &'static str,
@@ -107,10 +107,7 @@ pub fn parse_bot_ip_ranges(body: &[u8]) -> Result<Vec<AddressRange>, String> {
         return if doc == Value::Null {
             Ok(ranges)
         } else {
-            Err(format!(
-                "json: cannot unmarshal {} into Go value",
-                doc.type_name()
-            ))
+            Err(type_mismatch_text("", doc.type_name(), "object"))
         };
     };
     let mut prefixes: Option<&Vec<Value>> = None;
@@ -119,7 +116,13 @@ pub fn parse_bot_ip_ranges(body: &[u8]) -> Result<Vec<AddressRange>, String> {
             match v {
                 Value::Array(a) => prefixes = Some(a),
                 Value::Null => prefixes = None,
-                _ => return Err("json: cannot unmarshal into prefixes".into()),
+                other => {
+                    return Err(type_mismatch_text(
+                        "prefixes",
+                        other.type_name(),
+                        "[]object",
+                    ));
+                }
             }
         }
     }
@@ -133,13 +136,22 @@ pub fn parse_bot_ip_ranges(body: &[u8]) -> Result<Vec<AddressRange>, String> {
                         match v {
                             Value::String(s) if key_matches(k, "ipv4Prefix") => v4 = s,
                             Value::String(_) | Value::Null => {}
-                            _ => err = Some("json: cannot unmarshal into prefix".to_string()),
+                            _ => {
+                                let name = if key_matches(k, "ipv4Prefix") {
+                                    "prefixes.ipv4Prefix"
+                                } else {
+                                    "prefixes.ipv6Prefix"
+                                };
+                                err = Some(type_mismatch_text(name, &v.kind_text(), "string"));
+                            }
                         }
                     }
                 }
             }
             Value::Null => {}
-            _ => err = Some("json: cannot unmarshal into prefix".to_string()),
+            other => {
+                err = Some(type_mismatch_text("prefixes", &other.kind_text(), "object"));
+            }
         }
         if v4.is_empty() {
             continue;

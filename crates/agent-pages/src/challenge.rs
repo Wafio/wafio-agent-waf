@@ -8,7 +8,7 @@ use crate::seeded_rng::SeededRng;
 use crate::templates as t;
 use wafio_bytetext::html::escape as html_escape;
 use wafio_bytetext::pattern::{CompiledRegex, escape_regex_meta};
-use wafio_domain::json_text::{Value, key_matches, parse};
+use wafio_domain::json_text::{Value, key_matches, parse, type_mismatch_text};
 
 pub const CHALLENGE_TYPE_JS: &str = "js_challenge";
 pub const CHALLENGE_TYPE_TURNSTILE: &str = "turnstile";
@@ -85,18 +85,15 @@ pub struct ChallengeSettings {
 
 // Decoding and defaults
 
-fn type_mismatch_message(field: &str, v: &Value) -> String {
-    format!(
-        "json: cannot unmarshal {} into Go struct field ChallengeConfig.{field}",
-        v.type_name()
-    )
+fn type_mismatch_message(field: &str, v: &Value, ty: &str) -> String {
+    type_mismatch_text(field, &v.kind_text(), ty)
 }
 
 fn set_bool(dst: &mut bool, field: &str, v: &Value) -> Result<(), String> {
     match v {
         Value::Bool(b) => *dst = *b,
         Value::Null => {}
-        _ => return Err(type_mismatch_message(field, v)),
+        _ => return Err(type_mismatch_message(field, v, "bool")),
     }
     Ok(())
 }
@@ -105,7 +102,7 @@ fn set_string(dst: &mut String, field: &str, v: &Value) -> Result<(), String> {
     match v {
         Value::String(s) => *dst = String::from_utf8_lossy(s).into_owned(),
         Value::Null => {}
-        _ => return Err(type_mismatch_message(field, v)),
+        _ => return Err(type_mismatch_message(field, v, "string")),
     }
     Ok(())
 }
@@ -113,10 +110,10 @@ fn set_string(dst: &mut String, field: &str, v: &Value) -> Result<(), String> {
 fn set_int(dst: &mut i64, field: &str, v: &Value) -> Result<(), String> {
     match v {
         Value::Number(n) => {
-            *dst = parse_int(n, 10).ok_or_else(|| type_mismatch_message(field, v))?
+            *dst = parse_int(n, 10).ok_or_else(|| type_mismatch_message(field, v, "int"))?
         }
         Value::Null => {}
-        _ => return Err(type_mismatch_message(field, v)),
+        _ => return Err(type_mismatch_message(field, v, "int")),
     }
     Ok(())
 }
@@ -131,10 +128,7 @@ impl ChallengeSettings {
             Value::Object(f) => f,
             Value::Null => return Ok(c),
             _ => {
-                return Err(format!(
-                    "json: cannot unmarshal {} into Go value of type engine.ChallengeConfig",
-                    doc.type_name()
-                ));
+                return Err(type_mismatch_text("", doc.type_name(), "object"));
             }
         };
         let mut first_err = None;
@@ -180,7 +174,7 @@ impl ChallengeSettings {
                             c.allow_local_ips = None;
                             Ok(())
                         }
-                        _ => Err(type_mismatch_message("allow_local_ips", v)),
+                        _ => Err(type_mismatch_message("allow_local_ips", v, "bool")),
                     };
                 }
                 b!("ip_rep_enabled", ip_rep_enabled);
@@ -204,7 +198,7 @@ impl ChallengeSettings {
                             c.good_bot_allowlist = Vec::new();
                             Ok(())
                         }
-                        _ => Err(type_mismatch_message("good_bot_allowlist", v)),
+                        _ => Err(type_mismatch_message("good_bot_allowlist", v, "[]string")),
                     };
                 }
                 s!("custom_js_challenge_html", custom_js_challenge_html);
@@ -980,9 +974,9 @@ pub(crate) fn fill_format_template(format: &str, args: &[&[u8]]) -> Vec<u8> {
             match f[i + 1] {
                 b'%' => out.push(b'%'),
                 b's' | b'd' | b'q' => {
-                    out.extend_from_slice(next.next().expect("sprintf: missing argument"))
+                    out.extend_from_slice(next.next().expect("page template: missing argument"))
                 }
-                c => panic!("sprintf: unsupported verb %{}", c as char),
+                c => panic!("page template: unsupported verb %{}", c as char),
             }
             i += 2;
             continue;

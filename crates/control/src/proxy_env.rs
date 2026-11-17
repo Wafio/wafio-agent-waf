@@ -436,7 +436,7 @@ async fn read_head<S: AsyncRead + Unpin>(io: &mut S) -> Result<String, TunnelErr
     while !(head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n")) {
         if head.len() >= MAX {
             return Err(TunnelError::Io(
-                "http: server response headers exceeded 65536 bytes".into(),
+                "server response headers exceeded 65536 bytes".into(),
             ));
         }
         match io.read(&mut b).await.map_err(io_error)? {

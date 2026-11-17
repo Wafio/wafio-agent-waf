@@ -736,41 +736,33 @@ async fn undecodable_bundles_are_acked_with_the_decoder_error_text() {
     };
     for (json, want) in [
         (r#"{"apps":"#, "unexpected end of JSON input"),
-        (
-            "[1,2]",
-            "json: cannot unmarshal array into Go value of type agent.Bundle",
-        ),
+        ("[1,2]", "expected an object, got an array"),
         (
             r#"{"generation":"3"}"#,
-            "json: cannot unmarshal string into Go struct field Bundle.generation of type int64",
+            "generation: expected an integer, got a string",
         ),
         (
             r#"{"generation":1.5}"#,
-            "json: cannot unmarshal number 1.5 into Go struct field Bundle.generation of type int64",
+            "generation: expected an integer, got the number 1.5",
         ),
         (
             r#"{"management_only":1}"#,
-            "json: cannot unmarshal number into Go struct field Bundle.management_only of type bool",
+            "management_only: expected true or false, got a number",
         ),
-        (
-            r#"{"apps":[1]}"#,
-            "json: cannot unmarshal number into Go struct field Bundle.apps of type agent.BundleApp",
-        ),
+        (r#"{"apps":[1]}"#, "apps: expected an object, got a number"),
         (
             r#"{"unblock_entries":{}}"#,
-            "json: cannot unmarshal object into Go struct field Bundle.unblock_entries of type []agent.UnblockEntry",
+            "unblock_entries: expected an array, got an object",
         ),
     ] {
         assert_eq!(refuse("probe", json).await, want, "{json}");
     }
     // The first error of the document is reported: the app's own field, not the later element.
-    *sink.check_error.lock().unwrap() = Some(
-        "json: cannot unmarshal string into Go struct field BundleApp.apps.listen_port of type int"
-            .into(),
-    );
+    *sink.check_error.lock().unwrap() =
+        Some("apps.listen_port: expected an integer, got a string".into());
     assert_eq!(
         refuse("full", r#"{"apps":[{"listen_port":"80"},1]}"#).await,
-        "json: cannot unmarshal string into Go struct field BundleApp.apps.listen_port of type int"
+        "apps.listen_port: expected an integer, got a string"
     );
     assert!(sink.applied.lock().unwrap().is_empty());
     assert_eq!(link.bundle_status(), (String::new(), 0));

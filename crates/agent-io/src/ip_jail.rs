@@ -143,7 +143,7 @@ fn http_post_via(
         && matches!(p.scheme.as_str(), "https" | "socks5" | "socks5h")
     {
         return Err(format!(
-            "Post {}: proxyconnect tcp: {} proxies are not supported by the jail client",
+            "Post {}: connect to proxy: {} proxies are not supported by the jail client",
             quoted(),
             p.scheme
         ));
@@ -189,7 +189,8 @@ fn http_post_via(
         .unwrap_or_default();
     req.extend_from_slice(
         format!(
-            " HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Go-http-client/1.1\r\nContent-Length: {}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{proxy_auth}Connection: close\r\n\r\n",
+            " HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {}\r\nContent-Length: {}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{proxy_auth}Connection: close\r\n\r\n",
+            crate::user_agent(),
             body.len()
         )
         .as_bytes(),

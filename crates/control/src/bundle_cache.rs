@@ -411,19 +411,19 @@ mod tests {
         for (content, want) in [
             (
                 r#"{"version":"1"}"#.to_string(),
-                "decode cache envelope: json: cannot unmarshal string into Go struct field bundleCacheEnvelope.version of type int",
+                "decode cache envelope: version: expected an integer, got a string",
             ),
             (
                 "[1]".into(),
-                "decode cache envelope: json: cannot unmarshal array into Go value of type agent.bundleCacheEnvelope",
+                "decode cache envelope: expected an object, got an array",
             ),
             (
                 r#"{"generation":1.5}"#.into(),
-                "decode cache envelope: json: cannot unmarshal number 1.5 into Go struct field bundleCacheEnvelope.generation of type int64",
+                "decode cache envelope: generation: expected an integer, got the number 1.5",
             ),
             (
                 r#"{"saved_at":5}"#.into(),
-                "decode cache envelope: Time.UnmarshalJSON: input is not a JSON string",
+                "decode cache envelope: expected a string with a timestamp",
             ),
             (
                 "{\"version\":1".into(),
@@ -431,11 +431,11 @@ mod tests {
             ),
             (
                 env(r#"{"generation":"3"}"#),
-                "decode cached bundle: json: cannot unmarshal string into Go struct field Bundle.generation of type int64",
+                "decode cached bundle: generation: expected an integer, got a string",
             ),
             (
                 env("[1]"),
-                "decode cached bundle: json: cannot unmarshal array into Go value of type agent.Bundle",
+                "decode cached bundle: expected an object, got an array",
             ),
         ] {
             std::fs::write(&path, &content).unwrap();

@@ -1,7 +1,7 @@
 //! The per-app `websocket` block of an app's rules_json (agent-side only). Key absent → interception
 //! ON with default limits and no origin check.
 
-use wafio_domain::json_text::Value;
+use wafio_domain::json_text::{Value, type_mismatch_text};
 use wafio_domain::text_helpers::{eq_ignore_case, trim_whitespace};
 
 use crate::url_parse;
@@ -78,26 +78,18 @@ pub fn parse_ws_app_policy(rules_json: &[u8]) -> Result<WsAppPolicy, String> {
                 ],
             ) {
                 match i {
-                    0 => d.opt_bool_into(v, &mut enabled, "wsAppConfigRaw.enabled"),
+                    0 => d.opt_bool_into(v, &mut enabled, "enabled"),
                     1 => decode_origin_check(&mut d, v, &mut origin_check),
                     2 => decode_limits(&mut d, v, &mut limits),
-                    3 => d.bool_into(
-                        v,
-                        &mut cfg.scan_binary_hashes,
-                        "wsAppConfigRaw.scan_binary_hashes",
-                    ),
-                    _ => d.bool_into(
-                        v,
-                        &mut cfg.scan_server_frames,
-                        "wsAppConfigRaw.scan_server_frames",
-                    ),
+                    3 => d.bool_into(v, &mut cfg.scan_binary_hashes, "scan_binary_hashes"),
+                    _ => d.bool_into(v, &mut cfg.scan_server_frames, "scan_server_frames"),
                 }
             }
         }
         other => {
             return Err(format!(
-                "websocket: json: cannot unmarshal {} into Go value of type agent.wsAppConfigRaw",
-                other.type_name()
+                "websocket: {}",
+                type_mismatch_text("", other.type_name(), "object")
             ));
         }
     }

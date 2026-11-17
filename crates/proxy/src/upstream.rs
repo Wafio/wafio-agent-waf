@@ -412,7 +412,7 @@ async fn exchange(
         if interim >= INTERIM_RESPONSE_LIMIT {
             return Err(Error::explain(
                 ErrorType::InvalidHTTPHeader,
-                "fasthttp: too many 1xx informational responses received",
+                "too many 1xx informational responses received",
             ));
         }
         interim += 1;

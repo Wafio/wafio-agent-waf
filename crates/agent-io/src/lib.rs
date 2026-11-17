@@ -17,3 +17,14 @@ pub mod websocket_config;
 pub mod ws_config;
 pub mod ws_frame;
 pub mod ws_scanner;
+
+/// The version the build stamped through `WAFIO_AGENT_VERSION`; `dev` when it did not.
+pub const AGENT_VERSION: &str = match option_env!("WAFIO_AGENT_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
+
+/// The `User-Agent` of the requests the agent makes on its own.
+pub fn user_agent() -> String {
+    format!("wafio-waf-agent/{AGENT_VERSION}")
+}

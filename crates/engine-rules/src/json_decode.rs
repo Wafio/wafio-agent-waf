@@ -1,16 +1,17 @@
 //! The control plane's JSON decoding semantics over `wafio_domain::json_text::Value`, for the
 //! hand-written decoders of the rules structs: syntax errors with the control plane's scanner
 //! messages, struct keys matched exactly then case-insensitively, a repeated key decoded into the
-//! same field (merge), type errors saved and decoding continued (first one reported, with its
-//! `Struct.field` context), errors returned by a field's own decoder aborting the decode.
+//! same field (merge), type errors saved and decoding continued (first one reported, with the
+//! JSON path of its field), errors returned by a field's own decoder aborting the decode.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 pub use wafio_domain::json_text::Value;
+use wafio_domain::json_text::type_mismatch_text;
 use wafio_domain::text_helpers::eq_ignore_case;
 
-/// A JSON decode error; its message is the text the control plane's decoder prints.
+/// A JSON decode error and its message.
 #[derive(Clone, Debug, PartialEq)]
 pub enum JsonDecodeError {
     /// A syntax error.
@@ -32,22 +33,10 @@ impl fmt::Display for JsonDecodeError {
             JsonDecodeError::Syntax(m) | JsonDecodeError::Message(m) => f.write_str(m),
             JsonDecodeError::Type {
                 value,
-                type_name: ty,
-                struct_name: strukt,
+                type_name,
                 field,
-            } => {
-                if !strukt.is_empty() || !field.is_empty() {
-                    write!(
-                        f,
-                        "json: cannot unmarshal {value} into Go struct field {strukt}.{field} of type {ty}"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "json: cannot unmarshal {value} into Go value of type {ty}"
-                    )
-                }
-            }
+                ..
+            } => f.write_str(&type_mismatch_text(field, value, type_name)),
         }
     }
 }
@@ -407,8 +396,8 @@ fn key_str(k: &[u8]) -> String {
 }
 
 /// Decodes a JSON object into a struct with the given JSON field names: `each(d, index,
-/// value)` decodes one member into field `fields[index]`. `ty` is the type name an
-/// error reports (`engine.PathBlockConfig`), `struct_name` its bare name.
+/// value)` decodes one member into field `fields[index]`. `ty` is the type tag of the value, which
+/// tells an error what the field takes (an object here); `strukt` is the bare name of the struct.
 pub fn object<'v>(
     d: &mut DecodeTrace,
     v: &'v Value,
@@ -580,7 +569,7 @@ pub fn raw_map(v: &Value) -> Result<Option<BTreeMap<String, &Value>>, JsonDecode
         }
         other => Err(JsonDecodeError::Type {
             value: other.type_name().into(),
-            type_name: "map[string]json.RawMessage".into(),
+            type_name: "object".into(),
             struct_name: String::new(),
             field: String::new(),
         }),
@@ -656,10 +645,7 @@ mod tests {
             })
         })
         .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "json: cannot unmarshal number into Go struct field S.b of type string"
-        );
+        assert_eq!(err.to_string(), "b: expected a string, got a number");
         assert_eq!((s.a, s.b.as_str()), (1, "x"));
     }
 }

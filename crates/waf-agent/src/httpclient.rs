@@ -161,7 +161,7 @@ fn parse(url: &str) -> Result<Target, String> {
         _ => return Err(format!("unsupported protocol scheme {scheme:?}")),
     };
     let (rest, query) = split_query(rest);
-    let no_host = || "http: no Host in request URL".to_string();
+    let no_host = || "no host in the URL".to_string();
     let after = rest.strip_prefix("//").ok_or_else(no_host)?;
     let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
     let (userinfo, authority) = match authority.rsplit_once('@') {
@@ -182,7 +182,7 @@ fn parse(url: &str) -> Result<Target, String> {
         if tls { 443 } else { 80 }
     } else {
         port.parse::<u16>()
-            .map_err(|_| format!("dial tcp: address {port}: invalid port"))?
+            .map_err(|_| format!("connect: invalid port {port}"))?
     };
     Ok(Target {
         tls,
@@ -408,9 +408,9 @@ async fn lookup(host: &str, port: u16, what: &'static str) -> Result<std::net::S
     tokio::task::spawn_blocking(move || {
         use std::net::ToSocketAddrs;
         addr.to_socket_addrs()
-            .map_err(|e| format!("{what}: lookup {host}: {e}"))?
+            .map_err(|e| format!("{what}: resolve {host}: {e}"))?
             .next()
-            .ok_or_else(|| format!("{what}: lookup {host}: no such host"))
+            .ok_or_else(|| format!("{what}: resolve {host}: no address found"))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -426,7 +426,7 @@ fn peer(addr: std::net::SocketAddr, tls: bool, sni: &str) -> HttpPeer {
 async fn plan(t: &Target, ua: &str, proxies: &ProxyConfig) -> Result<Plan, String> {
     let scheme = if t.tls { "https" } else { "http" };
     let Some(p) = proxies.proxy_for(scheme, &t.host, &t.port_text)? else {
-        let addr = lookup(&t.host, t.port, "dial tcp").await?;
+        let addr = lookup(&t.host, t.port, "connect").await?;
         return Ok(Plan {
             peer: peer(addr, t.tls, &t.host),
             absolute: false,
@@ -440,9 +440,9 @@ async fn plan(t: &Target, ua: &str, proxies: &ProxyConfig) -> Result<Plan, Strin
             .port
             .parse()
             .unwrap_or(if p.scheme == "https" { 443 } else { 80 });
-        let addr = lookup(&p.host, port, "dial tcp")
+        let addr = lookup(&p.host, port, "connect")
             .await
-            .map_err(|e| format!("proxyconnect tcp: {e}"))?;
+            .map_err(|e| format!("connect to proxy: {e}"))?;
         return Ok(Plan {
             peer: peer(addr, p.scheme == "https", &p.host),
             absolute: true,
@@ -561,7 +561,7 @@ async fn dial_tunnel(p: &ProxyUrl, host: &str, port: u16, ua: &str) -> Result<St
     let proxy_addr = p.http_address();
     let tcp = tokio::net::TcpStream::connect(&proxy_addr)
         .await
-        .map_err(|e| format!("proxyconnect tcp: dial tcp {proxy_addr}: {e}"))?;
+        .map_err(|e| format!("connect to proxy {proxy_addr}: {e}"))?;
     let target = proxy_env::format_host_port(host, &port.to_string());
     async fn open<S: AsyncRead + AsyncWrite + Unpin>(
         io: &mut S,
@@ -585,7 +585,7 @@ async fn dial_tunnel(p: &ProxyUrl, host: &str, port: u16, ua: &str) -> Result<St
     if p.scheme == "https" {
         let mut tls = tls_to_proxy(tcp, &p.host)
             .await
-            .map_err(|e| format!("proxyconnect tcp: {e}"))?;
+            .map_err(|e| format!("connect to proxy: {e}"))?;
         open(&mut tls, socks, p, t, &proxy_addr, ua).await?;
         Ok(VirtualSocketStream::new(Box::new(Wrap(tls))).into())
     } else {
@@ -1102,7 +1102,7 @@ mod tests {
         assert_eq!((t.port, t.host.as_str()), (80, "::1"));
         // the digits are a valid URL, the number is not for the dialler
         let e = parse("http://h:99999/").err().unwrap();
-        assert_eq!(e, "dial tcp: address 99999: invalid port");
+        assert_eq!(e, "connect: invalid port 99999");
         assert!(!is_parse_error(&e));
         // the Host header is the authority as written
         assert_eq!(parse("http://u@h:80/").unwrap().authority, "h:80");
@@ -1134,8 +1134,8 @@ mod tests {
         for (u, why) in [
             ("ftp://h/", "unsupported protocol scheme \"ftp\""),
             ("h/x", "unsupported protocol scheme \"\""),
-            ("http:foo", "http: no Host in request URL"),
-            ("http:///x", "http: no Host in request URL"),
+            ("http:foo", "no host in the URL"),
+            ("http:///x", "no host in the URL"),
             ("HTTP://h/", ""),
         ] {
             match parse(u) {
@@ -1399,17 +1399,14 @@ mod tests {
                 .unwrap()
                 .starts_with("CONNECT example.invalid:8443 ")
         );
-        // a proxy that is not there is a proxyconnect error
+        // a proxy that is not there is a connect-to-proxy error
         let closed = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
         let pc = proxies("", &format!("http://127.0.0.1:{closed}"), "");
         let e = get_via("https://example.invalid/x", &pc).unwrap_err();
-        assert!(
-            e.starts_with("proxyconnect tcp: dial tcp 127.0.0.1:"),
-            "{e}"
-        );
+        assert!(e.starts_with("connect to proxy 127.0.0.1:"), "{e}");
     }
 
     /// `NO_PROXY` and loopback targets are dialled directly, whatever the proxy variables say.
@@ -1423,7 +1420,7 @@ mod tests {
         );
         for url in ["http://example.invalid/", "http://a.corp.invalid/"] {
             let e = get_via(url, &pc).unwrap_err();
-            assert!(e.starts_with("dial tcp: lookup "), "{url}: {e}");
+            assert!(e.starts_with("connect: resolve "), "{url}: {e}");
         }
         let (port, direct) = serve(|_, _| "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".into());
         get_via(&format!("http://127.0.0.1:{port}/p"), &pc).unwrap();

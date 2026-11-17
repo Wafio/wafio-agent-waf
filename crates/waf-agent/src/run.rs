@@ -172,7 +172,7 @@ fn refresh_good_bots(c: &VerifiedBotChecker) {
         // Timeout 30 s, body cut at 2 MiB.
         let fetched = crate::httpclient::get_blocking(
             &url,
-            "Go-http-client/1.1",
+            &wafio_agent_io::user_agent(),
             usize::MAX,
             Duration::from_secs(30),
         )
@@ -208,7 +208,7 @@ impl wafio_agent_pages::challenge_handler::CaptchaVerifier for Captcha {
     fn submit_form(&self, url: &str, body: &[u8]) -> Option<Vec<u8>> {
         crate::httpclient::post_form_blocking(
             url,
-            "Go-http-client/1.1",
+            &wafio_agent_io::user_agent(),
             body,
             MAX_SITEVERIFY_BODY,
             self.timeout,

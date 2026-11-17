@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::clientip::{build_trusted_prefixes, check_trusted_proxies};
 use crate::ip_address::IpPrefix;
-use crate::json_text::{self, Value, key_matches};
+use crate::json_text::{self, Value, key_matches, type_mismatch_text};
 use crate::text_helpers::{eq_ignore_case, quote, trim_whitespace};
 
 /// A proxy_config parse or validation error (user-facing message).
@@ -109,13 +109,7 @@ struct ConfigDecoder {
 impl ConfigDecoder {
     fn type_error(&mut self, v: &Value, path: &str, ty: &str) {
         if self.error.is_none() {
-            let what = match v {
-                Value::Number(n) => format!("number {}", String::from_utf8_lossy(n)),
-                other => other.type_name().to_string(),
-            };
-            self.error = Some(format!(
-                "json: cannot unmarshal {what} into Go struct field ProxyConfig.{path} of type {ty}"
-            ));
+            self.error = Some(type_mismatch_text(path, &v.kind_text(), ty));
         }
     }
 
@@ -250,8 +244,8 @@ pub fn parse_proxy_config(raw: &[u8]) -> Result<ProxyConfig, ProxyError> {
     };
     let Value::Object(members) = &root else {
         return Err(ProxyError(format!(
-            "proxy_config: json: cannot unmarshal {} into Go value of type map[string]json.RawMessage",
-            root.type_name()
+            "proxy_config: {}",
+            type_mismatch_text("", root.type_name(), "object")
         )));
     };
     let mut d = ConfigDecoder::default();

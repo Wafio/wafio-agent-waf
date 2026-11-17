@@ -490,6 +490,55 @@ impl Value {
             Value::Object(_) => "object",
         }
     }
+
+    /// [`Self::type_name`], and for a number the literal after it (`number 1.5`).
+    pub fn kind_text(&self) -> String {
+        match self {
+            Value::Number(n) => format!("number {}", String::from_utf8_lossy(n)),
+            other => other.type_name().to_string(),
+        }
+    }
+}
+
+/// A value kind (`Value::kind_text`) as a phrase for an error text.
+fn kind_phrase(kind: &str) -> String {
+    match kind {
+        "bool" => "a boolean".into(),
+        "number" => "a number".into(),
+        "string" => "a string".into(),
+        "array" => "an array".into(),
+        "object" => "an object".into(),
+        other => match other.strip_prefix("number ") {
+            Some(literal) => format!("the number {literal}"),
+            None => other.into(),
+        },
+    }
+}
+
+/// What a field takes, from its type tag: `int`, `int64`, `float64`, `string`, `bool`, `[]string`,
+/// `[]<element>` for other arrays, and an object for anything else.
+fn type_phrase(ty: &str) -> &'static str {
+    match ty {
+        "int" | "int64" => "an integer",
+        "float64" => "a number",
+        "string" => "a string",
+        "bool" => "true or false",
+        "[]string" => "an array of strings",
+        _ if ty.starts_with("[]") => "an array",
+        _ => "an object",
+    }
+}
+
+/// The text for a value of the wrong JSON type: `timeouts.connect_ms: expected an integer, got a
+/// string`. `field` is the JSON path of the field, empty for a whole document, `kind` comes from
+/// [`Value::kind_text`] and `ty` is the type tag of the field.
+pub fn type_mismatch_text(field: &str, kind: &str, ty: &str) -> String {
+    let text = format!("expected {}, got {}", type_phrase(ty), kind_phrase(kind));
+    if field.is_empty() {
+        text
+    } else {
+        format!("{field}: {text}")
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +605,33 @@ mod tests {
         let mut input = "\u{2028}".as_bytes().to_vec();
         input.push(0xff);
         assert_eq!(encode_string(&input), br#""\u2028\ufffd""#.to_vec());
+    }
+
+    #[test]
+    fn type_mismatch_texts_are_plain() {
+        assert_eq!(
+            type_mismatch_text("timeouts.connect_ms", "string", "int"),
+            "timeouts.connect_ms: expected an integer, got a string"
+        );
+        assert_eq!(
+            type_mismatch_text("generation", "number 1.5", "int64"),
+            "generation: expected an integer, got the number 1.5"
+        );
+        assert_eq!(
+            type_mismatch_text("", "array", "agent.Bundle"),
+            "expected an object, got an array"
+        );
+        assert_eq!(
+            type_mismatch_text("good_bot_cidrs", "string", "[]string"),
+            "good_bot_cidrs: expected an array of strings, got a string"
+        );
+        assert_eq!(
+            type_mismatch_text("enabled", "number", "bool"),
+            "enabled: expected true or false, got a number"
+        );
+        assert_eq!(
+            Value::Number(b"2e3".to_vec()).kind_text(),
+            "number 2e3".to_string()
+        );
     }
 }

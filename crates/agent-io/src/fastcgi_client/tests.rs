@@ -689,7 +689,7 @@ async fn read_timeout_and_dial_error() {
         .send_request(b"GET", b"/", b"h", b"r", &[], b"")
         .await
         .unwrap_err();
-    assert_eq!(err, "fcgi: read header: i/o timeout");
+    assert_eq!(err, "fcgi: read header: timed out");
     assert_eq!(
         pool.open_connection_count(),
         0,

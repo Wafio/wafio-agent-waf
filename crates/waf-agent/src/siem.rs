@@ -142,7 +142,12 @@ fn deliver(rt: &tokio::runtime::Runtime, job: &Job, c: &Counters, backoff: Durat
             truncate: true,
             timeout: Duration::from_secs(5),
         };
-        let retry = match rt.block_on(request_with("POST", &job.url, "Go-http-client/1.1", &opts)) {
+        let retry = match rt.block_on(request_with(
+            "POST",
+            &job.url,
+            &wafio_agent_io::user_agent(),
+            &opts,
+        )) {
             Ok(r) if (200..300).contains(&r.status) => {
                 c.delivered.fetch_add(1, Relaxed);
                 return;

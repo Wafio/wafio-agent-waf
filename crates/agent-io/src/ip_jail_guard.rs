@@ -162,8 +162,8 @@ pub async fn lookup_control_plane_endpoints(server_addr: &str) -> Result<Vec<Soc
             let fut = tokio::net::lookup_host((host.as_str(), port));
             match tokio::time::timeout(Duration::from_secs(3), fut).await {
                 Ok(Ok(it)) => it.map(|sa| IpAddress::from_std(sa.ip())).collect(),
-                Ok(Err(e)) => return Err(format!("lookup {host}: {e}")),
-                Err(_) => return Err(format!("lookup {host}: i/o timeout")),
+                Ok(Err(e)) => return Err(format!("resolve {host}: {e}")),
+                Err(_) => return Err(format!("resolve {host}: timed out")),
             }
         }
     };

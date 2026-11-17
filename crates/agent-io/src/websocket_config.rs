@@ -3,7 +3,7 @@
 //! the same field (a `*struct` merges), a type mismatch is remembered and decoding continues, `null`
 //! leaves a bool or int unchanged and clears a pointer.
 
-use wafio_domain::json_text::{self, Value, key_matches};
+use wafio_domain::json_text::{self, Value, key_matches, type_mismatch_text};
 use wafio_domain::text_helpers::{quote, trim_whitespace};
 
 use crate::url_parse;
@@ -31,10 +31,7 @@ fn raw_map_of(v: Value) -> Result<RawMap, String> {
             }
             Ok(Some(out))
         }
-        other => Err(format!(
-            "json: cannot unmarshal {} into Go value of type map[string]json.RawMessage",
-            other.type_name()
-        )),
+        other => Err(type_mismatch_text("", other.type_name(), "object")),
     }
 }
 
@@ -54,13 +51,7 @@ pub(crate) struct Decoder {
 impl Decoder {
     fn record_type_mismatch(&mut self, v: &Value, field: &str, ty: &str) {
         if self.first_error.is_none() {
-            let what = match v {
-                Value::Number(n) => format!("number {}", String::from_utf8_lossy(n)),
-                other => other.type_name().to_string(),
-            };
-            self.first_error = Some(format!(
-                "json: cannot unmarshal {what} into Go struct field {field} of type {ty}"
-            ));
+            self.first_error = Some(type_mismatch_text(field, &v.kind_text(), ty));
         }
     }
 
@@ -157,14 +148,14 @@ pub(crate) fn decode_origin_check(d: &mut Decoder, v: &Value, dst: &mut Option<O
             let oc = dst.get_or_insert_default();
             for (i, fv) in d.fields(m, &["enabled", "allowed_origins"]) {
                 match i {
-                    0 => d.bool_into(fv, &mut oc.enabled, ".origin_check.enabled"),
+                    0 => d.bool_into(fv, &mut oc.enabled, "origin_check.enabled"),
                     _ => {
-                        d.strings_into(fv, &mut oc.allowed_origins, ".origin_check.allowed_origins")
+                        d.strings_into(fv, &mut oc.allowed_origins, "origin_check.allowed_origins")
                     }
                 }
             }
         }
-        other => d.record_type_mismatch(other, ".origin_check", "struct"),
+        other => d.record_type_mismatch(other, "origin_check", "struct"),
     }
 }
 
@@ -178,13 +169,13 @@ pub(crate) fn decode_limits(d: &mut Decoder, v: &Value, dst: &mut Option<LimitsR
                 &["max_text_bytes", "max_binary_bytes", "max_messages_per_min"],
             ) {
                 match i {
-                    0 => d.int_into(fv, &mut l.max_text_bytes, ".limits.max_text_bytes"),
-                    1 => d.int_into(fv, &mut l.max_binary_bytes, ".limits.max_binary_bytes"),
-                    _ => d.int_into(fv, &mut l.max_msgs_per_min, ".limits.max_messages_per_min"),
+                    0 => d.int_into(fv, &mut l.max_text_bytes, "limits.max_text_bytes"),
+                    1 => d.int_into(fv, &mut l.max_binary_bytes, "limits.max_binary_bytes"),
+                    _ => d.int_into(fv, &mut l.max_msgs_per_min, "limits.max_messages_per_min"),
                 }
             }
         }
-        other => d.record_type_mismatch(other, ".limits", "struct"),
+        other => d.record_type_mismatch(other, "limits", "struct"),
     }
 }
 
@@ -217,9 +208,9 @@ pub fn check_websocket_rules(data: &[u8]) -> Result<(), String> {
         ],
     ) {
         match i {
-            0 => d.opt_bool_into(v, &mut enabled, ".enabled"),
-            1 => d.opt_bool_into(v, &mut scan_bin, ".scan_binary_hashes"),
-            2 => d.opt_bool_into(v, &mut scan_srv, ".scan_server_frames"),
+            0 => d.opt_bool_into(v, &mut enabled, "enabled"),
+            1 => d.opt_bool_into(v, &mut scan_bin, "scan_binary_hashes"),
+            2 => d.opt_bool_into(v, &mut scan_srv, "scan_server_frames"),
             3 => decode_origin_check(&mut d, v, &mut origin_check),
             _ => decode_limits(&mut d, v, &mut limits),
         }

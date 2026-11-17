@@ -76,8 +76,8 @@ impl std::fmt::Display for WsError {
             WsError::Close { code, text } => write!(f, "websocket: close {code} {text}"),
             WsError::ReadLimit => f.write_str("websocket: read limit exceeded"),
             WsError::CloseSent => f.write_str("websocket: close sent"),
-            WsError::Closed => f.write_str("use of closed network connection"),
-            WsError::Timeout => f.write_str("i/o timeout"),
+            WsError::Closed => f.write_str("connection closed"),
+            WsError::Timeout => f.write_str("timed out"),
             WsError::Protocol(m) => write!(f, "websocket: {m}"),
             WsError::InvalidControlFrame => f.write_str("websocket: invalid control frame"),
             WsError::Handshake(m) | WsError::Io(m) => f.write_str(m),
@@ -376,7 +376,7 @@ impl WsConnection {
         let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
         let mut host = host.to_string();
         let mut extra = String::new();
-        // Unless the header carries a User-Agent the request names itself `Go-http-client/1.1`,
+        // Unless the header carries a User-Agent the request names itself with the agent's own,
         // and an empty one writes none.
         let mut user_agent = false;
         for (k, v) in headers {
@@ -409,7 +409,7 @@ impl WsConnection {
             extra.push_str(&format!("{k}: {v}\r\n"));
         }
         if !user_agent {
-            extra.push_str("User-Agent: Go-http-client/1.1\r\n");
+            extra.push_str(&format!("User-Agent: {}\r\n", crate::user_agent()));
         }
         let req = format!(
             "GET {request_uri} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n"

@@ -1356,9 +1356,7 @@ mod tests {
     struct FailSink;
     impl BundleSink for FailSink {
         fn apply(&self, _: &[u8], _: i64) -> Result<(), BundleError> {
-            Err(BundleError::Apply(
-                "use of closed network connection".into(),
-            ))
+            Err(BundleError::Apply("connection closed".into()))
         }
     }
     struct ZeroStats;

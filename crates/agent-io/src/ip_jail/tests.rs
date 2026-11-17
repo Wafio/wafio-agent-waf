@@ -319,7 +319,7 @@ fn jail_post_follows_the_proxy_environment() {
     // Proxies the client cannot speak to are an error, not a direct connection.
     for p in ["https://127.0.0.1:1", "socks5://127.0.0.1:1"] {
         let e = via(p, "", "http://jail.example/x").unwrap_err();
-        assert!(e.contains("proxyconnect tcp"), "{e}");
+        assert!(e.contains("connect to proxy"), "{e}");
     }
 }
 

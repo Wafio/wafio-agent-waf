@@ -166,7 +166,7 @@ impl FastCgiConnectionPool {
                     Ok(r) => r,
                     Err(_) => Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        format!("dial {net} {ad}: i/o timeout"),
+                        format!("connect {net} {ad}: timed out"),
                     )),
                 }
             }) as DialFuture
@@ -609,7 +609,7 @@ impl FastCgiConnectionPool {
 }
 
 fn io_timeout() -> io::Error {
-    io::Error::new(io::ErrorKind::TimedOut, "i/o timeout")
+    io::Error::new(io::ErrorKind::TimedOut, "timed out")
 }
 
 async fn read_exact<R: AsyncRead + Unpin>(

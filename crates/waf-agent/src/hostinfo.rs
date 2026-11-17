@@ -4,11 +4,7 @@
 
 use std::sync::OnceLock;
 
-/// Set at build time through `WAFIO_AGENT_VERSION`.
-pub const AGENT_VERSION: &str = match option_env!("WAFIO_AGENT_VERSION") {
-    Some(v) => v,
-    None => "dev",
-};
+pub use wafio_agent_io::AGENT_VERSION;
 
 #[derive(Clone, Debug, Default)]
 struct Static {

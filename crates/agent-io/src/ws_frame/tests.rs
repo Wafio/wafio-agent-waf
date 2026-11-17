@@ -386,7 +386,7 @@ async fn client_handshake_rejects_bad_accept() {
     );
 }
 
-/// The handshake adds `User-Agent: Go-http-client/1.1` when its headers carry
+/// The handshake adds the agent's own `User-Agent` when its headers carry
 /// none, writes the first one given and none for an empty value.
 #[tokio::test]
 async fn client_handshake_default_user_agent() {
@@ -401,10 +401,13 @@ async fn client_handshake_default_user_agent() {
     let h = |k: &str, v: &str| (k.to_string(), v.to_string());
     let req = head(vec![]).await;
     assert_eq!(req.matches("User-Agent: ").count(), 1, "{req}");
-    assert!(req.contains("User-Agent: Go-http-client/1.1\r\n"), "{req}");
+    assert!(
+        req.contains(&format!("User-Agent: {}\r\n", crate::user_agent())),
+        "{req}"
+    );
     let req = head(vec![h("User-Agent", "ua/1")]).await;
     assert!(
-        req.contains("User-Agent: ua/1\r\n") && !req.contains("Go-http"),
+        req.contains("User-Agent: ua/1\r\n") && !req.contains("wafio-waf-agent/"),
         "{req}"
     );
     let req = head(vec![h("User-Agent", "")]).await;

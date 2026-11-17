@@ -171,7 +171,7 @@ pub(crate) fn time_string(raw: &RawValue) -> Result<Option<&str>, String> {
     match s {
         "null" => Ok(None),
         _ if s.starts_with('"') => Ok(Some(&s[1..s.len() - 1])),
-        _ => Err("Time.UnmarshalJSON: input is not a JSON string".into()),
+        _ => Err("expected a string with a timestamp".into()),
     }
 }
 
@@ -241,22 +241,10 @@ mod tests {
                 b"{\"a\":\"\x01\"}",
                 "invalid character '\\x01' in string literal",
             ),
-            (
-                b"[1,2]",
-                "json: cannot unmarshal array into Go value of type agent.Bundle",
-            ),
-            (
-                b"\"x\"",
-                "json: cannot unmarshal string into Go value of type agent.Bundle",
-            ),
-            (
-                b"5",
-                "json: cannot unmarshal number into Go value of type agent.Bundle",
-            ),
-            (
-                b"true",
-                "json: cannot unmarshal bool into Go value of type agent.Bundle",
-            ),
+            (b"[1,2]", "expected an object, got an array"),
+            (b"\"x\"", "expected an object, got a string"),
+            (b"5", "expected an object, got a number"),
+            (b"true", "expected an object, got a boolean"),
         ] {
             assert_eq!(
                 members(doc, "agent.Bundle").unwrap_err(),
@@ -275,14 +263,12 @@ mod tests {
         let int = |d: &str| int64(field(d), "Bundle", "generation", "int64").unwrap_err();
         assert_eq!(
             int(r#"{"generation":"3"}"#),
-            "json: cannot unmarshal string into Go struct field Bundle.generation of type int64"
+            "generation: expected an integer, got a string"
         );
         for lit in ["1.5", "1e2", "99999999999999999999"] {
             assert_eq!(
                 int(&format!(r#"{{"generation":{lit}}}"#)),
-                format!(
-                    "json: cannot unmarshal number {lit} into Go struct field Bundle.generation of type int64"
-                )
+                format!("generation: expected an integer, got the number {lit}")
             );
         }
         assert_eq!(
@@ -293,16 +279,16 @@ mod tests {
                 "int"
             )
             .unwrap_err(),
-            "json: cannot unmarshal bool into Go struct field bundleCacheEnvelope.version of type int"
+            "version: expected an integer, got a boolean"
         );
         let b = |d: &str| boolean(field(d), "Bundle", "management_only").unwrap_err();
         assert_eq!(
             b(r#"{"management_only":"yes"}"#),
-            "json: cannot unmarshal string into Go struct field Bundle.management_only of type bool"
+            "management_only: expected true or false, got a string"
         );
         assert_eq!(
             b(r#"{"management_only":1}"#),
-            "json: cannot unmarshal number into Go struct field Bundle.management_only of type bool"
+            "management_only: expected true or false, got a number"
         );
         let s = |d: &str| {
             struct_slice_len(
@@ -314,42 +300,29 @@ mod tests {
             )
         };
         for (doc, want) in [
-            (
-                r#"{"apps":[1]}"#,
-                "number into Go struct field Bundle.apps of type agent.BundleApp",
-            ),
+            (r#"{"apps":[1]}"#, "apps: expected an object, got a number"),
             (
                 r#"{"apps":[true]}"#,
-                "bool into Go struct field Bundle.apps of type agent.BundleApp",
+                "apps: expected an object, got a boolean",
             ),
             (
                 r#"{"apps":[[1]]}"#,
-                "array into Go struct field Bundle.apps of type agent.BundleApp",
+                "apps: expected an object, got an array",
             ),
             (
                 r#"{"apps":[{"a":1},"x"]}"#,
-                "string into Go struct field Bundle.apps of type agent.BundleApp",
+                "apps: expected an object, got a string",
             ),
-            (
-                r#"{"apps":5}"#,
-                "number into Go struct field Bundle.apps of type []agent.BundleApp",
-            ),
-            (
-                r#"{"apps":{}}"#,
-                "object into Go struct field Bundle.apps of type []agent.BundleApp",
-            ),
+            (r#"{"apps":5}"#, "apps: expected an array, got a number"),
+            (r#"{"apps":{}}"#, "apps: expected an array, got an object"),
         ] {
-            assert_eq!(
-                s(doc).unwrap_err(),
-                format!("json: cannot unmarshal {want}"),
-                "{doc}"
-            );
+            assert_eq!(s(doc).unwrap_err(), want, "{doc}");
         }
         assert_eq!(s(r#"{"apps":[null,{}]}"#), Ok(2));
         assert_eq!(s(r#"{"apps":null}"#), Ok(0));
         assert_eq!(
             time_string(field(r#"{"saved_at":5}"#)).unwrap_err(),
-            "Time.UnmarshalJSON: input is not a JSON string"
+            "expected a string with a timestamp"
         );
         assert_eq!(
             time_string(field(r#"{"saved_at":"2026\u002d11"}"#)),

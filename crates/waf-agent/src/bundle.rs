@@ -139,7 +139,7 @@ fn raw_slice(
     v: &Value,
     out: &mut Vec<Vec<u8>>,
 ) -> Result<(), JsonDecodeError> {
-    json_decode::slice(d, v, out, "[]json.RawMessage", |_, v, r| {
+    json_decode::slice(d, v, out, "[]object", |_, v, r| {
         *r = sp.raw(v);
         Ok(())
     })
@@ -310,15 +310,15 @@ mod tests {
     fn decode_error_texts() {
         assert_eq!(
             decode_bundle(br#"{"apps":[{"listen_port":"80"}]}"#).unwrap_err(),
-            "json: cannot unmarshal string into Go struct field BundleApp.apps.listen_port of type int"
+            "apps.listen_port: expected an integer, got a string"
         );
         assert_eq!(
             decode_bundle(br#"{"generation":1.5}"#).unwrap_err(),
-            "json: cannot unmarshal number 1.5 into Go struct field Bundle.generation of type int64"
+            "generation: expected an integer, got the number 1.5"
         );
         assert_eq!(
             decode_bundle(b"[]").unwrap_err(),
-            "json: cannot unmarshal array into Go value of type agent.Bundle"
+            "expected an object, got an array"
         );
         assert_eq!(
             decode_bundle(b"{").unwrap_err(),
