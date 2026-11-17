@@ -668,3 +668,35 @@ async fn upstream_status_message_bytes_are_kept() {
         assert_eq!(line, want, "{path}: {:?}", String::from_utf8_lossy(&line));
     }
 }
+
+/// A raw `"`, `<` or `>` in the query: the upstream client refuses such a target, so an allowed
+/// request used to end in a 502. The three bytes go out escaped, the rest of the query as written,
+/// and what the analysis sees does not change: the marker next to them is still found.
+#[tokio::test]
+async fn raw_quote_and_angle_brackets_in_the_query_reach_the_upstream_escaped() {
+    let up = http_upstream().await;
+    let port = free_port();
+    let (h, proxy) =
+        Harness::serve_with_fake_engine(vec![app("a1", port, &format!("http://{}", up.addr))]);
+
+    let resp = one(proxy, &get("/search?q=<b>\"hi\"</b>&n=%3C1")).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        up.last().line,
+        "GET /search?q=%3Cb%3E%22hi%22%3C/b%3E&n=%3C1 HTTP/1.1"
+    );
+    let ev = h.last_event();
+    assert_eq!(s(&ev.action), "allow");
+    // The event keeps the target the client sent.
+    assert_eq!(s(&ev.uri), "/search?q=<b>\"hi\"</b>&n=%3C1");
+
+    let seen = up.count();
+    let resp = one(proxy, &get("/search?q=<b>wafio-test-xss</b>")).await;
+    assert_eq!(resp.status, 403);
+    assert_eq!(
+        up.count(),
+        seen,
+        "a blocked request never contacts the upstream"
+    );
+    assert_eq!(s(&h.last_event().action), "block");
+}

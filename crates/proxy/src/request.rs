@@ -173,6 +173,21 @@ pub fn push_escaped_path(dst: &mut Vec<u8>, src: &[u8]) {
     }
 }
 
+/// Appends the query as it goes to the upstream: byte for byte, except `"`, `<` and `>`, which are
+/// written as `%22`, `%3C` and `%3E`. The upstream client refuses a request target that holds one
+/// of the three raw, so a request the analysis had allowed ended in a 502. Only the target sent
+/// upstream changes: `query`, which the analysis reads, keeps the bytes the client sent.
+pub fn push_forward_query(dst: &mut Vec<u8>, query: &[u8]) {
+    for &c in query {
+        match c {
+            b'"' => dst.extend_from_slice(b"%22"),
+            b'<' => dst.extend_from_slice(b"%3C"),
+            b'>' => dst.extend_from_slice(b"%3E"),
+            _ => dst.push(c),
+        }
+    }
+}
+
 /// Removes every line named `key` by swapping it with the last one, so each delete reorders the
 /// lines that follow it (two lines of one name come out the other way round).
 pub(crate) fn remove_all_lines_named(h: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8]) {
@@ -281,7 +296,7 @@ impl InboundRequest {
         push_escaped_path(&mut req.forward_request_target, &req.forward_path);
         if !req.query.is_empty() {
             req.forward_request_target.push(b'?');
-            req.forward_request_target.extend_from_slice(&req.query);
+            push_forward_query(&mut req.forward_request_target, &req.query);
         }
         // The header map: the Host header as written (not the URI host), Content-Length,
         // Content-Type, User-Agent, Trailer, Cookie, the other lines in order (every non-close
@@ -364,6 +379,23 @@ mod tests {
         assert_eq!(title_case_header_key(b"content-type"), b"Content-Type");
         assert_eq!(title_case_header_key(b"x_y"), b"X_y");
         assert_eq!(title_case_header_key(b"bad key"), b"bad key");
+    }
+
+    #[test]
+    fn the_forwarded_query_escapes_what_the_upstream_client_refuses() {
+        let r = InboundRequest::from_head(
+            b"GET /a?x=<b>\"y\"</b>&z=%3C1 HTTP/1.1\r\nHost: app.test\r\n\r\n",
+        );
+        // What the analysis reads is what the client sent.
+        assert_eq!(r.query, b"x=<b>\"y\"</b>&z=%3C1");
+        // Only the three bytes change on the way out; an escape the client wrote stays as it is.
+        assert_eq!(
+            r.forward_request_target,
+            b"/a?x=%3Cb%3E%22y%22%3C/b%3E&z=%3C1"
+        );
+        let mut plain = Vec::new();
+        push_forward_query(&mut plain, b"q=1&z=%41&k={x}|y^z`'\xc3\xa9");
+        assert_eq!(plain, b"q=1&z=%41&k={x}|y^z`'\xc3\xa9");
     }
 
     #[test]
