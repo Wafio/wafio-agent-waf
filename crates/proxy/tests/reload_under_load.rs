@@ -112,8 +112,9 @@ async fn load(proxy: std::net::SocketAddr, stats: Arc<Stats>, stop: Arc<AtomicBo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigusr2_reload_under_load() {
-    let dir =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("sp4-{}", std::process::id()));
+    // Under the system temp directory, not the cargo one: the Unix sockets in it must fit sun_path (108 bytes),
+    // and a checkout several folders deep does not leave room.
+    let dir = std::env::temp_dir().join(format!("wafio-reload-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Run from a copy so the "package upgrade" below can replace the file under it.
