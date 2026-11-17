@@ -35,8 +35,14 @@ fn with_decode_budget(n: i64) -> BudgetGuard {
     BudgetGuard { prev, _g: g }
 }
 
+/// Takes the lock and leaves the limit as it is. The limit is read under the lock: read before it, the value
+/// could be the one another test had set for itself and has put back since.
 fn lock_budget() -> BudgetGuard {
-    with_decode_budget(inflight_decode_bytes_limit())
+    let g = BUDGET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    BudgetGuard {
+        prev: inflight_decode_bytes_limit(),
+        _g: g,
+    }
 }
 
 struct Hold(i64);
