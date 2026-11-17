@@ -9,7 +9,6 @@ use wafio_domain::text_helpers::{quote, trim_whitespace_str};
 pub const CONDITION_LIMIT_PER_RULE: usize = 64;
 pub const TRANSFORM_LIMIT_PER_CONDITION: usize = 16;
 pub const CONDITION_VALUE_LEN_LIMIT: usize = 2048;
-pub const RULE_LIMIT_PER_APP: usize = 200;
 
 /// One selectable condition field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
