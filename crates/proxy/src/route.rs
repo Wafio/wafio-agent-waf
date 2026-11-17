@@ -145,12 +145,15 @@ impl RouteApp {
                 return None;
             }
         };
+        let consumed = head.len + body.data.len();
         let req = InboundRequest::from_parsed(&head, parts, &body.trailers, body.data.is_empty());
         let r = match pipeline::handle(&self.shared, &route, req, body.data, peer_ip).await {
             Ok(Done::Respond(r)) => r,
             Ok(Done::Stream(s)) => {
                 let close = head.connection_close || *shutdown.borrow();
-                return relay(&self.shared, stream, buf, &head, *s, close, write_ms).await;
+                return relay(&self.shared, stream, buf, &head, *s, close, write_ms)
+                    .await
+                    .map(|(stream, rest)| (stream, shrink_idle_buffer(rest, consumed)));
             }
             Err(_) => return None,
             Ok(Done::Upgrade(plan)) => {
@@ -189,7 +192,7 @@ impl RouteApp {
             stream.flush().await
         };
         match run_until_deadline(ms(write_ms).map(|d| Instant::now() + d), send).await {
-            Ok(Ok(())) => Some((stream, buf)),
+            Ok(Ok(())) => Some((stream, shrink_idle_buffer(buf, consumed))),
             _ => None,
         }
     }
@@ -407,6 +410,23 @@ async fn reject(stream: Stream, r: OutboundResponse, write_ms: i64) {
     finish_close(stream, wire, write_ms).await;
 }
 
+/// Largest read buffer a kept-alive connection holds while it waits for its next request.
+const IDLE_BUFFER_MAX: usize = 64 << 10;
+
+/// The read buffer a connection keeps for its next request. A body read leaves the buffer as big as the
+/// body (and a growth step beyond it); with hundreds of connections that is memory held for nothing, so a
+/// request that filled a big buffer leaves the connection a fresh one holding only the bytes already
+/// read past it.
+///
+/// `consumed` is what the request took off the front of `buf`: that prefix is still part of the
+/// allocation, but `capacity()` of what is left does not count it, so it is added back here.
+fn shrink_idle_buffer(buf: BytesMut, consumed: usize) -> BytesMut {
+    if consumed + buf.capacity() <= IDLE_BUFFER_MAX {
+        return buf;
+    }
+    BytesMut::from(&buf[..])
+}
+
 /// The connection loop for plain HTTP/1 (no TLS, no h2c): the requests are read, bounded and
 /// answered one at a time.
 pub(crate) async fn serve_connection(app: Arc<RouteApp>, stream: Stream, mut stop: ShutdownWatch) {
@@ -445,5 +465,41 @@ pub(crate) async fn serve_connection(app: Arc<RouteApp>, stream: Stream, mut sto
                 None => return,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_buffer_shrinks_only_when_big_and_keeps_the_pending_bytes() {
+        let mut big = BytesMut::with_capacity(IDLE_BUFFER_MAX * 2);
+        big.extend_from_slice(b"GET /");
+        let kept = shrink_idle_buffer(big, 0);
+        assert_eq!(&kept[..], b"GET /");
+        assert!(kept.capacity() <= IDLE_BUFFER_MAX);
+        assert_eq!(
+            shrink_idle_buffer(BytesMut::with_capacity(4096), 300).capacity(),
+            4096
+        );
+    }
+
+    /// A body that ends near the end of a big allocation leaves a small view of it; the request
+    /// still read a big buffer, so the next request must not inherit it.
+    #[test]
+    fn idle_buffer_shrinks_after_a_body_that_ended_near_the_allocation_end() {
+        let mut big = BytesMut::with_capacity(IDLE_BUFFER_MAX * 3);
+        big.resize(IDLE_BUFFER_MAX * 2 + 1000, 0);
+        big.extend_from_slice(b"GET /");
+        let consumed = big.len() - 5;
+        big.advance(consumed);
+        assert!(
+            big.capacity() <= IDLE_BUFFER_MAX,
+            "the view hides the allocation"
+        );
+        let kept = shrink_idle_buffer(big, consumed);
+        assert_eq!(&kept[..], b"GET /");
+        assert!(kept.capacity() < 1024);
     }
 }
