@@ -103,7 +103,7 @@ scripts/ci-local.sh
 ```
 
 In order: agent-material check (`scripts/check-ai.sh`), secret scan (`gitleaks`), proto copy check
-(`scripts/sync-proto.sh --check`), notices (`scripts/gen-notices.py`), advisories, the test certificate keys,
+(`scripts/sync-proto.sh --check`), notices (`scripts/gen-notices.py`), advisories, the test certificates,
 `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and
 `cargo test --locked --workspace`. In a copy of the tree without `.git` the gate skips the agent-material check
 and scans the files for secrets instead of the history; run `scripts/check-ai.sh` in the checkout then.
@@ -115,10 +115,10 @@ one (another interface version, a failing init, a panic in a scan) and the compa
 scripting attempt: enough to drive verdicts, modes, log-only engines, decision events and WebSocket closes. What real
 detection finds, and the regression snapshot of its verdicts, are tested in wafio-semantic-engine.
 
-The private keys of the test certificates in `crates/control/tests/fixtures` are not in git: `*.key` is ignored.
-`ci-local.sh` copies `client.key`, `client-rsa.key` and `server.key` from `WAFIO_TEST_KEYS_DIR`
-(default `~/wr/data/fixtures-keys`) and stops with a message when they are missing. The control-plane link
-tests and the agent integration tests need them.
+The test certificates and keys in `crates/control/tests/fixtures` are not in git. `scripts/gen-test-certs.sh` makes
+a set with openssl (an authority, a server certificate for localhost and two client certificates), and `ci-local.sh`
+runs it when a file is missing. The control-plane link tests and the agent integration tests need them; run the
+script once before `cargo test` by hand.
 
 The rules documents the reader of `engine-rules` is replayed against (`rules_golden`) and the bundle scenarios
 (`crates/waf-agent/tests/fixtures/bundle_golden.jsonl`) hold no verdict of an engine. `bundle_golden` is rewritten with
@@ -455,7 +455,7 @@ crates/
                              bounded LRU, malware hashes, byte-level text helpers (UTF-8, URL, HTML, patterns, transforms)
   proto                      generated gRPC client and server
 proto/                       vendored protocol file and its SOURCE
-scripts/                     ci-local.sh  build-dist.sh  gen-notices.py  sync-proto.sh  check-ai.sh  advisories.py
+scripts/                     ci-local.sh  build-dist.sh  gen-test-certs.sh  gen-notices.py  sync-proto.sh  check-ai.sh  advisories.py
 scripts/notices/             notices.json and the licence texts that gen-notices.py puts into NOTICES.txt
 tools/core-gen               Go generators for the bytetext Unicode and HTML entity tables
 ```

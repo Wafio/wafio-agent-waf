@@ -3,7 +3,8 @@ target-*/
 /build/
 /security-data/
 
-# Private keys of the test certificates stay out of git (scripts/ci-local.sh, WAFIO_TEST_KEYS_DIR).
+# The test certificates and their keys are made by scripts/gen-test-certs.sh and stay out of git.
+/crates/control/tests/fixtures/*.crt
 *.key
 *.pem
 .env

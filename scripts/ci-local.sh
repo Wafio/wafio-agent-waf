@@ -6,8 +6,6 @@
 #
 # WAFIO_CARGO_PROFILE (default conformance): the cargo profile of clippy and the tests. It is the release
 #   profile without LTO, so the crates build in minutes instead of tens of minutes.
-# WAFIO_TEST_KEYS_DIR (default ~/wr/data/fixtures-keys): where the private keys of the test certificates in
-#   crates/control/tests/fixtures live. They are not committed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,18 +38,8 @@ echo '== advisories'
 python3 scripts/test_advisories.py
 python3 scripts/advisories.py Cargo.lock
 
-echo '== test keys'
-keys=${WAFIO_TEST_KEYS_DIR:-$HOME/wr/data/fixtures-keys}
-fx=crates/control/tests/fixtures
-for k in client client-rsa server; do
-  [ -f "$fx/$k.key" ] && continue
-  if [ -f "$keys/$k.key" ]; then
-    cp "$keys/$k.key" "$fx/$k.key"
-  else
-    echo "missing $fx/$k.key: put the test keys in WAFIO_TEST_KEYS_DIR ($keys)" >&2
-    exit 1
-  fi
-done
+echo '== test certificates'
+scripts/gen-test-certs.sh
 
 echo '== fmt'
 cargo fmt --all --check
