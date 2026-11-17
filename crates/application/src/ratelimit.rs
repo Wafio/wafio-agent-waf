@@ -29,10 +29,6 @@ static EXPIRED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CAPACITY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CAPACITY_LOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Buckets removed, expired and capacity evictions together.
-pub fn evicted_total() -> u64 {
-    EXPIRED_TOTAL.load(Ordering::Relaxed) + CAPACITY_TOTAL.load(Ordering::Relaxed)
-}
 pub fn expired_evicted_total() -> u64 {
     EXPIRED_TOTAL.load(Ordering::Relaxed)
 }

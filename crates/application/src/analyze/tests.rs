@@ -79,18 +79,6 @@ fn body_limit_blocks_first() {
 }
 
 #[test]
-fn panic_fails_open() {
-    // The stubbed engines panic (todo!), which must surface as the fail-open verdict.
-    let before = RECOVERED_ANALYZE_PANICS.load(Ordering::Relaxed);
-    let r = analyze(&request("GET", "/", &[]), &AnalyzeConfig::default());
-    if r.analyze_method == ANALYZE_METHOD_ERROR {
-        assert_eq!(r.action, "allow");
-        assert_eq!(r.message, b"analysis error");
-        assert!(RECOVERED_ANALYZE_PANICS.load(Ordering::Relaxed) > before);
-    }
-}
-
-#[test]
 fn header_lookup_and_policy_key() {
     let mut rq = request(
         "GET",
@@ -190,7 +178,7 @@ fn rate_store_is_object_safe() {
 
 #[test]
 fn path_ip_rules_v4_mapped_cidr_matches_v4_client() {
-    // A v4-mapped network is reduced to IPv4 when matching (review finding).
+    // A v4-mapped network is reduced to IPv4 when matching.
     let cfg_for = |mode: &str| {
         let rules = format!(
             r#"{{"path_exceptions":[{{"path":"/zzblk","ip_rules":{{"mode":"{mode}","ips":["::ffff:192.0.2.0/120"]}}}}]}}"#
@@ -228,7 +216,7 @@ fn upload(data: &[u8]) -> IncomingRequest {
 
 #[test]
 fn content_scan_without_database_is_incomplete_not_fail_open() {
-    // Review finding: the todo!() stub panicked → allow/error; the answer is on_incomplete.
+    // A missing database is an incomplete scan, so the answer is the `on_incomplete` setting.
     let mut cs = crate::deps::engine::ContentScanConfig {
         enabled: true,
         mode: "block".into(),

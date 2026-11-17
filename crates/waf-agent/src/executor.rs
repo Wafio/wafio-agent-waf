@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use wafio_agent_io::ip_jail::JailTracker;
 use wafio_agent_pages::challenge::ChallengeSettings;
-use wafio_application::blocklist::{self, BlockStore};
+use wafio_application::blocklist;
 use wafio_application::deps::engine::bot_protection_from_rules;
-use wafio_application::ratelimit::{self, RateLimitStore};
+use wafio_application::ratelimit;
 use wafio_application::{
     AnalyzeConfig, DisabledGeoLookup, GeoLookup, cache_base_semantic_config, default_malware_engine,
 };
@@ -28,19 +28,6 @@ pub struct BaseExecutor {
     pub challenge: Option<ChallengeSettings>,
     /// Shared by every executor built from this one.
     pub jail: Option<Arc<JailTracker>>,
-}
-
-/// A block store holding at most `WAFIO_WAF_STORE_MAX_ENTRIES` keys.
-pub fn capped_block_store() -> Arc<dyn BlockStore> {
-    Arc::new(blocklist::MemoryStore::with_cap(
-        wafio_agent_io::store_limits::store_entry_cap() as usize,
-    ))
-}
-
-pub fn capped_rate_limit_store() -> Arc<dyn RateLimitStore> {
-    Arc::new(ratelimit::MemoryStore::with_cap(
-        wafio_agent_io::store_limits::store_entry_cap() as usize,
-    ))
 }
 
 /// The concrete stores behind an executor (the cleaner and unblock commands need them).

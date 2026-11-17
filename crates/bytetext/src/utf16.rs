@@ -4,10 +4,6 @@ use crate::CodePoint;
 
 const REPLACEMENT: CodePoint = 0xFFFD;
 
-pub fn is_surrogate(r: CodePoint) -> bool {
-    (0xD800..0xE000).contains(&r)
-}
-
 /// The code point of a surrogate pair, else U+FFFD.
 pub fn decode_surrogate_pair(r1: CodePoint, r2: CodePoint) -> CodePoint {
     if (0xD800..0xDC00).contains(&r1) && (0xDC00..0xE000).contains(&r2) {

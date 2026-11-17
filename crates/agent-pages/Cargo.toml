@@ -13,6 +13,3 @@ wafio-lru.workspace = true
 aes-gcm.workspace = true
 sha2.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

@@ -1,6 +1,6 @@
-//! Private URL parser for the subset this crate reads (scheme, user, host, path, raw query,
-//! fragment) and host:port splitting.
-//! bytetext has no URL parser yet; move this there when it does.
+//! URL parser for the subset the agent reads (scheme, user, host, path, raw query, fragment) and
+//! host:port splitting. Its errors carry text for the log. The parser in `wafio_bytetext::url`
+//! keeps less (no user, no error text) and is for the engines.
 
 use wafio_domain::text_helpers::quote;
 
@@ -13,11 +13,10 @@ enum Mode {
     Fragment,
 }
 
-#[allow(dead_code)]
-/// The URL fields this crate reads. `user` is `Some((name, password))`
+/// The URL fields the agent reads. `user` is `Some((name, password))`
 /// when the authority carried userinfo.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Url {
+pub struct Url {
     pub scheme: Vec<u8>,
     pub opaque: Vec<u8>,
     pub user: Option<(Vec<u8>, Option<Vec<u8>>)>,
@@ -29,14 +28,17 @@ pub(crate) struct Url {
 }
 
 impl Url {
+    /// Whether the URL has a scheme.
     pub fn has_scheme(&self) -> bool {
         !self.scheme.is_empty()
     }
 
+    /// The host without its port or brackets.
     pub fn hostname(&self) -> &[u8] {
         url_split_host_port(&self.host).0
     }
 
+    /// The port digits, empty when there is none.
     pub fn port(&self) -> &[u8] {
         url_split_host_port(&self.host).1
     }
@@ -347,7 +349,7 @@ fn parse_inner(raw: &[u8]) -> Result<Url, String> {
 }
 
 /// Parses `raw`. The error text has the form `parse "<url>": <reason>`.
-pub(crate) fn parse(raw: &[u8]) -> Result<Url, String> {
+pub fn parse(raw: &[u8]) -> Result<Url, String> {
     let (u, frag) = match raw.iter().position(|&c| c == b'#') {
         Some(i) => (&raw[..i], &raw[i + 1..]),
         None => (raw, &b""[..]),

@@ -471,14 +471,4 @@ mod tests {
         );
         std::fs::remove_dir_all(out).unwrap();
     }
-
-    /// Writes a cache for the previous agent to read back (`WAFIO_RUST_CACHE_OUT=<dir>`).
-    #[test]
-    fn write_cache_fixture() {
-        let Ok(dir) = std::env::var("WAFIO_RUST_CACHE_OUT") else {
-            return;
-        };
-        let raw = br#"{"agent_id":"agent-rs","project_id":"proj-1","generation":3,"apps":[{"app_id":"app-1","listen_host":"0.0.0.0","listen_port":8080,"upstream":"http://127.0.0.1:9000","mode":"block"}],"rules_json":{"thresholds":{"block":150,"log":80}},"sensitivity":2}"#;
-        save_bundle_cache(Path::new(&dir), raw, 77, SystemTime::now()).unwrap();
-    }
 }

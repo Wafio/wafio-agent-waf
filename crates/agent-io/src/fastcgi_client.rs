@@ -27,7 +27,6 @@ use wafio_bytetext::strings::{to_lowercase, to_uppercase, trim_whitespace};
 
 // FastCGI record types.
 pub const FCGI_BEGIN_REQUEST: u8 = 1;
-pub const FCGI_ABORT_REQUEST: u8 = 2;
 pub const FCGI_END_REQUEST: u8 = 3;
 pub const FCGI_PARAMS: u8 = 4;
 pub const FCGI_STDIN: u8 = 5;

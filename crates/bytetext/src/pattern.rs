@@ -77,13 +77,6 @@ impl CompiledRegex {
         &self.names
     }
 
-    pub fn group_index(&self, name: &str) -> Option<usize> {
-        if name.is_empty() {
-            return None;
-        }
-        self.names.iter().position(|n| n == name)
-    }
-
     pub fn is_match(&self, s: &[u8]) -> bool {
         self.is_match_text(&Text::new(s))
     }
@@ -689,15 +682,6 @@ pub fn escape_regex_meta(s: &[u8]) -> Vec<u8> {
         out.push(c);
     }
     out
-}
-
-/// A haystack as the matcher reads it (invalid bytes → U+FFFD); exposed for callers that
-/// run the regex crate directly.
-pub fn lossy_view(s: &[u8]) -> Cow<'_, [u8]> {
-    match Hay::new(s) {
-        Hay::Valid(h) => Cow::Borrowed(h),
-        Hay::Mapped { h, .. } => Cow::Owned(h),
-    }
 }
 
 #[cfg(test)]

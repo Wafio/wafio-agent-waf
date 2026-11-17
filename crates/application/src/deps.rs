@@ -1,7 +1,5 @@
 //! Every item this crate calls in other crates, in one place.
-//! Items no crate has published yet are private copies or stubs.
-
-#![allow(dead_code, unused_variables)]
+//! Items no crate has published yet are private copies.
 
 pub mod engine {
     //! The engine boundary (crate engine-api) and the rules (crate engine-rules).
@@ -34,15 +32,6 @@ pub mod engine {
         merge_effect_into_plan, merge_script_results, parse_body_for_rules,
         readings_for_proxy_request, readings_for_raw_target, unescape_form_leniently,
     };
-
-    /// Nothing to do ahead of time: engine-rules compiles a pattern on first use and caches it
-    /// (`cached_rule_regex`).
-    pub fn compile_rule_regexes(
-        gui: &[CustomGuiRule],
-        tuning: &[TuningRule],
-        paths: &[PathExceptionConfig],
-    ) {
-    }
 
     /// The bot protection config the rules JSON parser builds
     /// turned into the prepared detector config.

@@ -33,7 +33,6 @@ pub mod sniff;
 pub mod testing;
 pub mod upgrade;
 pub mod upstream;
-mod url_parse;
 pub mod websocket;
 
 pub use config::{AppAnalysisSetup, AppSpec};

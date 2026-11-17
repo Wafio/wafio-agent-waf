@@ -116,10 +116,6 @@ pub fn is_word_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
-pub fn is_word_code_point(r: CodePoint) -> bool {
-    (0..128).contains(&r) && is_word_byte(r as u8)
-}
-
 /// Parses exactly `n` hex digits at the start of `s`.
 pub fn parse_fixed_hex_digits(s: &[u8], n: usize) -> Option<i64> {
     if s.len() < n {

@@ -194,14 +194,6 @@ pub fn find_by(s: &[u8], f: impl Fn(CodePoint) -> bool) -> Option<usize> {
     find_by_truth(s, &f, true)
 }
 
-pub fn rfind_by(s: &[u8], f: impl Fn(CodePoint) -> bool) -> Option<usize> {
-    rfind_by_truth(s, &f, true)
-}
-
-pub fn contains_by(s: &[u8], f: impl Fn(CodePoint) -> bool) -> bool {
-    find_by(s, f).is_some()
-}
-
 pub fn trim_start_by(s: &[u8], f: impl Fn(CodePoint) -> bool) -> &[u8] {
     match find_by_truth(s, &f, false) {
         Some(i) => &s[i..],
@@ -265,10 +257,6 @@ pub fn find_code_point(s: &[u8], r: CodePoint) -> Option<usize> {
     find(s, &utf8::encode_code_point(r))
 }
 
-pub fn contains_code_point(s: &[u8], r: CodePoint) -> bool {
-    find_code_point(s, r).is_some()
-}
-
 pub fn find_any_of(s: &[u8], chars: &[u8]) -> Option<usize> {
     if chars.is_empty() {
         return None;
@@ -297,24 +285,6 @@ pub fn find_any_of(s: &[u8], chars: &[u8]) -> Option<usize> {
     code_points(s)
         .find(|&(_, c, _)| find_code_point(chars, c).is_some())
         .map(|(i, _, _)| i)
-}
-
-pub fn rfind_any_of(s: &[u8], chars: &[u8]) -> Option<usize> {
-    if chars.is_empty() {
-        return None;
-    }
-    if chars.is_ascii() {
-        return s.iter().rposition(|c| chars.contains(c));
-    }
-    let mut i = s.len();
-    while i > 0 {
-        let (r, size) = decode_last_code_point(&s[..i]);
-        i -= size;
-        if find_code_point(chars, r).is_some() {
-            return Some(i);
-        }
-    }
-    None
 }
 
 pub fn contains_any_of(s: &[u8], chars: &[u8]) -> bool {

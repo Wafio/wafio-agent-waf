@@ -107,14 +107,6 @@ impl RegexBudget {
     }
 }
 
-/// `charge` on an optional budget (None = unlimited).
-pub fn charge_opt(b: Option<&mut RegexBudget>, insts: usize, n: usize) -> bool {
-    match b {
-        None => true,
-        Some(b) => b.charge(insts, n),
-    }
-}
-
 /// The number of instructions the pattern compiles to, or None when the parser rejects it.
 pub fn regex_program_size(pattern: &str) -> Option<usize> {
     crate::pattern_compile::program_size(pattern).ok()

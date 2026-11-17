@@ -49,8 +49,6 @@ pub struct IncomingRequest {
 
 /// How the decision was produced.
 pub const ANALYZE_METHOD_SEMANTIC: &str = "semantic";
-/// Deprecated alias for ANALYZE_METHOD_SEMANTIC.
-pub const ANALYZE_METHOD_FAST_SCAN: &str = "semantic";
 pub const ANALYZE_METHOD_POLICY: &str = "policy";
 pub const ANALYZE_METHOD_GEO: &str = "geo";
 pub const ANALYZE_METHOD_BOT: &str = "bot";

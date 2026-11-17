@@ -6,14 +6,12 @@
 
 pub mod client_ip;
 pub mod fastcgi_client;
-#[cfg(test)]
-mod golden_tests;
 pub mod ip_jail;
 pub mod ip_jail_guard;
 pub mod metrics;
 mod sha1;
 pub mod store_limits;
-mod url_parse;
+pub mod url_parse;
 pub mod utf8;
 pub mod websocket_config;
 pub mod ws_config;

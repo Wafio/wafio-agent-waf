@@ -3,7 +3,7 @@
 //! The IP matching helpers (`parse_client_ip`, `ip_in_list`, `DisabledGeoLookup`)
 //! live in `wafio_application::geo`, where the pipeline already calls them.
 
-// One audited `unsafe` site in this crate carries `#[allow(unsafe_code)]`; anything new needs the same, with its reason.
+// This crate has no `unsafe`; a new site needs `#[allow(unsafe_code)]` and its reason.
 #![deny(unsafe_code)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 

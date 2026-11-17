@@ -165,10 +165,6 @@ impl Variant {
         }
     }
 
-    pub fn decoded_len(&self, n: usize) -> usize {
-        if self.padded { n / 4 * 3 } else { n * 6 / 8 }
-    }
-
     pub fn encoded_len(&self, n: usize) -> usize {
         if self.padded {
             n.div_ceil(3) * 4

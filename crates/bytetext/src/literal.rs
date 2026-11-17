@@ -596,18 +596,6 @@ pub fn quote_ascii_only(s: &[u8]) -> Vec<u8> {
     quote_with(s, b'"', true)
 }
 
-pub fn quote_code_point(r: CodePoint) -> Vec<u8> {
-    let r = if utf8::is_valid_code_point(r) {
-        r
-    } else {
-        REPLACEMENT_CODE_POINT
-    };
-    let mut buf = vec![b'\''];
-    push_escaped_code_point(&mut buf, r, b'\'', false);
-    buf.push(b'\'');
-    buf
-}
-
 // Float parsing
 
 /// Some(value) when parsing succeeds (a syntax error and a range error are both None).

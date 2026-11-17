@@ -16,8 +16,6 @@ pub const CHALLENGE_TYPE_HCAPTCHA: &str = "hcaptcha";
 pub const CHALLENGE_TYPE_CLICK_PUZZLE: &str = "click_puzzle";
 pub const CHALLENGE_TYPE_ADAPTIVE: &str = "adaptive";
 
-pub const LATEST_TEMPLATE_VERSION: i64 = 3;
-
 pub use crate::templates::{
     STOCK_BLOCK_HTML, STOCK_CLICK_PUZZLE_HTML, STOCK_GEO_BLOCK_HTML, STOCK_GEO_BLOCK_JSON,
     STOCK_GEO_BLOCK_XML, STOCK_IP_REP_BLOCK_HTML, STOCK_IP_REP_BLOCK_JSON, STOCK_IP_REP_BLOCK_XML,
@@ -522,7 +520,6 @@ fn parse_regex_repeat_count(t: &[char]) -> Option<(u64, Option<u64>, usize)> {
 pub const NONCE_LIFETIME: i64 = 300;
 const BUILTIN_CHALLENGE_SECRET: &str = "wafio-challenge-v1";
 pub const STANDARD_POW_DIFFICULTY: i64 = 12;
-pub const ELEVATED_POW_DIFFICULTY: i64 = 16;
 pub const CHALLENGE_COOKIE: &str = "_wafio_ch";
 pub const VERIFY_ENDPOINT_PATH: &str = "/_wafio/challenge/verify";
 

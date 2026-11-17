@@ -85,11 +85,6 @@ pub fn default_bad_bot_ua_blocklist() -> Vec<String> {
         .clone()
 }
 
-pub fn reload_default_bad_bot_ua() {
-    let l = load_bad_bot_ua_blocklist();
-    *UA_LIST.write().unwrap_or_else(|e| e.into_inner()) = Some(l);
-}
-
 static JA3_LIST: OnceLock<Vec<String>> = OnceLock::new();
 
 /// The default JA3 blocklist (loaded once, empty when no file opens).
@@ -140,9 +135,4 @@ pub fn default_ja4_blocklist(seeds: &[&str]) -> Vec<String> {
 /// The default JA4 allowlist: the file, else `seeds`.
 pub fn default_ja4_allowlist(seeds: &[&str]) -> Vec<String> {
     or_seeds(ja4_files().1, seeds)
-}
-
-/// Re-reads both JA4 lists from disk.
-pub fn reload_default_ja4() {
-    *JA4_FILES.write().unwrap_or_else(|e| e.into_inner()) = Some(load_ja4_files());
 }

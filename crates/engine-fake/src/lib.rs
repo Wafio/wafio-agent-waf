@@ -1,6 +1,7 @@
 //! An engine for the tests of the open crates. It knows three things: text that holds [`SQL_MARKER`] is an SQL
 //! injection, text that holds [`XSS_MARKER`] is a cross-site scripting attempt (both strong) and text that holds
-//! [`WEAK_MARKER`] is a weak open-redirect detection. That is enough to drive the plumbing around an engine
+//! [`WEAK_MARKER`] is a weak open-redirect detection. Text that holds [`PANIC_MARKER`] makes a scan of a request
+//! panic, to test the fail-open path of the callers. That is enough to drive the plumbing around an engine
 //! (verdicts, modes, log-only engines, weak detections, decision events, WebSocket closes). What real detection
 //! finds is tested where the real engine lives.
 
@@ -22,6 +23,9 @@ pub const XSS_MARKER: &str = "wafio-test-xss";
 
 /// Text that this engine takes for a weak detection: the request is logged and goes on.
 pub const WEAK_MARKER: &str = "wafio-test-weak";
+
+/// Text that makes `scan_request` panic.
+pub const PANIC_MARKER: &str = "wafio-test-panic";
 
 /// What each marker is: the marker, the reason of the finding, the key of the detector and the tier.
 const FINDINGS: [(&str, &str, &str, Tier); 3] = [
@@ -81,6 +85,9 @@ impl Engine for FakeEngine {
         let mut out = ScanOutcome::default();
         if !scan.run_scan {
             return out;
+        }
+        if place(scan, PANIC_MARKER).is_some() {
+            panic!("fake engine panic");
         }
         for (marker, reason, key, tier) in FINDINGS {
             if scan.config.is_disabled(key) {

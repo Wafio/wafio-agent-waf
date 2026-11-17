@@ -8,8 +8,6 @@ pub use crate::unicode_tables::UNICODE_VERSION;
 
 pub const MAX_CODE_POINT: CodePoint = 0x10FFFF;
 pub const REPLACEMENT_CODE_POINT: CodePoint = 0xFFFD;
-pub const MAX_ASCII_CODE_POINT: CodePoint = 0x7F;
-pub const MAX_LATIN1_CODE_POINT: CodePoint = 0xFF;
 
 /// A range table, flattened to inclusive ranges.
 pub type Table = &'static [(u32, u32)];
@@ -40,7 +38,6 @@ pub static CC: Table = &t::CAT_CC;
 pub static CF: Table = &t::CAT_CF;
 pub static CO: Table = &t::CAT_CO;
 pub static CS: Table = &t::CAT_CS;
-pub static C: Table = &t::CAT_C;
 pub static MN: Table = &t::CAT_MN;
 pub static MC: Table = &t::CAT_MC;
 pub static ME: Table = &t::CAT_ME;
@@ -50,12 +47,8 @@ pub static N: Table = &t::IS_NUMBER;
 pub static Z: Table = &t::CAT_Z;
 pub static ZS: Table = &t::CAT_ZS;
 pub static L: Table = &t::IS_LETTER;
-pub static LU: Table = &t::IS_UPPER;
-pub static LL: Table = &t::IS_LOWER;
-pub static LT: Table = &t::IS_TITLE;
 pub static P: Table = &t::IS_PUNCT;
 pub static S: Table = &t::IS_SYMBOL;
-pub static WHITE_SPACE: Table = &t::IS_SPACE;
 
 pub fn is_letter(r: CodePoint) -> bool {
     table_contains(&t::IS_LETTER, r)
@@ -65,9 +58,6 @@ pub fn is_upper(r: CodePoint) -> bool {
 }
 pub fn is_lower(r: CodePoint) -> bool {
     table_contains(&t::IS_LOWER, r)
-}
-pub fn is_title(r: CodePoint) -> bool {
-    table_contains(&t::IS_TITLE, r)
 }
 pub fn is_digit(r: CodePoint) -> bool {
     if (0..=0x7F).contains(&r) {
@@ -152,7 +142,6 @@ impl CaseMap {
 
 static LOWER_MAP: LazyLock<CaseMap> = LazyLock::new(|| CaseMap::new(&t::TO_LOWER));
 static UPPER_MAP: LazyLock<CaseMap> = LazyLock::new(|| CaseMap::new(&t::TO_UPPER));
-static TITLE_MAP: LazyLock<CaseMap> = LazyLock::new(|| CaseMap::new(&t::TO_TITLE));
 static FOLD_MAP: LazyLock<CaseMap> = LazyLock::new(|| CaseMap::new(&t::SIMPLE_FOLD));
 
 fn map_lookup(map: &CaseMap, r: CodePoint) -> CodePoint {
@@ -180,10 +169,6 @@ pub fn to_uppercase(r: CodePoint) -> CodePoint {
         return r;
     }
     map_lookup(&UPPER_MAP, r)
-}
-
-pub fn to_titlecase(r: CodePoint) -> CodePoint {
-    map_lookup(&TITLE_MAP, r)
 }
 
 /// The next code point of r's case-fold orbit (r itself when it has none).
@@ -219,12 +204,7 @@ mod tests {
 
     #[test]
     fn caseless_range_has_no_mappings() {
-        for table in [
-            &t::TO_LOWER[..],
-            &t::TO_UPPER[..],
-            &t::TO_TITLE[..],
-            &t::SIMPLE_FOLD[..],
-        ] {
+        for table in [&t::TO_LOWER[..], &t::TO_UPPER[..], &t::SIMPLE_FOLD[..]] {
             assert!(table.iter().all(|&(k, _)| !CASELESS.contains(&k)));
         }
     }
@@ -246,10 +226,6 @@ mod tests {
             assert_eq!(
                 UPPER_MAP.get(r),
                 if r < 0 { r } else { reference(&t::TO_UPPER, r) }
-            );
-            assert_eq!(
-                TITLE_MAP.get(r),
-                if r < 0 { r } else { reference(&t::TO_TITLE, r) }
             );
             assert_eq!(
                 FOLD_MAP.get(r),

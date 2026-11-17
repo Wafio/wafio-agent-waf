@@ -4,13 +4,9 @@
 
 use std::net::IpAddr;
 
-use maxminddb::MaxMindDbError;
 use serde::Deserialize;
 use wafio_application::geo::to_ipv4;
 
-#[cfg(feature = "mmap")]
-type Source = maxminddb::Mmap;
-#[cfg(not(feature = "mmap"))]
 type Source = Vec<u8>;
 
 const IS_ANONYMOUS_IP: u32 = 1;
@@ -111,23 +107,9 @@ pub(crate) struct AsnRecord {
     pub autonomous_system_organization: String,
 }
 
-fn open_source(path: &str) -> Result<maxminddb::Reader<Source>, MaxMindDbError> {
-    #[cfg(feature = "mmap")]
-    {
-        // SAFETY: the databases are replaced by renaming a new file over them, never edited in place.
-        #[allow(unsafe_code)]
-        let reader = unsafe { maxminddb::Reader::open_mmap(path) };
-        reader
-    }
-    #[cfg(not(feature = "mmap"))]
-    {
-        maxminddb::Reader::open_readfile(path)
-    }
-}
-
 impl Reader {
     pub(crate) fn open(path: &str) -> Result<Reader, String> {
-        let db = open_source(path).map_err(|e| e.to_string())?;
+        let db = maxminddb::Reader::open_readfile(path).map_err(|e| e.to_string())?;
         let kind = db_type(&db.metadata().database_type)?;
         Ok(Reader { db, kind })
     }

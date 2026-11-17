@@ -551,15 +551,6 @@ pub fn parse_head(buf: &[u8]) -> Result<Head, HeadError> {
     Ok(head)
 }
 
-/// Checks only the request line once it is complete (it is answered before the headers end).
-/// `Ok(())` also while the line is incomplete.
-pub fn check_first_line(buf: &[u8]) -> Result<(), HeadError> {
-    match parse_start_line(buf) {
-        Err(HeadError::Bad) => Err(HeadError::Bad),
-        _ => Ok(()),
-    }
-}
-
 // ---- URI host part -------------------------------------------------------------------------
 
 /// Splits off an absolute-form scheme and authority: (scheme, host, uri).

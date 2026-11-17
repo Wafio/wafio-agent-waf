@@ -52,7 +52,6 @@
           "crates/bytetext/src/html_entities.rs",
           "crates/bodyinspect/src/decode.rs",
           "crates/agent-io/src/url_parse.rs",
-          "crates/proxy/src/url_parse.rs",
           "crates/proxy/src/sniff.rs",
           "crates/domain/src/websocket_config.rs",
           "crates/domain/src/multipart.rs",

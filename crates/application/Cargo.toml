@@ -14,11 +14,9 @@ wafio-engine-rules.workspace = true
 wafio-bytetext.workspace = true
 wafio-lru.workspace = true
 wafio-malware.workspace = true
-regex.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 memchr.workspace = true
 
 [dev-dependencies]
-brotli.workspace = true
-flate2.workspace = true
+wafio-engine-fake.workspace = true

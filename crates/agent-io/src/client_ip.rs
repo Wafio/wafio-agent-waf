@@ -78,20 +78,6 @@ pub fn is_client_address_header(name: &[u8]) -> bool {
         || eq_ignore_case(&dashed, HEADER_X_FORWARDED_FOR.as_bytes())
 }
 
-/// Removes every incoming X-Real-IP and X-Forwarded-For line
-/// (any case, underscore spellings included) and every `Proxy` line (httpoxy) from the upstream
-/// header list, then appends the replacements. The route's `request_headers` are applied after this.
-/// The other lines keep their order.
-pub fn rewrite_upstream_client_headers(
-    upstream: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    remote: &[u8],
-    forwarded_for: Vec<u8>,
-) {
-    upstream.retain(|(n, _)| !is_client_address_header(n) && !eq_ignore_case(n, b"Proxy"));
-    upstream.push((HEADER_X_REAL_IP.as_bytes().to_vec(), remote.to_vec()));
-    upstream.push((HEADER_X_FORWARDED_FOR.as_bytes().to_vec(), forwarded_for));
-}
-
 /// True for a loopback or private client that is the TCP
 /// peer itself. An address from X-Forwarded-For or X-Real-IP never counts.
 pub fn is_direct_local_client(peer: &IpAddress, client_ip: &str) -> bool {
@@ -367,66 +353,21 @@ mod tests {
         ];
         for (cfg, p, headers, want_xff, want_xri) in cases {
             let pe = peer(p);
-            let remote = effective_client_ip(&pe, headers, cfg);
-            let mut up: Vec<(Vec<u8>, Vec<u8>)> = headers
-                .iter()
-                .map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec()))
-                .collect();
-            up.push((b"x-real-ip".to_vec(), b"1.1.1.1".to_vec()));
-            rewrite_upstream_client_headers(
-                &mut up,
-                remote.as_bytes(),
-                outgoing_forwarded_for(&pe, headers, cfg),
-            );
-            let get = |name: &str| -> Vec<String> {
-                up.iter()
-                    .filter(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
-                    .map(|(_, v)| String::from_utf8(v.clone()).unwrap())
-                    .collect()
-            };
             assert_eq!(
-                get("X-Forwarded-For"),
-                vec![want_xff.to_string()],
+                effective_client_ip(&pe, headers, cfg),
+                *want_xri,
                 "{p} {headers:?}"
             );
             assert_eq!(
-                get("X-Real-IP"),
-                vec![want_xri.to_string()],
+                outgoing_forwarded_for(&pe, headers, cfg),
+                want_xff.as_bytes(),
                 "{p} {headers:?}"
             );
         }
     }
 
-    /// TestSetUpstreamClientHeadersDropsSpoofsAndProxy: underscore spellings and `Proxy` never reach
-    /// the upstream.
     #[test]
-    fn upstream_headers_drop_spoofs_and_proxy() {
-        for name in [
-            "X_Forwarded_For",
-            "x_real_ip",
-            "X-Real_IP",
-            "X_FORWARDED-FOR",
-            "Proxy",
-            "proxy",
-        ] {
-            let mut up: Vec<(Vec<u8>, Vec<u8>)> = vec![
-                (name.as_bytes().to_vec(), b"6.6.6.6".to_vec()),
-                (name.as_bytes().to_vec(), b"7.7.7.7".to_vec()),
-                (b"X-Forwarded-For".to_vec(), b"5.5.5.5".to_vec()),
-                (b"User-Agent".to_vec(), b"t".to_vec()),
-            ];
-            rewrite_upstream_client_headers(&mut up, b"203.0.113.7", b"203.0.113.7".to_vec());
-            let names: Vec<&[u8]> = up.iter().map(|(n, _)| n.as_slice()).collect();
-            assert_eq!(
-                names,
-                [&b"User-Agent"[..], b"X-Real-IP", b"X-Forwarded-For"],
-                "{name}"
-            );
-            assert!(
-                up.iter().skip(1).all(|(_, v)| v == b"203.0.113.7"),
-                "{name}"
-            );
-        }
+    fn client_address_header_names() {
         for (n, want) in [
             ("X-Real-IP", true),
             ("x-forwarded-for", true),

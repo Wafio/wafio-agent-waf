@@ -130,14 +130,6 @@ impl AnalysisResult {
     }
 }
 
-/// The evidence of a guessed (or unknown) match source.
-pub fn inferred_match_evidence(source: &[u8]) -> MatchEvidence {
-    MatchEvidence {
-        source: source.to_vec(),
-        ..Default::default()
-    }
-}
-
 /// The evidence of a decision.
 pub fn decision_evidence<S: AsRef<str>>(
     source: &[u8],

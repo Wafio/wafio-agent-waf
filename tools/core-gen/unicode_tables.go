@@ -61,7 +61,6 @@ func main() {
 	emitRanges("IS_LETTER", unicode.IsLetter)
 	emitRanges("IS_UPPER", unicode.IsUpper)
 	emitRanges("IS_LOWER", unicode.IsLower)
-	emitRanges("IS_TITLE", unicode.IsTitle)
 	emitRanges("IS_DIGIT", unicode.IsDigit)
 	emitRanges("IS_NUMBER", unicode.IsNumber)
 	emitRanges("IS_MARK", unicode.IsMark)
@@ -81,9 +80,7 @@ func main() {
 	emitRanges("CAT_ND", in(unicode.Nd))
 	emitRanges("CAT_Z", in(unicode.Z))
 	emitRanges("CAT_ZS", in(unicode.Zs))
-	emitRanges("CAT_C", in(unicode.C))
 	emitMap("TO_LOWER", unicode.ToLower)
 	emitMap("TO_UPPER", unicode.ToUpper)
-	emitMap("TO_TITLE", unicode.ToTitle)
 	emitMap("SIMPLE_FOLD", unicode.SimpleFold)
 }

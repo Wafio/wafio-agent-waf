@@ -174,7 +174,7 @@ pub fn unix_socket_path_of_upstream(upstream: &str) -> Option<String> {
 
 /// The scheme and host of an `http(s)://` upstream (the default port added).
 fn parse_http_upstream(app_id: &str, upstream: &str) -> Result<(&'static str, String), String> {
-    let u = crate::url_parse::parse(upstream.as_bytes()).map_err(|e| {
+    let u = wafio_agent_io::url_parse::parse(upstream.as_bytes()).map_err(|e| {
         format!(
             "app {}: parse upstream {}: {e}",
             quote(app_id.as_bytes()),

@@ -92,7 +92,7 @@ async fn fragmented_message_assembled_with_ping_between() {
     assert_eq!(pong, [0x80 | OP_PONG, 1, b'p']);
 }
 
-/// Review finding: the ping handler ignores a pong that cannot be written within the reply timeout
+/// The ping handler ignores a pong that cannot be written within the reply timeout
 /// (a data write to a slow peer holds the writer); the read goes on ("hi" after 1 s).
 #[tokio::test]
 async fn ping_while_writer_busy_keeps_reading() {

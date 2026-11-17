@@ -53,14 +53,6 @@ pub fn classify_semantic_reason(
     }
 }
 
-/// Deprecated alias of [`classify_semantic_reason`].
-pub fn classify_legacy_scan_reason(
-    normalized_reason: &str,
-    match_detail: &[u8],
-) -> AttackClassification {
-    classify_semantic_reason(normalized_reason, match_detail)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,16 +69,6 @@ mod tests {
             assert!(
                 !t.mitre_techniques.is_empty(),
                 "reason {reason} has no MITRE technique"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_scan_classification_alias_matches() {
-        for reason in ALL_SEMANTIC_REASONS {
-            assert_eq!(
-                classify_semantic_reason(reason, b"").cwe,
-                classify_legacy_scan_reason(reason, b"").cwe
             );
         }
     }

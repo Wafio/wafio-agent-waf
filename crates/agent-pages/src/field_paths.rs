@@ -44,18 +44,6 @@ pub fn allows_method(methods: &[String], method: &[u8]) -> bool {
         .any(|m| wafio_bytetext::strings::to_uppercase(trim_whitespace(m.as_bytes())) == method)
 }
 
-/// The method filter for the field rules of a request (the path match is engine-rules').
-pub fn filter_field_rules_by_method(
-    rules: &[RequestFieldRule],
-    method: &[u8],
-) -> Vec<RequestFieldRule> {
-    rules
-        .iter()
-        .filter(|r| allows_method(&r.methods, method))
-        .cloned()
-        .collect()
-}
-
 const UTF8_BYTE_ORDER_MARK: &[u8] = b"\xef\xbb\xbf";
 
 // Documents nested deeper than this are decoded and rewritten on a big-stack thread:

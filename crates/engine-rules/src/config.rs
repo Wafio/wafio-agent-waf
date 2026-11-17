@@ -1315,11 +1315,6 @@ pub fn load_rules_json(data: &[u8]) -> Result<LoadResult, JsonDecodeError> {
     read_rule_map_json(data)
 }
 
-pub fn load_rules_file(path: &str) -> Result<LoadResult, String> {
-    let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    read_rule_map_json(&data).map_err(|e| e.to_string())
-}
-
 fn decode_struct<T: Default>(
     v: &Value,
     f: impl FnOnce(&mut DecodeTrace, &Value, &mut T) -> Result<(), JsonDecodeError>,
@@ -2349,13 +2344,6 @@ pub fn find_exception_for_forwarded_path<'a>(
     )
 }
 
-pub fn find_exception_for_request_path<'a>(
-    rp: &RequestPathReadings,
-    exceptions: &'a [PathExceptionConfig],
-) -> Option<&'a PathExceptionConfig> {
-    first_exception_over_readings(rp, exceptions, false)
-}
-
 pub fn find_exception_for_raw_target_with_field_rules<'a>(
     uri: &[u8],
     exceptions: &'a [PathExceptionConfig],
@@ -2616,11 +2604,6 @@ pub fn exception_matches_path_folded(
             req == p.as_slice() || (req.starts_with(&p) && req.get(p.len()) == Some(&b'/'))
         }
     }
-}
-
-/// Case-insensitive comparison for callers matching config names.
-pub fn eq_ignore_case_str(a: &str, b: &str) -> bool {
-    eq_ignore_case(a.as_bytes(), b.as_bytes())
 }
 
 #[cfg(test)]

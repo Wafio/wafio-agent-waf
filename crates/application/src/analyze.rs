@@ -103,7 +103,7 @@ impl AnalyzeConfig {
     }
 }
 
-/// Builds the base SemanticConfig once and compiles the custom-rule regexes. Call after every field is set.
+/// Builds the base SemanticConfig once. Call after every field is set.
 pub fn cache_base_semantic_config(cfg: &mut AnalyzeConfig) {
     let mut sc = SemanticConfig {
         ssrf_config: cfg.ssrf_config.clone(),
@@ -111,11 +111,6 @@ pub fn cache_base_semantic_config(cfg: &mut AnalyzeConfig) {
     };
     apply_policy_overrides(&mut sc, cfg.semantic_policies.as_ref());
     cfg.cached_semantic_config = Some(Arc::new(sc));
-    compile_rule_regexes(
-        &cfg.custom_gui_rules,
-        &cfg.custom_tuning_rules,
-        &cfg.path_exceptions,
-    );
 }
 
 /// Engine keys of `SemanticConfig.disabled_engines` that tuning can skip.

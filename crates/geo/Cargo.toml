@@ -6,11 +6,6 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
-[features]
-# Memory-map the .mmdb files (the city database is ~130 MiB); needs memmap2,
-# which maxminddb pulls in only with this feature.
-mmap = ["maxminddb/mmap"]
-
 [dependencies]
 wafio-application.workspace = true
 wafio-bytetext.workspace = true

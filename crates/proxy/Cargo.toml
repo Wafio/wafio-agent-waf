@@ -26,4 +26,3 @@ memchr.workspace = true
 
 [dev-dependencies]
 wafio-engine-fake.workspace = true
-serde_json = { workspace = true }
