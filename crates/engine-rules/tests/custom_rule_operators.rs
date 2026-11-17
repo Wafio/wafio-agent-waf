@@ -1,6 +1,5 @@
-//! Regression tests for review findings: regexp syntax acceptance and program size, glob matching
-//! and float parsing in custom rule operators. Expected values are what the control plane's
-//! regexp engine, glob matching and float parsing give (from the review's differential).
+//! Custom rule operators: regexp syntax acceptance and program size, glob matching and float parsing.
+//! Expected values are what the control plane's regexp engine, glob matching and float parsing give.
 
 use wafio_engine_rules::*;
 

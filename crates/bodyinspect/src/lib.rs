@@ -27,7 +27,7 @@ pub use decode::{
 
 /// Bytes examined by the text sniffer; the head decides.
 pub const SNIFF_WINDOW_BYTES: usize = 64 << 10;
-/// Same threshold as the semantic whole-body fallback.
+/// Share of printable bytes in the head below which the sniffer takes a body for something other than text.
 const SNIFF_MIN_PRINTABLE_RATIO: f64 = 0.85;
 /// Declared-type label length in the mismatch note.
 const LABEL_MAX_LEN: usize = 64;

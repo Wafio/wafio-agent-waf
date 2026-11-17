@@ -38,7 +38,7 @@ The agent speaks the protocol defined in wafio-cp-backend (`shared/proto`). A co
 - `docker` on the build host for `scripts/build-dist.sh --container`, which builds a release input; that host needs no Rust.
 - `bash` for the scripts, `gitleaks` 8.30.1 for the gate, `go` only for `tools/core-gen`.
 - A checkout of uddin-lang-rs next to this one (`../uddin-lang-rs`). The agent runs script rules with its crate `uddin-waf`, which
-  `Cargo.toml` takes by path for now; a pinned git revision of uddin-lang-rs replaces the path later.
+  `Cargo.toml` takes by path for now. uddin-lang-rs has the tag v0.1.0; a git dependency on a tag replaces the path later.
 - No `protoc`: the build compiles the proto file with `protox`.
 
 ## Build
@@ -125,10 +125,13 @@ The rules documents the reader of `engine-rules` is replayed against (`rules_gol
 `WAFIO_WRITE_SNAPSHOT=1 cargo test -p wafio-waf-agent --test bundle_golden`; the other golden data is written by
 `scripts/make-snapshot.sh` of wafio-semantic-engine.
 
-Tests that compare against another implementation through an environment variable (`WAFIO_GOLDEN_*`,
-`WAFIO_BOT_ORACLE`) skip when it is unset. The script replay (`crates/waf-agent/tests/script_rules.rs`) runs the recorded
-cases of `build/regression/script-golden.jsonl` (`WAFIO_SCRIPT_GOLDEN` names another file), made with the Go
-interpreter of wafio-cp-backend, through the agent's runner, and skips when the file is missing.
+Tests that compare against the control plane's Go code through a dump skip when the variable of their dump is unset:
+`geo_differential` (`GODUMP_GEO`, the databases in `GEO_DB_DIR`), `net_differential` (`WAFIO_GONET_ORACLE`),
+`pattern_differential` (`WAFIO_REGEXP_ORACLE`) and the websocket rules check of `wafio-domain` (`GODUMP_WS`). Go tests in
+wafio-cp-backend (`shared/geo`, `internal/engine`, `internal/domain`) write the dumps, each when its `*_OUT` variable names a file.
+The script replay (`crates/waf-agent/tests/script_rules.rs`) runs the recorded cases of `build/regression/script-golden.jsonl`
+(`WAFIO_SCRIPT_GOLDEN` names another file) through the agent's runner, and skips when the file is missing. The file is not in git:
+`scripts/make-snapshot.sh` of wafio-semantic-engine writes it, with the results of this runner, from recorded script cases.
 
 The black-box suites that start an agent binary and drive it over HTTP and gRPC live in wafio-cp-backend
 (`internal/conformance/blackbox`). They take the binary from `WAFIO_AGENT_BIN`, so they run against this agent too.
@@ -258,7 +261,7 @@ The agent needs a control plane to get its routes from, so there is no static mo
 dashboard, download its mTLS bundle, then:
 
 ```sh
-target/release/wafio-waf-agent \
+target/release/wafio-waf-agent-open \
   --grpc-server cp.example.test:9090 \
   --client-cert client.crt --client-key client.key --ca-cert ca.crt \
   --agent-name my-agent \
@@ -275,7 +278,7 @@ lists, bot fingerprints, malware hashes) once, and again from time to time. `--d
 `--profile` is `agent` by default, `--only` picks single components and `--force` downloads again:
 
 ```sh
-wafio-waf-agent fetch-data --dir /etc/wafio/security-data --maxmind-key <key>
+wafio-waf-agent-open fetch-data --dir /etc/wafio/security-data --maxmind-key <key>
 ```
 
 ## Configuration
@@ -287,7 +290,7 @@ start and names every missing one): `--grpc-server` (`WAFIO_GRPC_SERVER`), `--cl
 `--bot-ja4-file` or `--bot-ja3-file` (when `--bot-ja4-file` is empty the agent uses the first non-empty `ja4.txt` it finds under
 `security-data/ja4/`, `/etc/wafio/security-data/ja4/` and `/usr/local/share/wafio/ja4/`). Optional ones include `--host-key`,
 `--state-dir`, `--bundle-cache-max-age` (default `168h0m0s`), the IP reputation and jail files and `--pid-file`.
-`wafio-waf-agent --help` lists all of them.
+`wafio-waf-agent-open --help` lists all of them.
 
 The security data (GeoIP databases, user-agent and fingerprint lists, IP reputation lists, malware hashes) lives in one
 directory: `--security-data-dir` (`WAFIO_SECURITY_DATA_DIR`, default `/etc/wafio/security-data`). The control plane
@@ -309,8 +312,8 @@ systemctl reload wafio-waf-agent    # a successor takes the listening sockets, t
 The agent sends `READY=1` after its first bundle (live or cached). The unit runs as the system user `wafio`, keeps
 `CAP_NET_BIND_SERVICE` so an app can listen below port 1024, and applies the containment that the header of the
 unit file lists, with what stays writable. The Rust
-agent has not been started under the unit on a real systemd yet: test a start, a reload and a script rule on the demo
-first.
+agent has not been started under the unit on a real systemd yet: test a start, a reload and a script rule on a test host
+before a production host.
 
 ## Switching inspection off
 
@@ -410,7 +413,7 @@ fit is inspected as received (`body_decompress_budget`).
 
 The only C code in the binary is the TLS provider (`ring`) and the allocator (`mimalloc`). `cargo tree` still lists
 `zstd-sys` and `libz-ng-sys` under `pingora-core`; nothing calls them and the linker drops them. On a release binary,
-`nm wafio-waf-agent | grep -E 'zng_|ZSTD_'` prints nothing.
+`nm wafio-waf-agent-open | grep -E 'zng_|ZSTD_'` prints nothing.
 
 ## Protocol file
 

@@ -118,7 +118,7 @@ async fn sigusr2_reload_under_load() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Run from a copy so the "package upgrade" below can replace the file under it.
-    let exe = dir.join("wafio-demo");
+    let exe = dir.join("reload-demo");
     std::fs::copy(demo_exe(), &exe).unwrap();
     let notify = UnixDatagram::bind(dir.join("notify.sock")).unwrap();
     notify
@@ -152,8 +152,8 @@ async fn sigusr2_reload_under_load() {
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     // Package upgrade: a new file at the same path, then `systemctl reload` = SIGUSR2.
-    std::fs::copy(&exe, dir.join("wafio-demo.new")).unwrap();
-    std::fs::rename(dir.join("wafio-demo.new"), &exe).unwrap();
+    std::fs::copy(&exe, dir.join("reload-demo.new")).unwrap();
+    std::fs::rename(dir.join("reload-demo.new"), &exe).unwrap();
     let usr2_at = Instant::now();
     assert!(
         std::process::Command::new("kill")

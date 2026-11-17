@@ -2,7 +2,6 @@
 """Fail on known advisories for the packages in a lockfile that are not in the allowlist.
 
     scripts/advisories.py Cargo.lock
-    scripts/advisories.py web/bun.lock
 
 Asks OSV (api.osv.dev) about every locked registry package. Only the ecosystem, package
 name and version are sent. Unmaintained notices count as advisories. When OSV cannot be
@@ -29,14 +28,7 @@ def parse_cargo(text):
     return {("crates.io", p["name"], p["version"]) for p in pkgs if str(p.get("source", "")).startswith("registry+")}
 
 
-def parse_bun(text):
-    """bun.lock is JSON with trailing commas; entry[0] is "name@version"."""
-    pkgs = json.loads(re.sub(r",(\s*[}\]])", r"\1", text)).get("packages", {})
-    found = (re.fullmatch(r"(@?[^@]+)@(\d[^@]*)", entry[0]) for entry in pkgs.values())
-    return {("npm", m[1], m[2]) for m in found if m}
-
-
-PARSERS = {"Cargo.lock": parse_cargo, "bun.lock": parse_bun}
+PARSERS = {"Cargo.lock": parse_cargo}
 
 
 def read_allow(path):
@@ -89,5 +81,5 @@ def main(path, allow=ALLOW):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2 or os.path.basename(sys.argv[1]) not in PARSERS:
-        sys.exit("usage: advisories.py Cargo.lock|bun.lock")
+        sys.exit("usage: advisories.py Cargo.lock")
     sys.exit(main(sys.argv[1]))

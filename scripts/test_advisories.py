@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests of the lockfile parsers and the pass, fail and offline paths of advisories.py."""
+"""Tests of the lockfile parser and the pass, fail and offline paths of advisories.py."""
 import contextlib
 import io
 import os
@@ -31,28 +31,9 @@ version = "0.2.0"
 source = "git+https://example.invalid/x#abc"
 """
 
-BUN = """\
-{
-  "lockfileVersion": 1,
-  "workspaces": { "": { "name": "site", "dependencies": { "svelte": "^5.0.0", }, }, },
-  "packages": {
-    "svelte": ["svelte@5.57.1", "", { "dependencies": { "devalue": "^5.9.2", }, }, "sha512-x"],
-    "@sveltejs/kit": ["@sveltejs/kit@2.70.4", "", {}, "sha512-y"],
-    "svelte/acorn": ["acorn@8.18.0", "", {}, "sha512-z"],
-    "site": ["site@workspace:.", ""],
-    "alias": ["alias@npm:other@1.0.0", ""],
-  },
-}
-"""
-
-
 class Advisories(unittest.TestCase):
-    def test_parsers(self):
+    def test_parser(self):
         self.assertEqual(advisories.parse_cargo(CARGO), {("crates.io", "serde", "1.0.200")})
-        self.assertEqual(
-            advisories.parse_bun(BUN),
-            {("npm", "svelte", "5.57.1"), ("npm", "@sveltejs/kit", "2.70.4"), ("npm", "acorn", "8.18.0")},
-        )
 
     def run_main(self, allow_text, query):
         with tempfile.TemporaryDirectory() as d:

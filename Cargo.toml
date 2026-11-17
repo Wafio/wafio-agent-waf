@@ -29,8 +29,8 @@ wafio-geo = { path = "crates/geo" }
 wafio-malware = { path = "crates/malware" }
 wafio-engine-fake = { path = "crates/engine-fake" }
 
-# the script interpreter, checked out next to this repository. A pinned git revision of uddin-lang-rs replaces
-# the path later.
+# the script interpreter, checked out next to this repository. uddin-lang-rs has the tag v0.1.0; a git
+# dependency on a tag replaces the path later.
 uddin-waf = { path = "../uddin-lang-rs/crates/uddin-waf" }
 
 # third party (add here first, then `dep.workspace = true` in the crate)
@@ -44,7 +44,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 crc32fast = "1.5"
 flate2 = "1.1"
 libc = "0.2"
-# Loads the engine library. 0.9.0 and not the 0.9.1 of 2026-11-13, which is three days old; OSV lists no advisory for any version.
+# Loads the engine library. 0.9.0 and not the 0.9.1 of 2026-11-13, which was three days old at the review of 2026-11-16; OSV listed no advisory for any version.
 libloading = "0.9"
 maxminddb = "0.32"
 memchr = "2.8"
