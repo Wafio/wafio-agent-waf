@@ -1,0 +1,29 @@
+[package]
+name = "wafio-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wafio-agent-io.workspace = true
+wafio-agent-pages.workspace = true
+wafio-application.workspace = true
+wafio-bodyinspect.workspace = true
+wafio-domain.workspace = true
+wafio-engine-api.workspace = true
+wafio-engine-rules.workspace = true
+wafio-bytetext.workspace = true
+base64 = { workspace = true }
+bytes = { workspace = true }
+pingora = { workspace = true }
+sd-notify = { workspace = true }
+nix.workspace = true
+tokio = { workspace = true }
+tracing = { workspace = true }
+memchr.workspace = true
+
+[dev-dependencies]
+wafio-engine-fake.workspace = true
+serde_json = { workspace = true }

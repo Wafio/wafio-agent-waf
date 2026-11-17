@@ -1,0 +1,11 @@
+/target/
+target-*/
+/build/
+/security-data/
+
+# Private keys of the test certificates stay out of git (scripts/ci-local.sh, WAFIO_TEST_KEYS_DIR).
+*.key
+*.pem
+.env
+.env.*
+*.log

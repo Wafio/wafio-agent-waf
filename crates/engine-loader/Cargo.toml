@@ -1,0 +1,21 @@
+[package]
+name = "wafio-engine-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+# Lets a library owned by the user the process runs as pass the owner check, so that tests can run unprivileged.
+# Never enabled by a release build: the only crate that asks for it does so in its dev-dependencies.
+test-owner = []
+
+[dependencies]
+wafio-domain.workspace = true
+wafio-engine-abi.workspace = true
+wafio-engine-api.workspace = true
+libc.workspace = true
+libloading.workspace = true
+sha2.workspace = true
+tracing.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "wafio-agent-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wafio-control.workspace = true
+wafio-domain.workspace = true
+wafio-engine-api.workspace = true
+wafio-bytetext.workspace = true
+base64.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+memchr.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

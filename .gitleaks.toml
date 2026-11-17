@@ -1,0 +1,23 @@
+# gitleaks configuration (scripts/ci-local.sh, secret scan).
+#
+# Extends the default rule set. The allowlists cover test code only: Rust
+# integration tests and test modules carry dummy secrets and JWTs on purpose,
+# and a few unit tests in non-test files use the RFC 6455 sample
+# Sec-WebSocket-Key. A new secret anywhere else fails the scan.
+
+title = "wafio-agent-waf"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test code and test data"
+paths = [
+  '''^crates/[^/]+/tests/''',
+  '''(^|/)tests\.rs$''',
+  '''(^|/)src/.+/tests/''',
+]
+
+[[allowlists]]
+description = "RFC 6455 sample Sec-WebSocket-Key"
+regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']

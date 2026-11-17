@@ -1,0 +1,8 @@
+Generators and a check for the wafio-bytetext tables. They need Go and run from this directory
+(go.mod here pins the toolchain and golang.org/x/text; the rest of the repo has no Go):
+
+  go run unicode_tables.go > ../../crates/bytetext/src/unicode_tables.rs
+  go run entity/main.go entity/entity.go > ../../crates/bytetext/src/html_entities.rs
+  go run nfkc_inert.go        checks the model crates/bytetext/src/norm.rs relies on against x/text; prints violations
+
+entity/entity.go is a copy of $GOROOT/src/html/entity.go with the package renamed.

@@ -1,0 +1,292 @@
+// Golden generator for wafio-agent-io (crates/agent-io/src/golden_tests.rs).
+// Copied into internal/wafagent of wafio-cp-backend on the build machine only:
+//
+//	cp ../wafio-agent-waf/crates/agent-io/golden/agentio_golden_test.go.txt internal/wafagent/zz_agentio_golden_test.go
+//	AGENTIO_GOLDEN_OUT=/tmp/agentio.jsonl go test ./internal/wafagent -run TestAgentIOGolden -count=1
+//
+// Every line: {"fn": name, "in": {...}, "out": {...}}; bytes are hex.
+package wafagent
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"math"
+	"math/rand/v2"
+	"net"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/fasthttp/websocket"
+
+	"github.com/wafio/wafio-cp-backend/internal/domain"
+)
+
+func TestAgentIOGolden(t *testing.T) {
+	path := os.Getenv("AGENTIO_GOLDEN_OUT")
+	if path == "" {
+		t.Skip("AGENTIO_GOLDEN_OUT not set")
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	emit := func(fn string, in, out any) {
+		if err := enc.Encode(map[string]any{"fn": fn, "in": in, "out": out}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := hex.EncodeToString
+	rng := rand.New(rand.NewPCG(7, 11))
+
+	pieces := [][]byte{
+		[]byte("' OR 1=1--"), []byte(" union select "), []byte("hello world "), []byte(`{"a":"b"}`), []byte("é"), []byte("日本"),
+		{0xff}, {0xfe, 0xfd}, {0xc3}, {0xe2, 0x82}, {0xed, 0xa0, 0x80}, {0x00}, {0x01, 0x7f}, {'\t'}, {'\n'}, {0x1f, 0x8b},
+		[]byte("\xef\xbf\xbd"), []byte("abcdefghijklmnop"), []byte("<script>"), []byte(`"}`),
+	}
+	randBytes := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(rng.Uint32())
+		}
+		return b
+	}
+	gen := func() []byte {
+		var b []byte
+		switch rng.IntN(4) {
+		case 0:
+			return randBytes(rng.IntN(600))
+		case 1:
+			n := rng.IntN(40)
+			for range n {
+				b = append(b, pieces[rng.IntN(len(pieces))]...)
+			}
+		case 2:
+			b = append(b, `{"q":"`...)
+			for range rng.IntN(30) {
+				b = append(b, pieces[rng.IntN(len(pieces))]...)
+			}
+			b = append(b, `"}`...)
+		default:
+			for range rng.IntN(25) {
+				b = append(b, pieces[rng.IntN(len(pieces))]...)
+				b = append(b, randBytes(rng.IntN(30))...)
+			}
+		}
+		return b
+	}
+
+	// ws_frame_scan_view / runs / decoded-printable
+	for i := range 4000 {
+		p := gen()
+		if i%500 == 0 {
+			p = append(p, randBytes(70000)...)
+		}
+		kind := websocket.BinaryMessage
+		if rng.IntN(4) == 0 {
+			kind = websocket.TextMessage
+		}
+		maxText := []int{64 << 10, 100, 300, 1000}[rng.IntN(4)]
+		v := wsFrameScanView(kind, p, maxText)
+		var text any
+		if v.text != nil {
+			text = h(v.text)
+		}
+		emit("frame_view", map[string]any{"kind": kind, "p": h(p), "max": maxText},
+			map[string]any{"text": text, "runs": v.runs, "oversize": v.oversize})
+		limit := []int{5, 40, 1000}[rng.IntN(3)]
+		emit("printable_runs", map[string]any{"p": h(p), "limit": limit}, map[string]any{"v": h(wsPrintableRuns(p, limit))})
+		emit("decoded_printable", map[string]any{"p": h(p)}, map[string]any{"v": wsDecodedMostlyPrintable(p)})
+		emit("sanitize", map[string]any{"p": h(p)}, map[string]any{"v": h([]byte(sanitizeUTF8(string(p))))})
+	}
+
+	// websocket config
+	wsInputs := []string{
+		``, `   `, `{}`, `null`, `[]`, `{"a":1}`, `{"websocket":null}`, `{"websocket":7}`, `{"websocket":"x"}`, `{"websocket":[]}`,
+		`{"websocket":{}}`, `{"websocket":{"enabled":false}}`, `{"websocket":{"enabled":null}}`, `{"websocket":{"Enabled":null}}`,
+		`{"websocket":{"Enabled":false}}`, `{"websocket":{"ENABLED":false,"enabled":true}}`, `{"websocket":{"enabled":"no"}}`,
+		`{"websocket":{"scan_server_frames":true}}`, `{"websocket":{"SCAN_SERVER_FRAMES":true}}`, `{"websocket":{"scan_binary_hashes":true}}`,
+		`{"websocket":{"scan_binary_hashes":null}}`, `{"websocket":{"Scan_Binary_Hashes":null}}`, `{"websocket":{"scan_server_frames":1}}`,
+		`{"websocket":{"limits":{"max_text_bytes":10}}}`, `{"websocket":{"limits":{"max_text_bytes":-1}}}`, `{"websocket":{"limits":{"max_text_bytes":1.5}}}`,
+		`{"websocket":{"limits":{"max_text_bytes":1e3}}}`, `{"websocket":{"limits":{"max_text_bytes":-0}}}`, `{"websocket":{"limits":{"max_text_bytes":"5"}}}`,
+		`{"websocket":{"limits":{"max_text_bytes":null}}}`, `{"websocket":{"limits":{"MAX_TEXT_BYTES":null}}}`, `{"websocket":{"limits":null}}`,
+		`{"websocket":{"limits":{"max_text_bytes":5},"limits":{"max_binary_bytes":6}}}`, `{"websocket":{"limits":{"max_messages_per_min":99999999999999999999}}}`,
+		`{"websocket":{"limits":{"max_binary_bytes":-2,"max_messages_per_min":3}}}`, `{"websocket":{"limits":[]}}`, `{"websocket":{"Limits":{"max_text_bytes":-1}}}`,
+		`{"websocket":{"origin_check":{"enabled":true,"allowed_origins":["https://a.test"]}}}`,
+		`{"websocket":{"origin_check":{"enabled":true,"allowed_origins":[]}}}`,
+		`{"websocket":{"origin_check":{"enabled":false,"allowed_origins":[]}}}`,
+		`{"websocket":{"origin_check":{"enabled":true}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://a.test:443","http://b.test:8080"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://a.test/"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://a.test?x"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://a.test#x"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://u@a.test"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["ftp://a.test"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["HTTPS://A.TEST"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://a.test:0"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://a.test:65535"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://a.test:65536"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://[::1]:443"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://[::1"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://a.test "]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https://"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":["https:a.test"]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":[1]}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":"https://a.test"}}}`,
+		`{"websocket":{"origin_check":{"allowed_origins":[null]}}}`,
+		`{"websocket":{"origin_check":null}}`, `{"websocket":{"Origin_Check":{"allowed_origins":["x"]}}}`,
+		`{"websocket":{"origin_check":{"Allowed_Origins":["https://a.test"],"enabled":true}}}`,
+		`{"websocket":{"future":1,"limits":{"max_text_bytes":512,"x":[1,{}]}}}`,
+		`{"websocket":{}} x`, `{"websocket":{},"websocket":7}`, `{"websocket":7,"websocket":{}}`, `{"WebSocket":7}`,
+		`{"websocket":{"origin_check":{"enabled":true,"allowed_origins":["https://a.test"]},"limits":{"max_text_bytes":65536},"scan_binary_hashes":true}}`,
+	}
+	for _, in := range wsInputs {
+		cfg, err := parseWSAppConfig([]byte(in))
+		out := map[string]any{"err": err != nil}
+		if err == nil {
+			out["enabled"] = cfg.Enabled
+			out["oc_enabled"] = cfg.OriginCheck.Enabled
+			out["origins"] = cfg.OriginCheck.AllowedOrigins
+			out["limits"] = []int{cfg.Limits.MaxTextBytes, cfg.Limits.MaxBinaryBytes, cfg.Limits.MaxMsgsPerMin}
+			out["scan_bin"] = cfg.ScanBinaryHashes
+			out["scan_srv"] = cfg.ScanServerFrames
+		}
+		emit("ws_config", map[string]any{"json": in}, out)
+		emit("ws_validate", map[string]any{"json": in}, map[string]any{"err": domain.ValidateWebSocketRulesJSON([]byte(in)) != nil})
+	}
+
+	// origins and URLs
+	origins := []string{"", "https://a.test", "HTTPS://A.TEST", "https://a.test:443", "https://a.test/", "https://a.test/x", "https://a.test?q",
+		"https://a.test#f", "https://u@a.test", " https://a.test", "https://a.test ", "http://a.test", "javascript:alert(1)", "%zz://x",
+		"https://[::1]", "https://[::1]:8443", "null", "https://a.test.evil", "a.test", "//a.test", "https:", "https://"}
+	for _, a := range origins {
+		for _, b := range origins {
+			emit("origin_equals", map[string]any{"a": a, "b": b}, map[string]any{"v": originEquals(a, b)})
+		}
+	}
+	urls := append(origins, "fcgi://127.0.0.1:9000?root=/var/www&index=a.php", "fcgi:///x", "fcgi:", "fcgi://php", "fcgi://[::1]:9000",
+		"fcgi://a:b:c", "http://a:b:80", "mongodb://a:1,b:2/db", "http://[1.2.3.4]/", "http://[fe80::1%25eth0]:80/", "http://[fe80::1%eth0]/",
+		"http://a%41.test/", "http://a%2e.test/", "http://a b/", "http://a<b/", "http://u:p%40@h/p%20q?x=%zz#f%20g", "http://u@x@h/",
+		"*", "/a/b?c#d", "a/b:c", "1a:b", "a:b", "x\x01", "http://h/\x7f", "http://h/%zz", "http://h/?%zz", "http://h/#%zz", "?q", "#f",
+		"HTTP://H:80", "http://h:", "http://h:-1", "http://:80", "http://[::1]x", "http://[::1]:x", "http://a]b", "http://h/ä", "http://ä/",
+		"https://ok.test:70000", "ws://pipe.test/", "wss://h/chat?x=1")
+	for _, raw := range urls {
+		u, err := url.Parse(raw)
+		out := map[string]any{"err": err != nil}
+		if err == nil {
+			out["scheme"], out["opaque"], out["host"], out["path"] = u.Scheme, u.Opaque, u.Host, u.Path
+			out["raw_query"], out["fragment"], out["hostname"], out["port"] = u.RawQuery, u.Fragment, u.Hostname(), u.Port()
+			out["user"] = nil
+			if u.User != nil {
+				pw, set := u.User.Password()
+				var pwv any
+				if set {
+					pwv = pw
+				}
+				out["user"] = []any{u.User.Username(), pwv}
+			}
+		}
+		emit("url_parse", map[string]any{"raw": raw}, out)
+	}
+	hostports := []string{"", "a", "a:1", ":1", "a:", "[::1]:1", "[::1]", "::1:1", "[::1]x:1", "[::1]:1:2", "a]:1", "[a:1", "a[b:1",
+		"127.0.0.1:9100", "localhost:9100", "[fe80::1%lo]:1", "dns:///x:1", "[]:1"}
+	for _, hp := range hostports {
+		host, port, err := net.SplitHostPort(hp)
+		emit("split_host_port", map[string]any{"hp": hp}, map[string]any{"err": err != nil, "host": host, "port": port})
+	}
+
+	// FastCGI
+	hdrNames := []string{"Status", "status", "X-A", "Content-Type", " X-Sp ", "NoColon", "Set-Cookie", "Location", ""}
+	hdrVals := []string{"200", "404 Not Found", " 301 ", "abc", "+201", "-5", "a: b", "", "99999999999999999999", "text/html"}
+	seps := []string{"\r\n", "\n", "\r\n\r\n", "\n\n", "\r\r\n", "\n\r\n"}
+	for range 1500 {
+		var b strings.Builder
+		for range rng.IntN(6) {
+			n := hdrNames[rng.IntN(len(hdrNames))]
+			if n == "NoColon" {
+				b.WriteString(n)
+			} else {
+				b.WriteString(n + ":" + hdrVals[rng.IntN(len(hdrVals))])
+			}
+			b.WriteString(seps[rng.IntN(len(seps))])
+		}
+		b.WriteString("body" + strconv.Itoa(rng.IntN(100)))
+		resp, _ := parseFCGIStdout([]byte(b.String()))
+		emit("fcgi_stdout", map[string]any{"data": h([]byte(b.String()))},
+			map[string]any{"status": resp.Status, "headers": resp.Headers, "body": h(resp.Body)})
+	}
+	for range 200 {
+		var pairs [][2]string
+		for range rng.IntN(4) {
+			pairs = append(pairs, [2]string{strings.Repeat("k", rng.IntN(260)), strings.Repeat("v", []int{0, 127, 128, 129, 300, 70000}[rng.IntN(6)])})
+		}
+		var in [][]string
+		for _, p := range pairs {
+			in = append(in, []string{p[0], p[1]})
+		}
+		emit("encode_params", map[string]any{"pairs": in}, map[string]any{"v": h(encodeParams(pairs))})
+	}
+	uris := []string{"/", "/?a=1", "/index.php", "/a/../../etc/x.php?q", "/a/b", "/x.PHP", "", "?only", "/dir/", "/a.php/extra", "//x.php", "/./y.php"}
+	hosts := []string{"www.example.test", "h:8080", "[::1]:9", "::1", "", "h:", "a:b:c"}
+	roots := [][2]string{{"", "index.php"}, {"/srv/site", "index.php"}, {"/srv/site/", "app/main.php"}, {"relative", "i.php"}}
+	protos := []string{"", "https", "HTTPS", "http"}
+	for _, uri := range uris {
+		for _, host := range hosts {
+			for _, r := range roots {
+				proto := protos[rng.IntN(len(protos))]
+				headers := map[string][]string{"User-Agent": {"t"}, "X-Multi": {"1", "2"}, "Content-Length": {"9"}, "accept-language": {"id"}}
+				in := [][]any{{"User-Agent", []string{"t"}}, {"X-Multi", []string{"1", "2"}}, {"Content-Length", []string{"9"}}, {"accept-language", []string{"id"}}}
+				if proto != "" {
+					headers["X-Forwarded-Proto"] = []string{proto}
+					in = append(in, []any{"X-Forwarded-Proto", []string{proto}})
+				}
+				ct, cl := []string{"", "text/plain"}[rng.IntN(2)], rng.IntN(3)
+				p := &FCGIPool{DocRoot: r[0], Index: r[1]}
+				params := p.buildCGIParams("POST", uri, host, "203.0.113.9", headers, ct, cl)
+				var out [][]string
+				for _, kv := range params {
+					out = append(out, []string{kv[0], kv[1]})
+				}
+				emit("cgi_params", map[string]any{"uri": uri, "host": host, "root": r[0], "index": r[1], "headers": in, "ct": ct, "cl": cl},
+					map[string]any{"params": out})
+			}
+		}
+	}
+	upstreams := [][3]string{{"fcgi:unix:/run/php.sock", "", ""}, {"fcgi:unix:/run/php.sock?root=/a&index=b.php", "", ""},
+		{"fcgi:unix:/run/php.sock?root=/a&index=", "", ""}, {"fcgi:unix:/run/php.sock?root=/a", "/x", "y.php"}, {"fcgi:unix:", "", ""},
+		{"fcgi:unix::::", "", ""}, {"fcgi:unix:/s.sock:", "", ""}, {"fcgi://127.0.0.1", "", ""}, {"fcgi://127.0.0.1:9001?root=%2Fr&index=i%2Ephp", "", ""},
+		{"fcgi://[::1]", "", ""}, {"fcgi://[::1]:9000", "", ""}, {"fcgi://", "", ""}, {"fcgi:", "", ""}, {"fcgi:///p", "", ""}, {"http://x", "", ""},
+		{"fcgi://h:x", "", ""}, {"fcgi://h?root=a;b", "", ""}, {"fcgi:unix:/s?root=a%zz", "", ""}, {"FCGI://h", "", ""}, {"fcgi:/h", "", ""}}
+	for _, u := range upstreams {
+		p, err := ParseFCGIUpstream(u[0], u[1], u[2], 4, FCGITimeouts{})
+		out := map[string]any{"err": err != nil}
+		if err == nil {
+			out["network"], out["addr"], out["root"], out["index"] = p.network, p.addr, p.DocRoot, p.Index
+		}
+		emit("fcgi_upstream", map[string]any{"u": u[0], "root": u[1], "index": u[2]}, out)
+	}
+
+	// small helpers
+	for _, s := range []string{"", "250000", "250_000", " 5000 ", "999", "0", "-1", "lots", "1e6", "10000000", "+2000", "1_0_0_0", " 5000 ", "9223372036854775808", "0x1000"} {
+		emit("store_max", map[string]any{"s": s}, map[string]any{"v": parseStoreMaxEntries(s)})
+	}
+	for _, s := range []string{"1.2.3.4", "1.2.3.4:80", "::1", "[::1]:80", "a:b", "", "10.0.0.1x", "010.0.0.1", "256.1.1.1", "1.2.3", "1.2.3.4.5"} {
+		n, ok := parseIPv4Fast(s)
+		emit("ipv4", map[string]any{"s": s}, map[string]any{"strip": stripPort(s), "n": n, "ok": ok})
+	}
+	floats := []float64{0, math.Copysign(0, -1), 1, 3, 1.5, 1.0035, 0.00025, 0.0001, 0.00001, 123456, 1234567, 1e6, 1e21, 1e20, 100, 1e-300,
+		math.MaxFloat64, math.SmallestNonzeroFloat64, -2.5, 18446744073709551615, 0.1, 1.0 / 3, 2.0 / 3, 123456.789, 999999.5, 1e-5, 9.999e-5}
+	for range 300 {
+		floats = append(floats, math.Float64frombits(rng.Uint64()), rng.Float64()*math.Pow(10, float64(rng.IntN(40)-20)))
+	}
+	for _, v := range floats {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		emit("format_float", map[string]any{"bits": strconv.FormatUint(math.Float64bits(v), 10)}, map[string]any{"v": strconv.FormatFloat(v, 'g', -1, 64)})
+	}
+}

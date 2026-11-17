@@ -1,0 +1,85 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+# internal crates
+wafio-bytetext = { path = "crates/bytetext" }
+wafio-engine-abi = { path = "crates/engine-abi" }
+wafio-engine-api = { path = "crates/engine-api" }
+wafio-engine-loader = { path = "crates/engine-loader" }
+wafio-engine-rules = { path = "crates/engine-rules" }
+wafio-domain = { path = "crates/domain" }
+wafio-bodyinspect = { path = "crates/bodyinspect" }
+wafio-lru = { path = "crates/lru" }
+wafio-application = { path = "crates/application" }
+wafio-proto = { path = "crates/proto" }
+wafio-control = { path = "crates/control" }
+wafio-proxy = { path = "crates/proxy" }
+wafio-agent-pages = { path = "crates/agent-pages" }
+wafio-agent-io = { path = "crates/agent-io" }
+wafio-geo = { path = "crates/geo" }
+wafio-malware = { path = "crates/malware" }
+wafio-engine-fake = { path = "crates/engine-fake" }
+
+# the script interpreter, checked out next to this repository. A pinned git revision of uddin-lang-rs replaces
+# the path later.
+uddin-waf = { path = "../uddin-lang-rs/crates/uddin-waf" }
+
+# third party (add here first, then `dep.workspace = true` in the crate)
+adler2 = "2"
+aes-gcm = "0.10"
+async-trait = "0.1"
+base64 = "0.22"
+brotli = "9"
+bytes = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+crc32fast = "1.5"
+flate2 = "1.1"
+libc = "0.2"
+# Loads the engine library. 0.9.0 and not the 0.9.1 of 2026-11-13, which is three days old; OSV lists no advisory for any version.
+libloading = "0.9"
+maxminddb = "0.32"
+memchr = "2.8"
+# The 2.x line of mimalloc: about a quarter less resident memory than the default 3.x line at the same speed on this workload.
+mimalloc = { version = "0.1", features = ["v2"] }
+miniz_oxide = "0.9"
+# Safe wrappers of statfs, getifaddrs, if_nametoindex and shutdown. Already in the tree through pingora-core.
+nix = { version = "0.31", default-features = false, features = ["fs", "net"] }
+pingora = { version = "0.9", default-features = false, features = ["rustls"] }
+prost = "0.14"
+protox = "0.10"
+regex = "1.12"
+regex-syntax = "0.8"
+sd-notify = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tracing = "0.1"
+unicode-normalization = "0.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind" # catch_unwind fails a request open; never "abort"
+debug = "line-tables-only"
+
+# Fast-to-build optimised profile for conformance runs and integration checks.
+[profile.conformance]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = 0

@@ -1,0 +1,48 @@
+[package]
+name = "wafio-waf-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wafio-waf-agent-open"
+path = "src/main.rs"
+
+[features]
+# An agent that accepts an engine library owned by the user it runs as. For tests that cannot be root; a release build
+# never enables it.
+test-owner = ["wafio-engine-loader/test-owner"]
+
+[dependencies]
+wafio-agent-io.workspace = true
+wafio-agent-pages.workspace = true
+wafio-application.workspace = true
+wafio-bodyinspect.workspace = true
+wafio-control.workspace = true
+wafio-domain.workspace = true
+wafio-engine-api.workspace = true
+wafio-engine-loader.workspace = true
+wafio-engine-rules.workspace = true
+wafio-geo.workspace = true
+wafio-bytetext.workspace = true
+wafio-malware.workspace = true
+wafio-proxy.workspace = true
+uddin-waf.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+libc.workspace = true
+nix.workspace = true
+mimalloc.workspace = true
+pingora.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+tonic.workspace = true
+wafio-proto.workspace = true

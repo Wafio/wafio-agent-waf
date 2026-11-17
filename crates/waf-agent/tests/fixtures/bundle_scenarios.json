@@ -1,0 +1,423 @@
+[
+ {
+  "name": "minimal",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[]}"
+   }
+  ]
+ },
+ {
+  "name": "defaults_and_listener",
+  "steps": [
+   {
+    "generation": 2,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p1\",\"rules_json\":null,\"apps\":[{\"app_id\":\"web\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"MONITOR\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "project_rules_and_app_overrides",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p2\",\"sensitivity\":1,\"rules_json\":{\"request_body_limit\":\"140K\",\"challenge\":{\"enabled\":true,\"trigger\":\"on_bot_detect\",\"ip_rep_enabled\":true},\"l7_flood\":{\"enabled\":true,\"window_sec\":30,\"max_requests\":50},\"bot_protection\":{\"enabled\":true,\"mode\":\"block\"},\"content_scan\":{\"enabled\":true,\"mode\":\"log\"},\"block_policy\":{\"enabled\":false},\"semantic_policies\":{\"disable_rule_based\":true}},\"apps\":[{\"app_id\":\"inherit_obj\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{},\"sensitivity\":3},{\"app_id\":\"spaced\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{ },\"sensitivity\":3},{\"app_id\":\"null_rules\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":null,\"sensitivity\":3},{\"app_id\":\"arr_rules\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":[]},{\"app_id\":\"own\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"request_body_limit\":\"200K\",\"challenge\":{\"enabled\":false}},\"sensitivity\":3},{\"app_id\":\"own_no_sens\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"request_body_limit\":\"210K\"}}]}"
+   }
+  ]
+ },
+ {
+  "name": "retired_bundle_fields",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"sensitivity\":4}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"sensitivity\":-1}"
+   },
+   {
+    "generation": 3,
+    "bundle": "{\"apps\":[{\"app_id\":\"x\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"sensitivity\":4}]}"
+   },
+   {
+    "generation": 4,
+    "bundle": "{\"sensitivity\":3,\"apps\":[{\"app_id\":\"x\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\"}]}"
+   },
+   {
+    "generation": 5,
+    "bundle": "{\"sensitivity\":9,\"rules_json\":{\"request_body_in_memory_limit\":\"1M\"},\"apps\":[{\"app_id\":\"x\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"paranoia\":4,\"exclude_rules\":[\"942100\",\"941\"],\"sensitivity\":-1}]}"
+   }
+  ]
+ },
+ {
+  "name": "stale_generation",
+  "steps": [
+   {
+    "generation": 5,
+    "bundle": "{\"agent_id\":\"a\"}"
+   },
+   {
+    "generation": 4,
+    "bundle": "{\"agent_id\":\"a\"}"
+   },
+   {
+    "generation": 5,
+    "bundle": "{\"agent_id\":\"a\"}"
+   },
+   {
+    "generation": 1,
+    "bundle": "{\"agent_id\":\"b\"}"
+   },
+   {
+    "generation": 0,
+    "bundle": "{\"agent_id\":\"b\"}"
+   }
+  ]
+ },
+ {
+  "name": "store_carry_over",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"one\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\"},{\"app_id\":\"two\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"request_body_limit\":\"120K\"}}]}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"apps\":[{\"app_id\":\"one\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\"},{\"app_id\":\"two\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"request_body_limit\":\"121K\"}}]}"
+   },
+   {
+    "generation": 3,
+    "bundle": "{\"apps\":[{\"app_id\":\"one\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\"}]}"
+   },
+   {
+    "generation": 4,
+    "bundle": "{\"apps\":[{\"app_id\":\"one\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\"},{\"app_id\":\"two\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_ok_http_port",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"r\",\"upstream\":\"http://127.0.0.1:8080\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_ok_https_noport",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"r\",\"upstream\":\"HTTPS://example.com/base\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_ok_unix",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"r\",\"upstream\":\"unix:/run/app.sock\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_ok_unix_http",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"r\",\"upstream\":\"http://unix:/run/app.sock:\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_ok_fcgi_unix",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"r\",\"upstream\":\"fcgi:unix:/run/php/php-fpm.sock?root=/var/www/html&index=index.php\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_ok_fcgi_tcp",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"r\",\"upstream\":\"fcgi://127.0.0.1:9000\",\"fcgi_doc_root\":\"/srv/www\",\"fcgi_index\":\"index.php\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_ok_spaces",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"r\",\"upstream\":\"  http://10.0.0.1  \"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_err_empty",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"ok\",\"upstream\":\"http://h\"},{\"app_id\":\"r\",\"upstream\":\"  \"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_err_ftp",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"ok\",\"upstream\":\"http://h\"},{\"app_id\":\"r\",\"upstream\":\"ftp://h\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_err_noscheme",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"ok\",\"upstream\":\"http://h\"},{\"app_id\":\"r\",\"upstream\":\"127.0.0.1:80\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_err_bad_ipv6",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"ok\",\"upstream\":\"http://h\"},{\"app_id\":\"r\",\"upstream\":\"http://[::1\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_err_bad_escape",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"ok\",\"upstream\":\"http://h\"},{\"app_id\":\"r\",\"upstream\":\"http://h/%zz\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_err_fcgi_bad",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"ok\",\"upstream\":\"http://h\"},{\"app_id\":\"r\",\"upstream\":\"fcgi:unix:\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_err_bad_proxy_config",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"ok\",\"upstream\":\"http://h\"},{\"app_id\":\"r\",\"upstream\":\"http://h\",\"proxy_config\":{\"timeouts\":\"x\"}}]}"
+   }
+  ]
+ },
+ {
+  "name": "route_err_bad_ws",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"ok\",\"upstream\":\"http://h\"},{\"app_id\":\"r\",\"upstream\":\"http://h\",\"rules_json\":{\"websocket\":{\"enabled\":\"yes\"}}}]}"
+   }
+  ]
+ },
+ {
+  "name": "listener_errors",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"upstream\":\"http://h\",\"listen_port\":41872},{\"app_id\":\"b\",\"upstream\":\"http://h\",\"listen_port\":41872,\"listen_host\":\"0.0.0.0\"}]}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"upstream\":\"http://h\",\"listen_port\":70000}]}"
+   },
+   {
+    "generation": 3,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"upstream\":\"http://h\",\"listen_port\":41873,\"listen_host\":\"127.0.0.1\"},{\"app_id\":\"b\",\"upstream\":\"http://h\",\"listen_port\":41873,\"listen_host\":\"127.0.0.1\"}]}"
+   },
+   {
+    "generation": 4,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"upstream\":\"http://h\"},{\"app_id\":\"a\",\"upstream\":\"http://h\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "listener_limits_change",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41874,\"upstream\":\"http://h\",\"proxy_config\":{\"timeouts\":{\"read_ms\":1000}}}]}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41874,\"upstream\":\"http://h2\",\"proxy_config\":{\"timeouts\":{\"read_ms\":1000,\"upstream_ms\":5000}}}]}"
+   },
+   {
+    "generation": 3,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41874,\"upstream\":\"http://h\",\"proxy_config\":{\"timeouts\":{\"read_ms\":2000}}}]}"
+   },
+   {
+    "generation": 4,
+    "bundle": "{\"apps\":[{\"app_id\":\"b\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41875,\"upstream\":\"http://h\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "unblock",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\"}]}"
+   },
+   {
+    "generation": 0,
+    "bundle": "{\"management_only\":true,\"unblock_entries\":[{\"type\":\"ratelimit\",\"scope\":\"s\"}]}"
+   },
+   {
+    "generation": 0,
+    "bundle": "{\"management_only\":true,\"unblock_entries\":[{\"type\":\"login_scope\",\"key\":\"k\"}]}"
+   },
+   {
+    "generation": 0,
+    "bundle": "{\"management_only\":true,\"unblock_entries\":[{\"type\":\"blockpolicy\",\"scope\":\"s\"}]}"
+   },
+   {
+    "generation": 0,
+    "bundle": "{\"management_only\":true,\"unblock_entries\":[{\"type\":\"nope\",\"key\":\"k\"}]}"
+   },
+   {
+    "generation": 0,
+    "bundle": "{\"management_only\":true,\"unblock_entries\":[{\"type\":\"ratelimit\",\"scope\":\"s\",\"key\":\"k\"},{\"type\":\"login_scope\",\"scope\":\"s\"},{\"type\":\"blockpolicy\",\"key\":\"k\"}]}"
+   },
+   {
+    "generation": 9,
+    "bundle": "{\"agent_id\":\"\",\"apps\":[],\"unblock_entries\":[{\"type\":\"blockpolicy\",\"key\":\"k\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "custom_rules",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"upstream\":\"http://h\",\"custom_gui_rules\":[{\"id\":\"g_bad\",\"enabled\":true,\"action\":\"block\",\"conditions\":[{\"field\":\"uri\",\"operator\":\"regex\",\"value\":\"(\"}]},{\"id\":\"g_ok\",\"enabled\":true,\"action\":\"log\",\"conditions\":[{\"field\":\"uri\",\"operator\":\"contains\",\"value\":\"x\"}]},{\"id\":5},null,{\"id\":\"g_big\",\"enabled\":true,\"conditions\":[{\"field\":\"uri\",\"operator\":\"regex\",\"value\":\"(a|b|c|d|e|f|g|h|i|j){20}x{30}\"}]}],\"custom_script_rules\":[{\"id\":\"s1\",\"enabled\":true,\"script\":\"waf_block()\"},{\"id\":2}],\"custom_tuning_rules\":[{\"id\":\"t1\",\"enabled\":true},{\"id\":\"t_bad\",\"target\":{\"components\":[\"query\"],\"match\":\"(\"}}]}]}"
+   }
+  ]
+ },
+ {
+  "name": "rules_invalid",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"rules_json\":{\"thresholds\":\"x\"}}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"rules_json\":{\"request_body_in_memory_limit\":\"1M\"}}"
+   },
+   {
+    "generation": 3,
+    "bundle": "{\"rules_json\":{\"Thresholds\":{\"block\":100},\"thresholds\":{\"block\":110}}}"
+   },
+   {
+    "generation": 4,
+    "bundle": "{\"apps\":[{\"app_id\":\"a\",\"upstream\":\"http://h\",\"rules_json\":{\"thresholds\":{\"block\":-5}}}]}"
+   },
+   {
+    "generation": 5,
+    "bundle": "{\"rules_json\":\"not an object\"}"
+   },
+   {
+    "generation": 6,
+    "bundle": "{\"rules_json\":{\"thresholds\":{\"block\":160,\"log\":0}}}"
+   }
+  ]
+ },
+ {
+  "name": "ssrf",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"rules_json\":{\"ssrf\":{\"ssrf_blocklist\":[\"internal.example\",\"#c\",\".corp\"]}},\"apps\":[{\"app_id\":\"a\",\"upstream\":\"http://h\"}]}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"rules_json\":{\"ssrf\":{\"ssrf_blocklist_path\":\"/nonexistent/wafio-ssrf.txt\"}}}"
+   }
+  ]
+ },
+ {
+  "name": "decode_errors",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"apps\":{}}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"generation\":\"1\"}"
+   },
+   {
+    "generation": 3,
+    "bundle": "[]"
+   },
+   {
+    "generation": 4,
+    "bundle": "{\"apps\":[{\"listen_port\":\"80\"}]}"
+   },
+   {
+    "generation": 5,
+    "bundle": "null"
+   },
+   {
+    "generation": 6,
+    "bundle": "{\"APPS\":[{\"APP_ID\":\"up\",\"Upstream\":\"http://h\"}],\"Agent_ID\":\"x\",\"Project_Id\":\"p\"}"
+   },
+   {
+    "generation": 7,
+    "bundle": "{\"apps\":[{\"app_id\":\"m\",\"mode\":\"monitor\"}],\"apps\":[{\"upstream\":\"http://h\"}]}"
+   },
+   {
+    "generation": 8,
+    "bundle": "{\"apps\":[{\"app_id\":\"t\",\"upstream\":\"http://h\",\"listen_port\":1.5}]}"
+   },
+   {
+    "generation": 9,
+    "bundle": "{\"good_bot_cidrs\":\"x\"}"
+   },
+   {
+    "generation": 10,
+    "bundle": "{\"management_only\":\"yes\"}"
+   },
+   {
+    "generation": 11,
+    "bundle": "{"
+   }
+  ]
+ },
+ {
+  "name": "legacy_rules_documents",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"sensitivity\":2,\"apps\":[{\"app_id\":\"pair\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"semantic_policies\":{\"disable_semantic\":true,\"disable_rule_based\":true}}},{\"app_id\":\"semantic_alone\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"semantic_policies\":{\"disable_semantic\":true}}},{\"app_id\":\"rule_based_alone\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"semantic_policies\":{\"disable_rule_based\":true}}},{\"app_id\":\"new_key\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"semantic_policies\":{\"inspection_off\":true}}},{\"app_id\":\"new_key_false_old_true\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"semantic_policies\":{\"inspection_off\":false,\"disable_semantic\":true}}},{\"app_id\":\"skip_coraza_false\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"semantic_policies\":{\"skip_coraza_when_clean\":false,\"sql\":{\"disabled\":false}}}},{\"app_id\":\"retired_categories\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"categories\":{\"RFI\":{\"base_score\":180,\"confidence\":0.85,\"sensitivity\":1},\"Method\":{\"base_score\":60,\"confidence\":0.95,\"sensitivity\":1},\"Generic\":{\"base_score\":160,\"confidence\":0.8,\"sensitivity\":2},\"Scanner\":{\"base_score\":70,\"confidence\":0.8,\"sensitivity\":2},\"Protocol\":{\"base_score\":80,\"confidence\":0.7,\"sensitivity\":2},\"Multipart\":{\"base_score\":120,\"confidence\":0.8,\"sensitivity\":1},\"SessionFixation\":{\"base_score\":140,\"confidence\":0.85,\"sensitivity\":2},\"SQLi\":{\"base_score\":180,\"confidence\":0.9,\"sensitivity\":1}}}},{\"app_id\":\"old_body_buffer_limits\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"request_body_limit\":\"5M\",\"request_body_in_memory_limit\":\"4M\",\"response_body_limit\":\"2M\"}},{\"app_id\":\"old_path_pair\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"path_exceptions\":[{\"path\":\"/x\",\"disable_semantic\":true,\"disable_rule_based\":true},{\"path\":\"/y\",\"disable_rule_based\":true},{\"path\":\"/z\",\"inspection_off\":true}]}},{\"app_id\":\"old_tuning\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{\"path_exceptions\":[{\"path\":\"/t\",\"tuning\":{\"effect\":{\"skip_crs\":[\"942100\",\"*\"],\"skip_semantic\":[\"sql\"]}}}]}}]}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"rules_json\":{\"semantic_policies\":{\"disable_semantic\":true,\"disable_rule_based\":true,\"skip_coraza_when_clean\":true}},\"apps\":[{\"app_id\":\"inherits\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{}}]}"
+   }
+  ]
+ }
+]

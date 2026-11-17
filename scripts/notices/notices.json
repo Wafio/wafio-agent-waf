@@ -1,0 +1,309 @@
+{
+  "runtime_library": [
+    {
+      "name": "The Rust standard library (core, alloc, std)",
+      "version": "Rust 1.95.0",
+      "url": "https://github.com/rust-lang/rust",
+      "copyright": "Copyright (c) The Rust Project Developers (https://thanks.rust-lang.org)",
+      "licence": "Apache-2.0 OR MIT, used under Apache-2.0",
+      "text_ref": "Apache-2.0",
+      "also": [
+        "The library also holds code with other copyright holders: library/backtrace (2014 Alex Crichton), library/std/src/sync/mpmc (2019 The Crossbeam Project Developers) and the Unicode tables in core (1991-2024 Unicode, Inc., Unicode-3.0; the text is listed below under unicode-ident).",
+        "It builds on the crates cfg-if, foldhash (Zlib licence, text listed below under foldhash), gimli, hashbrown, libc, rustc-demangle and others, each MIT OR Apache-2.0. The Rust distribution lists them in COPYRIGHT-library.html."
+      ]
+    }
+  ],
+
+  "adapted": {
+    "heading": "Code adapted from other projects",
+    "intro": [
+      "Parts of this agent were written in Rust from the source of the open source projects below.",
+      "Each entry gives the project, its copyright holder and licence, the files of the agent that",
+      "contain adapted code, and what was changed. The licence text follows the entry, or is listed",
+      "under \"Licence and notice texts\" at the end of this file."
+    ],
+    "entries": [
+      {
+        "name": "The Go standard library, golang.org/x/net and golang.org/x/text",
+        "version": "Go 1.26.10, x/net v0.62.0",
+        "url": "https://go.dev",
+        "copyright": "Copyright 2009 The Go Authors.",
+        "licence": "BSD-3-Clause",
+        "licence_file": "go-authors.txt",
+        "used_for": "The HTML tokenizer and tree builder (x/net/html), regular expression syntax (regexp/syntax), the gzip and zlib framing rules (compress/gzip, compress/zlib), strconv, strings, unicode, utf8, utf16, base64, hex, path, net, net/url, net/netip, mime/multipart, quoted-printable, net/textproto, sort, math/rand, the log function of math, net/http content sniffing and redirects, time.ParseDuration, encoding/json text rules, and the proxy environment rules of x/net/http/httpproxy. The Unicode property tables were extracted through the unicode package. Unicode normalisation was checked against x/text.",
+        "files": [
+          "crates/bytetext/src/pattern_syntax.rs",
+          "crates/bytetext/src/pattern.rs",
+          "crates/bytetext/src/literal.rs",
+          "crates/bytetext/src/strings.rs",
+          "crates/bytetext/src/utf8.rs",
+          "crates/bytetext/src/utf16.rs",
+          "crates/bytetext/src/base64.rs",
+          "crates/bytetext/src/hex.rs",
+          "crates/bytetext/src/path.rs",
+          "crates/bytetext/src/url.rs",
+          "crates/bytetext/src/url_parse.rs",
+          "crates/bytetext/src/net.rs",
+          "crates/bytetext/src/html.rs",
+          "crates/bytetext/src/sort.rs",
+          "crates/bytetext/src/norm.rs",
+          "crates/bytetext/src/unicode.rs",
+          "crates/bytetext/src/unicode_tables.rs",
+          "crates/bytetext/src/html_entities.rs",
+          "crates/bodyinspect/src/decode.rs",
+          "crates/agent-io/src/url_parse.rs",
+          "crates/proxy/src/url_parse.rs",
+          "crates/proxy/src/sniff.rs",
+          "crates/domain/src/websocket_config.rs",
+          "crates/domain/src/multipart.rs",
+          "crates/domain/src/ip_address.rs",
+          "crates/domain/src/json_text.rs",
+          "crates/agent-pages/src/multipart.rs",
+          "crates/agent-pages/src/crypto.rs",
+          "crates/agent-pages/src/seeded_rng.rs",
+          "crates/engine-rules/src/forwarded_path.rs",
+          "crates/engine-rules/src/ip_network.rs",
+          "crates/engine-rules/src/config.rs",
+          "crates/engine-rules/src/json_decode.rs",
+          "crates/waf-agent/src/duration_text.rs",
+          "crates/waf-agent/src/httpclient.rs",
+          "crates/agent-io/src/fastcgi_client.rs",
+          "crates/control/src/proxy_env.rs",
+          "tools/core-gen/entity/entity.go"
+        ],
+        "changes": "Rewritten in Rust. Where the agent depends on the original behaviour (accepted syntax, error texts, limits) it is kept; the rest was left out. tools/core-gen/entity/entity.go is an unchanged copy of src/html/entity.go with the package renamed; it keeps its original licence header and lives in the source repository only, not in the binary or the bundle."
+      },
+      {
+        "name": "github.com/valyala/fasthttp",
+        "version": "v1.74.0",
+        "url": "https://github.com/valyala/fasthttp",
+        "copyright": "Copyright (c) 2015-present Aliaksandr Valialkin, VertaMedia, Kirill Danshin, Erik Dubbelboer, FastHTTP Authors",
+        "licence": "MIT",
+        "licence_file": "fasthttp.txt",
+        "used_for": "The HTTP/1 request head and body reader, the request and response model, the upstream header handling, the server error texts and the forwarded path normalisation.",
+        "files": [
+          "crates/proxy/src/head_parser.rs",
+          "crates/proxy/src/body_reader.rs",
+          "crates/proxy/src/request.rs",
+          "crates/proxy/src/response.rs",
+          "crates/proxy/src/upstream.rs",
+          "crates/proxy/src/route.rs",
+          "crates/proxy/src/listeners.rs",
+          "crates/engine-rules/src/forwarded_path.rs"
+        ],
+        "changes": "Rewritten in Rust on top of tokio; the parsing rules and error texts follow the original."
+      },
+      {
+        "name": "github.com/fasthttp/websocket (a fork of Gorilla WebSocket)",
+        "version": "v1.5.12",
+        "url": "https://github.com/fasthttp/websocket",
+        "copyright": "Copyright (c) 2013 The Gorilla WebSocket Authors. All rights reserved.",
+        "licence": "BSD-2-Clause",
+        "licence_file": "fasthttp-websocket.txt",
+        "used_for": "WebSocket framing, fragment assembly, ping, pong and close handling, read limits and deadlines.",
+        "files": [
+          "crates/agent-io/src/ws_frame.rs"
+        ],
+        "changes": "Rewritten in Rust; the protocol error texts and the order of the checks follow the original."
+      },
+      {
+        "name": "github.com/oschwald/geoip2-golang and github.com/oschwald/maxminddb-golang",
+        "version": "v1.13.0",
+        "url": "https://github.com/oschwald/geoip2-golang",
+        "copyright": "Copyright (c) 2015, Gregory J. Oschwald",
+        "licence": "ISC",
+        "licence_file": "oschwald-geoip2.txt",
+        "used_for": "The database type check when a GeoIP database is opened and the lookup rules for IPv4-mapped IPv6 addresses.",
+        "files": [
+          "crates/geo/src/reader.rs"
+        ],
+        "changes": "Rewritten in Rust over the maxminddb crate; the database decoding itself is not adapted."
+      },
+      {
+        "name": "github.com/cloudflare/tableflip",
+        "version": "v1.2.3",
+        "url": "https://github.com/cloudflare/tableflip",
+        "copyright": "Copyright (c) 2017-2018, Cloudflare. All rights reserved.",
+        "licence": "BSD-3-Clause",
+        "licence_file": "cloudflare-tableflip.txt",
+        "used_for": "The PID file handling and the texts of the upgrade and ready signal. Only these follow the original; the reload itself does not use its mechanism.",
+        "files": [
+          "crates/waf-agent/src/ready.rs"
+        ],
+        "changes": "Rewritten in Rust."
+      },
+      {
+        "name": "google.golang.org/grpc",
+        "version": "grpc-go",
+        "url": "https://github.com/grpc/grpc-go",
+        "copyright": "Copyright 2017 gRPC authors.",
+        "licence": "Apache-2.0",
+        "text_ref": "Apache-2.0",
+        "used_for": "The texts of the HTTP CONNECT handshake with a proxy (internal/transport/proxy.go).",
+        "files": [
+          "crates/control/src/proxy_env.rs"
+        ],
+        "changes": "Only the error message texts and the order of the handshake follow the original; the code is new and written in Rust."
+      },
+      {
+        "name": "Public domain code",
+        "version": "",
+        "url": "https://github.com/geraintluff/sha256 and Howard Hinnant's date algorithms (https://howardhinnant.github.io/date_algorithms.html)",
+        "copyright": "None claimed: released into the public domain by their authors.",
+        "licence": "Public domain",
+        "used_for": "A small SHA-256 function in JavaScript for the challenge page when the browser has no crypto.subtle (Geraint Luff), and the conversion between days and calendar dates (Howard Hinnant). Listed as a credit; no licence condition applies.",
+        "files": [
+          "crates/agent-pages/src/templates.rs",
+          "crates/control/src/timestamp.rs",
+          "crates/proxy/src/response.rs",
+          "crates/proxy/src/siem.rs",
+          "crates/waf-agent/src/stderr_log.rs",
+          "crates/malware/src/timestamp.rs"
+        ],
+        "changes": "Rewritten or reformatted for this agent."
+      }
+    ]
+  },
+
+  "licence_from_sibling": {
+    "alloc-stdlib": "alloc-no-stdlib",
+    "asn1-rs-impl": "asn1-rs",
+    "tonic-prost": "tonic"
+  },
+
+  "source_header_notices": {
+    "heading": "Copyright lines found only in source file headers",
+    "intro": [
+      "The crates below carry a copyright or licence notice in a source file header that is not in",
+      "their licence file. The notice is repeated here."
+    ],
+    "entries": [
+      {
+        "crates": ["brotli", "brotli-decompressor"],
+        "where": "src/enc/entropy_encode.rs (brotli), src/context.rs (brotli-decompressor)",
+        "lines": [
+          "Copyright 2010 Google Inc. All Rights Reserved.",
+          "Copyright 2013 Google Inc. All Rights Reserved.",
+          "Distributed under MIT license. See https://opensource.org/licenses/MIT"
+        ],
+        "licence_note": "The MIT text is listed under brotli below."
+      },
+      {
+        "crates": ["zstd-sys"],
+        "where": "zstd/lib/dictBuilder/divsufsort.c and divsufsort.h (libdivsufsort-lite)",
+        "licence_file": "libdivsufsort-lite-mit.txt"
+      },
+      {
+        "crates": ["tower"],
+        "where": "src/load/peak_ewma.rs",
+        "lines": [
+          "Derived from Finagle (https://github.com/twitter/finagle), which is distributed under the",
+          "Apache License, Version 2.0. Copyright 2017, Twitter Inc."
+        ],
+        "licence_note": "The Apache-2.0 text is listed below."
+      },
+      {
+        "crates": ["rustls-webpki"],
+        "where": "src headers",
+        "lines": [
+          "Copyright 2015, 2015-2016, 2015-2020, 2015-2021 Brian Smith.",
+          "Copyright 2022 Rafael Fernández López.",
+          "Copyright 2023 Daniel McCarney.",
+          "Licensed under the ISC licence, as in the crate's LICENSE file listed below."
+        ]
+      }
+    ]
+  },
+
+  "runtime_data": {
+    "heading": "Runtime data the agent downloads",
+    "intro": [
+      "The agent does not ship these data sets. The server that runs it downloads them from the",
+      "providers when it is installed and refreshes them at most once every 24 hours. WAFio does not",
+      "mirror, store or resell them, and you may not resell them. Terms of the providers apply."
+    ],
+    "entries": [
+      {
+        "name": "DB-IP geolocation data (default GeoIP provider)",
+        "url": "https://db-ip.com",
+        "lines": [
+          "IP geolocation data provided by DB-IP.com under the Creative Commons",
+          "Attribution 4.0 International License (CC BY 4.0).",
+          "https://creativecommons.org/licenses/by/4.0/",
+          "This product includes IP geolocation data created by DB-IP (https://db-ip.com)."
+        ]
+      },
+      {
+        "name": "MaxMind GeoLite2 (optional, only when you supply a MaxMind key)",
+        "url": "https://www.maxmind.com",
+        "lines": [
+          "When configured with a MaxMind license key, this product uses GeoLite2 data",
+          "created by MaxMind, available from https://www.maxmind.com, under the MaxMind",
+          "GeoLite2 End User License Agreement. https://www.maxmind.com/en/geolite2/eula",
+          "This product includes GeoLite2 data created by MaxMind."
+        ]
+      },
+      {
+        "name": "FireHOL IP reputation lists (firehol_level1, firehol_level2)",
+        "url": "https://github.com/firehol/blocklist-ipsets",
+        "lines": [
+          "The blocklist-ipsets repository has no single licence. Each list is built from",
+          "third-party sources whose own terms apply. FireHOL says: \"a few of these lists may",
+          "have special licences attached. Before using them, please check their source site.\"",
+          "Sources and their terms:",
+          "  - Spamhaus DROP and EDROP, a service of The Spamhaus Project",
+          "    (https://www.spamhaus.org/drop/). Free to use with credit to The Spamhaus Project.",
+          "  - DShield, SANS Internet Storm Center (https://www.dshield.org). CC BY-NC-SA 4.0",
+          "    (https://creativecommons.org/licenses/by-nc-sa/4.0/). The provider allows its use to",
+          "    protect your own network and asks that the data is not resold.",
+          "  - Feodo Tracker, abuse.ch (https://feodotracker.abuse.ch). CC0 1.0.",
+          "  - blocklist.de (https://www.blocklist.de). No licence is stated; the lists are offered",
+          "    for use at your own risk.",
+          "  - GreenSnow (https://greensnow.co). Credited as a source of the lists.",
+          "  - Fullbogons, Team Cymru (https://www.team-cymru.com). No terms are stated; offered as a",
+          "    community service.",
+          "Your server downloads these lists straight from FireHOL's repository to protect that",
+          "server. WAFio does not mirror, store or resell them."
+        ]
+      },
+      {
+        "name": "Salesforce JA3 fingerprint list",
+        "url": "https://github.com/salesforce/ja3",
+        "lines": [
+          "Copyright (c) 2017, Salesforce.com, Inc. Licensed under the BSD 3-Clause License."
+        ]
+      },
+      {
+        "name": "abuse.ch SSLBL JA3 fingerprints",
+        "url": "https://sslbl.abuse.ch",
+        "lines": [
+          "Provided by abuse.ch under CC0 1.0."
+        ]
+      },
+      {
+        "name": "MalwareBazaar (optional, only when you enter your own abuse.ch Auth-Key)",
+        "url": "https://bazaar.abuse.ch",
+        "lines": [
+          "Provided by abuse.ch. Under the abuse.ch terms, commercial use of this data is subject to a",
+          "Spamhaus subscription. The agent downloads it with your own Auth-Key, and the terms that",
+          "apply to your use are yours to check."
+        ]
+      },
+      {
+        "name": "nginx-ultimate-bad-bot-blocker (bad-user-agents list)",
+        "url": "https://github.com/mitchellkrogza/nginx-ultimate-bad-bot-blocker",
+        "lines": [
+          "Copyright (c) 2017 Mitchell Krog. Licensed under the MIT License; the text follows."
+        ],
+        "licence_file": "nginx-bad-bot-blocker-mit.txt"
+      },
+      {
+        "name": "JA4 fingerprint format",
+        "url": "https://github.com/FoxIO-LLC/ja4",
+        "lines": [
+          "The agent reads and lists TLS client fingerprints in the JA4 format by FoxIO, BSD-3-Clause."
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+//! Control-plane link of the WAF agent: the gRPC stream, reconnect backoff, bundle cache,
+//! bundle puller, telemetry and the malware database.
+
+#![forbid(unsafe_code)]
+
+mod bundle_cache;
+mod bundle_puller;
+mod grpc_reconnect;
+mod grpc_stream;
+mod json_members;
+mod malware_database;
+pub mod proxy_env;
+mod timestamp;
+mod waf_telemetry;
+
+pub use bundle_cache::{
+    BUNDLE_CACHE_FILE_NAME, BUNDLE_SOURCE_CACHE, BUNDLE_SOURCE_CACHE_STALE, BUNDLE_SOURCE_LIVE,
+    CacheReadError, CachedBundle, DEFAULT_BUNDLE_CACHE_MAX_AGE, load_bundle_cache,
+    save_bundle_cache,
+};
+pub use bundle_puller::{BundleError, BundleProbe, BundleSink};
+pub use grpc_reconnect::{
+    GRPC_CLIENT_KEEPALIVE_TIME, GRPC_CLIENT_KEEPALIVE_TIMEOUT, RECONNECT_BACKOFF_MAX,
+    RECONNECT_BACKOFF_MIN, RECONNECT_HEALTHY_AFTER, RECONNECT_JITTER, ReconnectBackoff, jitter,
+};
+pub use grpc_stream::{
+    AgentStats, ControlConfig, ControlLink, DEFAULT_SECURITY_DATA_DIR, HANDSHAKE_TIMEOUT,
+    HEARTBEAT_INTERVAL, HeartbeatCounters, Hooks, LinkError, default_server_name,
+};
+pub use malware_database::{FetchResult, MAX_MALWARE_SNAPSHOT_BYTES, SecurityData};
+pub use timestamp::Timestamp;
+pub use waf_telemetry::{
+    DecisionEvent, Redactor, TELEMETRY_QUEUE_CAP, TelemetryStats, clamp_i32, replace_invalid_utf8,
+    to_proto,
+};

@@ -1,0 +1,17 @@
+[package]
+name = "wafio-engine-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wafio-domain.workspace = true
+wafio-bytetext.workspace = true
+tracing.workspace = true
+memchr.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+base64.workspace = true
