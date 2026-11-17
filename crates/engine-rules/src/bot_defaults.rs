@@ -3,7 +3,7 @@
 //! executable; a missing file is an empty list. The JA4 lists fall back to the seeds an engine ships.
 
 use std::path::PathBuf;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 use wafio_bytetext::strings::{to_lowercase_cow as to_lowercase, trim_whitespace};
 
 /// Reads the first candidate that opens: $env, CWD/<rel>, <exe dir>/<rel>.
@@ -72,17 +72,10 @@ fn load_bad_bot_ua_blocklist() -> Vec<String> {
     out
 }
 
-static UA_LIST: RwLock<Option<Vec<String>>> = RwLock::new(None);
+static UA_LIST: OnceLock<Vec<String>> = OnceLock::new();
 
 pub fn default_bad_bot_ua_blocklist() -> Vec<String> {
-    if let Some(l) = UA_LIST.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        return l.clone();
-    }
-    UA_LIST
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(load_bad_bot_ua_blocklist)
-        .clone()
+    UA_LIST.get_or_init(load_bad_bot_ua_blocklist).clone()
 }
 
 static JA3_LIST: OnceLock<Vec<String>> = OnceLock::new();
@@ -113,14 +106,10 @@ fn load_ja4_files() -> Ja4Files {
     )
 }
 
-static JA4_FILES: RwLock<Option<Ja4Files>> = RwLock::new(None);
+static JA4_FILES: OnceLock<Ja4Files> = OnceLock::new();
 
 fn ja4_files() -> Ja4Files {
-    if let Some(l) = JA4_FILES.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        return l.clone();
-    }
-    let mut g = JA4_FILES.write().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(load_ja4_files).clone()
+    JA4_FILES.get_or_init(load_ja4_files).clone()
 }
 
 fn or_seeds(file: Option<Vec<String>>, seeds: &[&str]) -> Vec<String> {
