@@ -1,5 +1,5 @@
 //! Validation of the agent-only `websocket` section of an app's rules_json. Includes a private
-//! URL parser for the parts the origin check reads (bytetext has no URL parser).
+//! URL parser for the parts the origin check reads.
 
 use crate::ip_address::parse_ip_address;
 use crate::json_text::{self, Value, key_matches, type_mismatch_text};

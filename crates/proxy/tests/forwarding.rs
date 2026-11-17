@@ -123,7 +123,7 @@ async fn body_limit_is_400_and_never_forwarded() {
     assert_eq!(up.accepts(), 0);
     assert!(
         h.events().is_empty(),
-        "fasthttp answers before the handler: no decision"
+        "the proxy answers before the handler: no decision"
     );
     let resp = one(proxy, &post("/x", "text/plain", &[b'a'; 1024])).await;
     assert_eq!(resp.status, 200);
