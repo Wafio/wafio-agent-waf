@@ -2,6 +2,8 @@
 
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16868/badge)](https://www.bestpractices.dev/projects/16868) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Wafio/wafio-agent-waf/badge)](https://scorecard.dev/viewer/?uri=github.com/Wafio/wafio-agent-waf)
 
+This repository is one part of [WAFio](https://github.com/Wafio/wafio). Start there to install WAFio, to see the releases, or to report a problem when you do not know which part it is in.
+
 The open part of the Wafio WAF agent, written in Rust. It runs on a customer host as a reverse proxy in front of the
 applications you protect, and takes its routes, upstreams and rules from the Wafio control plane over mTLS gRPC. It does everything
 around detection: routing, body and path limits, rate limits, geo rules, bot checks, IP rules, custom rules, login protection,
