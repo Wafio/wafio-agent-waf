@@ -592,7 +592,7 @@ async fn a_bad_origin_or_preflight_gets_no_cors_approval() {
         one(addr, twice).await.header("access-control-allow-origin"),
         None
     );
-    // A method that is not a token, a list that is not tokens and commas.
+    // A method that is not a token, a list that is not header names and commas.
     let long_method = "A".repeat(33);
     for (method, headers, status) in [
         ("GE T", "", 503),

@@ -168,7 +168,7 @@ fn preflight(head: &Head, origin: &[u8]) -> Option<OutboundResponse> {
     r.add(b"Access-Control-Allow-Origin", origin);
     r.add(b"Access-Control-Allow-Methods", method);
     if let Some(requested) = header(head, b"access-control-request-headers")
-        .filter(|h| !h.is_empty() && h.len() <= 1024 && h.iter().all(|&c| c == b',' || tchar(c)))
+        .filter(|h| h.len() <= 1024 && is_name_list(h))
     {
         r.add(b"Access-Control-Allow-Headers", requested);
     }
@@ -180,6 +180,17 @@ fn preflight(head: &Head, origin: &[u8]) -> Option<OutboundResponse> {
     r.add(b"Cache-Control", b"no-store");
     r.add(b"X-Content-Type-Options", b"nosniff");
     Some(r)
+}
+
+/// Whether `list` is header names separated by commas, each with optional spaces or tabs around
+/// it: current browsers send `a,b`, older ones `a, b`.
+fn is_name_list(list: &[u8]) -> bool {
+    list.split(|&c| c == b',').all(|item| {
+        let mut words = item
+            .split(|&c| c == b' ' || c == b'\t')
+            .filter(|w| !w.is_empty());
+        matches!((words.next(), words.next()), (Some(w), None) if w.iter().all(|&c| tchar(c)))
+    })
 }
 
 /// Follows the route of one app for a session or stream of one client, so that it can end when
@@ -393,6 +404,21 @@ mod tests {
         assert!(valid_origin(
             format!("https://{}", "a".repeat(248)).as_bytes()
         ));
+    }
+
+    #[test]
+    fn requested_headers_are_names_separated_by_commas() {
+        for yes in [
+            "content-type",
+            "content-type,x-token",
+            "content-type, x-token",
+            "a ,\tb",
+        ] {
+            assert!(is_name_list(yes.as_bytes()), "{yes}");
+        }
+        for no in ["", " ", ",", "a,,b", "a,", "x-a b", "x-a;q", "a\u{c}"] {
+            assert!(!is_name_list(no.as_bytes()), "{no:?}");
+        }
     }
 
     #[test]

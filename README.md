@@ -204,8 +204,8 @@ requests that bypass maintenance and apps that are not in maintenance are untouc
   Retry-After`. The body is public text (the message and the end time), no cookie is set and no upstream data is involved, so reading
   it with credentials from any origin leaks nothing.
 - A preflight (`OPTIONS` with a valid `Origin` and an `Access-Control-Request-Method` that is a token of at most 32 bytes) gets 204 with
-  no body: the origin, the requested method, the requested headers when they are tokens and commas within 1024 bytes,
-  `Access-Control-Max-Age: 0`, `Cache-Control: no-store` and `Vary` for the three request headers. It carries no
+  no body: the origin, the requested method, the requested headers when they are header names separated by commas (spaces around them
+  allowed) within 1024 bytes, `Access-Control-Max-Age: 0`, `Cache-Control: no-store` and `Vary` for the three request headers. It carries no
   `Access-Control-Allow-Credentials`, and it is counted like any other maintenance answer. The agent cannot link a preflight to the
   request after it, and maintenance may end in between: an approval that allowed credentials, or stayed in the browser's cache, would let
   a page on another site send a credentialed request that needs a preflight into the upstream. The remaining limit: such a request still
