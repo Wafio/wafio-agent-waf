@@ -221,8 +221,19 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    /// Every test that reads a maintenance object goes through here. tracing caches whether a log
+    /// site is enabled, and a site that one thread registers while another sets its collector can
+    /// end up cached as disabled, so the readers of this module run one at a time.
+    static READER: Mutex<()> = Mutex::new(());
+
+    fn parse(raw: &[u8]) -> Option<MaintenanceSettings> {
+        let _one_at_a_time = READER.lock().unwrap_or_else(|e| e.into_inner());
+        parse_maintenance(raw)
+    }
+
     /// The log lines `parse_maintenance` writes for `raw`.
     fn warnings(raw: &str) -> Vec<String> {
+        let _one_at_a_time = READER.lock().unwrap_or_else(|e| e.into_inner());
         let lines = Arc::new(Mutex::new(Vec::new()));
         tracing::subscriber::with_default(Collect(lines.clone()), || {
             parse_maintenance(raw.as_bytes());
@@ -285,7 +296,7 @@ mod tests {
     }
 
     fn parsed(raw: &str) -> MaintenanceSettings {
-        parse_maintenance(raw.as_bytes()).expect("maintenance on")
+        parse(raw.as_bytes()).expect("maintenance on")
     }
 
     #[test]
@@ -302,7 +313,7 @@ mod tests {
             "not json",
             r#""text""#,
         ] {
-            assert_eq!(parse_maintenance(raw.as_bytes()), None, "{raw}");
+            assert_eq!(parse(raw.as_bytes()), None, "{raw}");
         }
     }
 
@@ -338,10 +349,7 @@ mod tests {
         assert_eq!(m.message, "hi");
         let m = parsed(r#"{"enabled":false,"enabled":true,"message":"a","message":"b"}"#);
         assert_eq!(m.message, "b", "the last occurrence wins");
-        assert_eq!(
-            parse_maintenance(br#"{"enabled":true,"enabled":false}"#),
-            None
-        );
+        assert_eq!(parse(br#"{"enabled":true,"enabled":false}"#), None);
     }
 
     #[test]
