@@ -78,9 +78,10 @@ on the build host, never the output directory), named by its build id, with a `.
 the baseline binary (any x86-64 CPU), which is the one a release ships; `scripts/build-dist.sh --container baseline v3` adds an
 x86-64-v3 binary that needs AVX2 and dies with SIGILL on an older CPU. Next to the binaries it writes
 `NOTICES.txt` (`scripts/gen-notices.py`: the crates the agent links, from `cargo metadata` and the licence files in the
-crate sources; the code adapted from other projects, the copyright lines found only in source headers and the runtime
-data the agent downloads, from `scripts/notices/`), `SHA256SUMS` of the binaries it built and `VERSION` with the
-stamped version. They go to `target/dist/` of the checkout, not to `build/`, which on a shared build host can be a link
+crate sources; the crates it links from other repositories (uddin-lang-rs), the code adapted from other projects, the
+copyright lines found only in source headers and the runtime data the agent downloads, from `scripts/notices/`),
+`SBOM.spdx.json` (the same crates as SPDX JSON, made by `gen-notices.py --spdx` from the build's own dependency tree, so it holds
+no dev-dependency and no build tool), `SHA256SUMS` of the binaries it built and `VERSION` with the stamped version. They go to `target/dist/` of the checkout, not to `build/`, which on a shared build host can be a link
 to a directory several checkouts use; `WAFIO_DIST_DIR` overrides it. Release builds do not run on a host
 that serves downloads.
 

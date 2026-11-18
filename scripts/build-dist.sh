@@ -11,6 +11,8 @@
 #                                          built when asked for; it is not part of a release
 #   NOTICES.txt                            the notices of the crates the agent links, of the code adapted from other
 #                                          projects and of the runtime data (scripts/gen-notices.py)
+#   SBOM.spdx.json                         the crates the pieces link, as SPDX JSON (scripts/gen-notices.py --spdx), for
+#                                          the SBOM of the release bundle: syft cannot read crates out of a Rust binary
 #   SHA256SUMS                             of the binaries this run built (not of older ones left in the directory)
 #   VERSION                                the version this run stamped (wafio-release scripts/release.sh compares it
 #                                          exactly with the release version)
@@ -293,7 +295,8 @@ for what in "${@:-baseline}"; do
   done
 done
 
-python3 "$notices" -o "$out/NOTICES.txt"
+# With a library the notices and the SBOM describe the binary and the library together: the script names the form.
+python3 "$notices" -o "$out/NOTICES.txt" --spdx "$out/SBOM.spdx.json" --version "$WAFIO_AGENT_VERSION" ${lib_package:+--engine-lib}
 
 printf '%s\n' "$WAFIO_AGENT_VERSION" >"$out/VERSION"
 (cd "$out" && rm -f SHA256SUMS && sha256sum "${built[@]}" >SHA256SUMS && cat SHA256SUMS)
