@@ -1,0 +1,10 @@
+# Dependabot keeps the pinned actions of the workflows current. The Cargo dependencies are not listed: the workspace
+# has a path dependency on ../uddin-lang-rs, which Dependabot cannot resolve. scripts/ci-local.sh checks them
+# against the advisory database on every run.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
