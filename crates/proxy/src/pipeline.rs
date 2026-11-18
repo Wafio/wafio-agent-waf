@@ -1,8 +1,9 @@
 //! One request of one app, after Pingora read its head and the whole body (route.rs). Order:
-//! challenge verify endpoint, path-encoding reject, IP reputation gate, challenge gate (skipped
-//! only for a WebSocket handshake this route takes over), decrypt field rules, body
-//! inspection, Analyze, verdict merge, block page / rule challenge / monitor, then WebSocket
-//! takeover, FastCGI or HTTP upstream. Detection runs via `run_detection` (16 MiB stack).
+//! maintenance page, challenge verify endpoint, path-encoding reject, IP reputation gate,
+//! challenge gate (skipped only for a WebSocket handshake this route takes over), decrypt field
+//! rules, body inspection, Analyze, verdict merge, block page / rule challenge / monitor, then
+//! WebSocket takeover, FastCGI or HTTP upstream. Detection runs via `run_detection` (16 MiB
+//! stack).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -21,13 +22,14 @@ use wafio_agent_pages::challenge_handler::{
 use wafio_agent_pages::challenge_verify_limit::{verify_limited_response, verify_post_allowed};
 use wafio_agent_pages::field_paths::{self as fp, RequestFieldRule, ResponseFieldTransformRule};
 use wafio_agent_pages::iprep::ReputationLevel;
+use wafio_agent_pages::maintenance::render_maintenance;
 use wafio_bodyinspect::{
     BODY_KIND_MULTIPART, BODY_KIND_TEXT, Options, decoded_size_cap, inspect, join_note,
     should_attach_notes,
 };
 use wafio_bytetext::strings::trim_whitespace;
 use wafio_domain::ip_address::IpAddress;
-use wafio_domain::{AnalysisResult, IncomingRequest};
+use wafio_domain::{AnalysisResult, IncomingRequest, MaintenanceSettings};
 
 use crate::config::{AppAnalysisSetup, Route, Target};
 use crate::decision::{
@@ -317,6 +319,40 @@ fn note(detail: &[u8], n: &[u8]) -> Vec<u8> {
     join_note(detail, n)
 }
 
+/// Whether maintenance mode lets the forwarded `path` through. A path that holds a `;` must also
+/// pass with the path parameters removed from it and from the entries, since servlet containers
+/// route `/healthz/..;/admin` to `/admin`.
+fn maintenance_allows_path(m: &MaintenanceSettings, path: &[u8]) -> bool {
+    if !m.allows_path(path) {
+        return false;
+    }
+    if !path.contains(&b';') {
+        return true;
+    }
+    let without_parameters = MaintenanceSettings {
+        allow_paths: m
+            .allow_paths
+            .iter()
+            .map(|entry| wafio_engine_rules::strip_path_parameters(entry))
+            .collect(),
+        ..MaintenanceSettings::default()
+    };
+    without_parameters.allows_path(&wafio_engine_rules::forwarded_path_readings(path).0)
+}
+
+/// The 503 of an app in maintenance mode. It is counted, not recorded as a decision.
+fn maintenance_response(m: &MaintenanceSettings, req: &InboundRequest) -> OutboundResponse {
+    crate::metrics::MAINTENANCE_RESPONSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (page, retry_after) = render_maintenance(m, req.peek("Accept"), now_unix());
+    let mut r = OutboundResponse::with(503, page.content_type, page.body);
+    r.add(b"Cache-Control", b"no-store");
+    r.add(b"X-Content-Type-Options", b"nosniff");
+    if let Some(seconds) = retry_after {
+        r.add(b"Retry-After", seconds.to_string().as_bytes());
+    }
+    r
+}
+
 /// The response, after recording (the route writes it after the handler returns).
 fn answer(r: OutboundResponse) -> pingora::Result<Done> {
     Ok(Done::Respond(r))
@@ -337,6 +373,15 @@ pub(crate) async fn handle(
     let challenge = exec.challenge.as_ref();
     let sink = &shared.decisions;
     let mode = route.mode.as_str();
+
+    // Maintenance mode answers before every other step, so nothing reaches the upstream. Allowed
+    // clients and paths go on through the whole pipeline.
+    if let Some(m) = &route.maintenance
+        && !wafio_engine_rules::ip_network::ip_in_list(&remote, &m.allow_ips)
+        && !maintenance_allows_path(m, &req.forward_path)
+    {
+        return answer(maintenance_response(m, &req));
+    }
 
     // The challenge verify POST is answered before any inspection.
     if req.forward_path == VERIFY_ENDPOINT_PATH.as_bytes() && req.method == b"POST" {

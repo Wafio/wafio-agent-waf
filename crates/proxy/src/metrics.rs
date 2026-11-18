@@ -1,7 +1,7 @@
 //! The agent-side counters the request path feeds: the analyze latency histogram,
-//! partial-coverage flags, recovered agent panics. Process-wide; the binary registers them
-//! (`wafio_waf_analyze_duration_seconds`, `wafio_waf_partial_coverage_flags`,
-//! `wafio_waf_agent_panics`) and reads the heartbeat summary.
+//! partial-coverage flags, recovered agent panics, maintenance answers. Process-wide; the binary
+//! registers them (`wafio_waf_analyze_duration_seconds`, `wafio_waf_partial_coverage_flags`,
+//! `wafio_waf_agent_panics`, `wafio_waf_maintenance_responses`) and reads the heartbeat summary.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +28,9 @@ pub static PANIC_COUNT: AtomicU64 = AtomicU64::new(0);
 pub fn count_agent_panic() {
     PANIC_COUNT.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Requests answered with the maintenance page.
+pub static MAINTENANCE_RESPONSES: AtomicU64 = AtomicU64::new(0);
 
 /// Most distinct coverage flags kept as labels; the rest count as "other".
 const COVERAGE_LABEL_CAP: usize = 32;

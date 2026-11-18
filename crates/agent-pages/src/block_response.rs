@@ -36,9 +36,9 @@ pub fn escape_for_xml(s: &[u8]) -> Vec<u8> {
     replace_all(&s, b"'", b"&apos;")
 }
 
-const JSON: &str = "application/json; charset=utf-8";
-const XML: &str = "application/xml; charset=utf-8";
-const HTML: &str = "text/html; charset=utf-8";
+pub(crate) const JSON: &str = "application/json; charset=utf-8";
+pub(crate) const XML: &str = "application/xml; charset=utf-8";
+pub(crate) const HTML: &str = "text/html; charset=utf-8";
 
 /// Picks a template field of the config.
 type Field = fn(&ChallengeSettings) -> &String;

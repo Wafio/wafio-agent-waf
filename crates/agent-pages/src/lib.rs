@@ -15,6 +15,7 @@ pub mod field_paths;
 pub mod goodbot;
 pub mod iprep;
 pub mod json_tree;
+pub mod maintenance;
 pub mod multipart;
 pub mod seeded_rng;
 #[rustfmt::skip]

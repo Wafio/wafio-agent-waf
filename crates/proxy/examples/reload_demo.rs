@@ -46,6 +46,7 @@ async fn run() -> std::io::Result<()> {
         rules_json: Vec::new(),
         fcgi_doc_root: String::new(),
         fcgi_index: String::new(),
+        maintenance: Vec::new(),
         analysis: Arc::new(wafio_proxy::testing::analysis_setup(br#"{}"#)),
     };
     proxy.apply(vec![app]).map_err(std::io::Error::other)?;

@@ -3174,6 +3174,7 @@ dependencies = [
  "memchr",
  "serde",
  "serde_json",
+ "tracing",
  "wafio-bytetext",
 ]
 
