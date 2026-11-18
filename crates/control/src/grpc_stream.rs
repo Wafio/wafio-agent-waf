@@ -758,6 +758,12 @@ async fn probe_stream(cfg: &ControlConfig) -> Result<(), LinkError> {
     Ok(())
 }
 
+/// The largest message the control plane may send, a bundle included. It is tonic's default made
+/// explicit, and the control plane keeps a bundle under it (`engine.MaxAgentBundleBytes`): a larger
+/// message ends the stream with `OutOfRange`, the agent reconnects, receives the same bundle and
+/// fails again, so it never gets a new configuration.
+const MAX_SERVER_MESSAGE_BYTES: usize = 4 << 20;
+
 /// Dial the control plane: mTLS (TLS 1.2+, CA pinned, client certificate), HTTP/2
 /// keepalive 30 s / 10 s while a stream is open.
 async fn connect(cfg: &ControlConfig) -> Result<AgentControlClient<Channel>, LinkError> {
@@ -823,7 +829,7 @@ async fn connect(cfg: &ControlConfig) -> Result<AgentControlClient<Channel>, Lin
             tonic::Status::unavailable(format!("connection error: {}", chain(&e))),
         )
     })?;
-    Ok(AgentControlClient::new(channel))
+    Ok(AgentControlClient::new(channel).max_decoding_message_size(MAX_SERVER_MESSAGE_BYTES))
 }
 
 /// The host of `host:port`, or the whole authority when it has no port.
