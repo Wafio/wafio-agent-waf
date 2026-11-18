@@ -350,6 +350,22 @@ async fn allowed_traffic_still_goes_through_the_whole_pipeline() {
 }
 
 #[tokio::test]
+async fn a_client_the_rules_would_block_gets_the_page_without_inspection() {
+    let up = http_upstream().await;
+    let mut a = app("m", free_port(), &format!("http://{}", up.addr));
+    a.analysis =
+        analysis_setup(r#"{"l7_flood":{"enabled":true,"max_requests":1,"window_sec":60}}"#);
+    a.maintenance = on("");
+    let (h, addr) = Harness::serve(vec![a]);
+    for _ in 0..3 {
+        assert_eq!(one(addr, &get("/?q=1")).await.status, 503);
+    }
+    settle().await;
+    assert!(h.events().is_empty(), "{:?}", h.events());
+    assert_eq!(up.count(), 0);
+}
+
+#[tokio::test]
 async fn off_means_the_site_and_a_reload_switches_it_on_the_running_listener() {
     let up = http_upstream().await;
     let port = free_port();
@@ -359,11 +375,13 @@ async fn off_means_the_site_and_a_reload_switches_it_on_the_running_listener() {
         a
     };
     let (h, addr) = Harness::serve(vec![spec(br#"{"enabled":false,"message":"x"}"#)]);
-    assert_eq!(one(addr, &get("/")).await.status, 200);
+    // One kept-alive connection sees both switches: a reload drops no connection.
+    let mut c = Client::connect(addr).await.unwrap();
+    assert_eq!(c.send(&get("/")).await.unwrap().status, 200);
     h.proxy.apply(vec![spec(&on(""))]).unwrap();
-    assert_eq!(one(addr, &get("/")).await.status, 503);
+    assert_eq!(c.send(&get("/")).await.unwrap().status, 503);
     h.proxy.apply(vec![spec(b"")]).unwrap();
-    assert_eq!(one(addr, &get("/")).await.status, 200);
+    assert_eq!(c.send(&get("/")).await.unwrap().status, 200);
     assert_eq!(up.count(), 2);
 }
 

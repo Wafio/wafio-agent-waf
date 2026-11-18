@@ -1,5 +1,6 @@
 //! The `maintenance` object of a bundle app reaches the proxy: the app answers 503 while the
-//! object is there and proxies again when a later bundle leaves it out.
+//! object is there and proxies again when a later bundle leaves it out. A value it cannot read
+//! fails neither the bundle nor the app.
 
 use std::sync::Arc;
 
@@ -85,5 +86,18 @@ fn a_bundle_turns_maintenance_mode_on_and_off() {
     assert!(rt.block_on(reply(port)).starts_with("HTTP/1.1 503 "));
     install(5, "");
     assert!(rt.block_on(reply(port)).starts_with("HTTP/1.1 502 "));
+    // A value this agent cannot read leaves the app serving the site.
+    for (generation, unreadable) in [(6, r#""on""#), (7, "[1]"), (8, r#"{"enabled":"yes"}"#)] {
+        install(generation, unreadable);
+        assert!(
+            rt.block_on(reply(port)).starts_with("HTTP/1.1 502 "),
+            "{unreadable}"
+        );
+    }
+    install(
+        9,
+        r#"{"enabled":true,"end_time":"soon","allow_ips":"all","allow_paths":[7]}"#,
+    );
+    assert!(rt.block_on(reply(port)).starts_with("HTTP/1.1 503 "));
     rt.block_on(proxy.shutdown(false));
 }
