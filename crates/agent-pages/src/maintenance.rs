@@ -247,4 +247,15 @@ mod tests {
         assert_eq!(ct, HTML);
         assert!(html.contains("<title>Down for maintenance</title>"));
     }
+
+    #[test]
+    fn the_stock_page_is_the_control_plane_copy() {
+        // The dashboard previews the control plane's StockMaintenanceHTML: change both, then this hash.
+        let hash =
+            crate::crypto::hex_encode(&crate::crypto::sha256(t::STOCK_MAINTENANCE_HTML.as_bytes()));
+        assert_eq!(
+            String::from_utf8(hash).unwrap(),
+            "19e7dcca79422988cd08f783ffc80b70dc0f4058ba78530afd7bbb06928da633"
+        );
+    }
 }
