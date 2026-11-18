@@ -256,6 +256,8 @@ async fn an_allowed_path_and_what_lies_below_it_reach_the_upstream() {
         ("/static/app.js", 200),
         ("/healthzx", 503),
         ("/healthz/../admin", 503),
+        ("/healthz/..;/admin", 503),
+        ("/healthz/x;v=1", 200),
         ("/Healthz", 503),
         ("/static", 503),
         ("/admin", 503),
@@ -263,7 +265,7 @@ async fn an_allowed_path_and_what_lies_below_it_reach_the_upstream() {
     ] {
         assert_eq!(one(addr, &get(path)).await.status, status, "{path}");
     }
-    assert_eq!(up.count(), 5, "only the allowed paths reached the upstream");
+    assert_eq!(up.count(), 6, "only the allowed paths reached the upstream");
 }
 
 #[tokio::test]

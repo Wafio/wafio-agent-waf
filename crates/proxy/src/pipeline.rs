@@ -319,6 +319,15 @@ fn note(detail: &[u8], n: &[u8]) -> Vec<u8> {
     join_note(detail, n)
 }
 
+/// Whether maintenance mode lets the forwarded `path` through. A path that holds a `;` must also
+/// pass with its path parameters removed, since servlet containers route `/healthz/..;/admin` to
+/// `/admin`.
+fn maintenance_allows_path(m: &MaintenanceSettings, path: &[u8]) -> bool {
+    m.allows_path(path)
+        && (!path.contains(&b';')
+            || m.allows_path(&wafio_engine_rules::forwarded_path_readings(path).0))
+}
+
 /// The 503 of an app in maintenance mode. It is counted, not recorded as a decision.
 fn maintenance_response(m: &MaintenanceSettings, req: &InboundRequest) -> OutboundResponse {
     crate::metrics::MAINTENANCE_RESPONSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -357,7 +366,7 @@ pub(crate) async fn handle(
     // clients and paths go on through the whole pipeline.
     if let Some(m) = &route.maintenance
         && !wafio_engine_rules::ip_network::ip_in_list(&remote, &m.allow_ips)
-        && !m.allows_path(&req.forward_path)
+        && !maintenance_allows_path(m, &req.forward_path)
     {
         return answer(maintenance_response(m, &req));
     }

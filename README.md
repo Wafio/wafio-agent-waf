@@ -157,7 +157,8 @@ whole request body, up to the app's body limit, before it answers.
   the site and runs the full normal pipeline.
 - `allow_paths`: a request whose decoded, dot-resolved path (the path the upstream receives) equals an entry, lies below it
   (`/healthz` covers `/healthz/x`, not `/healthzx`), or starts with an entry that ends in `/` gets the site. The match is
-  case-sensitive. An entry of `/` lets every path through.
+  case-sensitive. A path that holds `;` must also match with its path parameters removed, because servlet containers
+  route `/healthz/..;/admin` to `/admin`. An entry of `/` lets every path through.
 - The format follows the `Accept` header: `text/html` gets HTML, else `json` gets JSON, else `xml` gets XML, else HTML. Only the
   HTML page can be replaced (`custom_html`). `{{WAFIO_MESSAGE}}` is the message, or a default text, escaped for the format.
   `{{WAFIO_END_TIME}}` is the expected end as `YYYY-MM-DDTHH:MM:SSZ` while it lies ahead, else empty.
