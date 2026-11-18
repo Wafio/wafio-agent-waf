@@ -49,6 +49,11 @@ fn wait_ready(sock: &UnixDatagram) -> u32 {
     }
 }
 
+/// The tests copy the demo and start the copy. A process another test forks while a copy is being
+/// written holds the file open, and starting the copy then fails with "text file busy", so the
+/// tests of this file run one at a time.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn alive(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z "))
 }
@@ -115,6 +120,7 @@ async fn load(proxy: std::net::SocketAddr, stats: Arc<Stats>, stop: Arc<AtomicBo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigusr2_reload_under_load() {
+    let _one = ONE_AT_A_TIME.lock().await;
     // Under the system temp directory, not the cargo one: the Unix sockets in it must fit sun_path (108 bytes),
     // and a checkout several folders deep does not leave room.
     let dir = std::env::temp_dir().join(format!("wafio-reload-{}", std::process::id()));
@@ -281,6 +287,7 @@ async fn ws_echoes(c: &WsConnection) {
 /// answers a new handshake of a blocked client with 503 and lets an allowed path in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigusr2_reload_closes_open_websocket_sessions() {
+    let _one = ONE_AT_A_TIME.lock().await;
     let dir = std::env::temp_dir().join(format!("wafio-reload-ws-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
