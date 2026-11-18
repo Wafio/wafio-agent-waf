@@ -24,6 +24,8 @@ pub struct BundleApp {
     pub custom_gui_rules: Vec<Vec<u8>>,
     pub custom_script_rules: Vec<Vec<u8>>,
     pub custom_tuning_rules: Vec<Vec<u8>>,
+    /// Raw JSON of the maintenance object, present only while maintenance mode is on; empty = absent.
+    pub maintenance: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -145,7 +147,7 @@ fn raw_slice(
     })
 }
 
-const APP_FIELDS: [&str; 14] = [
+const APP_FIELDS: [&str; 15] = [
     "app_id",
     "listen_host",
     "listen_port",
@@ -160,6 +162,7 @@ const APP_FIELDS: [&str; 14] = [
     "custom_gui_rules",
     "custom_script_rules",
     "custom_tuning_rules",
+    "maintenance",
 ];
 
 fn decode_app(
@@ -189,7 +192,8 @@ fn decode_app(
                 10 => json_decode::string(d, v, &mut a.fcgi_index),
                 11 => raw_slice(d, sp, v, &mut a.custom_gui_rules)?,
                 12 => raw_slice(d, sp, v, &mut a.custom_script_rules)?,
-                _ => raw_slice(d, sp, v, &mut a.custom_tuning_rules)?,
+                13 => raw_slice(d, sp, v, &mut a.custom_tuning_rules)?,
+                _ => a.maintenance = sp.raw(v),
             }
             Ok(())
         },
@@ -288,6 +292,21 @@ mod tests {
         );
         assert_eq!(a.listen_port, 8080, "keys match case-insensitively");
         assert_eq!(a.aliases, vec!["A.example".to_string()]);
+    }
+
+    #[test]
+    fn the_maintenance_object_is_kept_as_written() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"x","maintenance":{ "enabled":true,"message":"Back soon","allow_ips":["10.0.0.1"] }},
+               {"app_id":"y"},{"app_id":"z","Maintenance":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            b.apps[0].maintenance,
+            br#"{ "enabled":true,"message":"Back soon","allow_ips":["10.0.0.1"] }"#.to_vec()
+        );
+        assert!(b.apps[1].maintenance.is_empty(), "absent stays empty");
+        assert_eq!(b.apps[2].maintenance, b"null".to_vec());
     }
 
     #[test]

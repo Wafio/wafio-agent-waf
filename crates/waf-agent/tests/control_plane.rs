@@ -1,6 +1,7 @@
 //! Black-box test with the real binary: an in-test fake control plane (tonic, mTLS with the
 //! control crate's fixture CA) checks what `wafio-waf-agent` sends — Hello (kind, version,
-//! the features `script_rules` and `no_semantic_engine`), the first heartbeat with host info and counters, the malware sync
+//! the features `script_rules`, `maintenance_mode` and `no_semantic_engine`), the first heartbeat with host info and
+//! counters, the malware sync
 //! into the security-data dir given by `--security-data-dir`, the bundle ack, READY after the
 //! live bundle, the bundle cache, a block decision with its credentials redacted.
 
@@ -247,8 +248,8 @@ async fn agent_talks_to_the_control_plane() {
     assert_eq!(h.agent_version, "wafio-waf-agent/dev");
     assert_eq!(
         h.features,
-        vec!["script_rules", "no_semantic_engine"],
-        "the agent runs script rules itself, and this binary has no engine"
+        vec!["script_rules", "maintenance_mode", "no_semantic_engine"],
+        "the agent runs script rules and serves the maintenance page itself, and this binary has no engine"
     );
 
     // The stream: Hello, then the first heartbeat with host info and the agent's counters.

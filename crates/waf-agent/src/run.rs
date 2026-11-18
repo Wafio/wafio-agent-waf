@@ -34,6 +34,8 @@ const READY_FALLBACK: Duration = Duration::from_secs(20);
 const CLEANUP_EVERY: Duration = Duration::from_secs(120);
 /// FireHOL refresh period.
 const IPREP_REFRESH: Duration = Duration::from_secs(24 * 3600);
+/// The `Hello.features` entry of an agent that serves the maintenance page.
+const FEATURE_MAINTENANCE_MODE: &str = "maintenance_mode";
 
 struct Stats;
 
@@ -266,8 +268,12 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
         crate::hostinfo::AGENT_VERSION,
     )
     .map_err(|e| format!("agent gRPC stream init: {e}"))?;
-    // Hello.features: script rules run in this process; and whether a semantic engine is installed.
-    cfg.features = vec![crate::script_rules::FEATURE_SCRIPT_RULES.into()];
+    // Hello.features: script rules run in this process, the agent answers for an app in maintenance
+    // mode itself, and whether a semantic engine is installed.
+    cfg.features = vec![
+        crate::script_rules::FEATURE_SCRIPT_RULES.into(),
+        FEATURE_MAINTENANCE_MODE.into(),
+    ];
     if !wafio_engine_api::engine().info().installed {
         cfg.features
             .push(crate::gaps::FEATURE_NO_SEMANTIC_ENGINE.into());

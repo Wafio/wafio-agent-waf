@@ -11,7 +11,8 @@ use wafio_application::{PARTIAL_COVERAGE_REQUESTS, RECOVERED_ANALYZE_PANICS};
 use wafio_control::{ControlLink, HeartbeatCounters};
 use wafio_engine_api::engine;
 use wafio_proxy::metrics::{
-    ANALYZE_LATENCY_HISTOGRAM, PANIC_COUNT, coverage_flag_samples, latency_percentiles,
+    ANALYZE_LATENCY_HISTOGRAM, MAINTENANCE_RESPONSES, PANIC_COUNT, coverage_flag_samples,
+    latency_percentiles,
 };
 
 /// The heartbeat counters the agent owns.
@@ -93,6 +94,11 @@ pub fn register_agent_metrics(reg: &Registry, link: Arc<ControlLink>) {
         "wafio_waf_agent_panics",
         "Other panics recovered by the agent (WebSocket relay, IP-jail enforcement).",
         || u(PANIC_COUNT.load(Ordering::Relaxed)),
+    );
+    reg.counter(
+        "wafio_waf_maintenance_responses",
+        "Requests answered with the maintenance page of an app in maintenance mode.",
+        || u(MAINTENANCE_RESPONSES.load(Ordering::Relaxed)),
     );
     reg.labeled_counter(
         "wafio_waf_jail_refused",
@@ -256,6 +262,7 @@ mod tests {
             "wafio_waf_analyze_duration_seconds",
             "wafio_waf_analyze_panics_total",
             "wafio_waf_partial_coverage_flags",
+            "wafio_waf_maintenance_responses_total",
             "wafio_waf_ratelimit_evictions_total",
             r#"wafio_waf_challenge_pinned_evictions_total{store="spent_tokens"}"#,
             r#"wafio_waf_challenge_pinned_evictions_total{store="revoked_cookies"}"#,

@@ -331,6 +331,7 @@ pub fn app(id: &str, port: u16, upstream: &str) -> AppSpec {
         rules_json: Vec::new(),
         fcgi_doc_root: String::new(),
         fcgi_index: String::new(),
+        maintenance: Vec::new(),
         analysis: analysis_setup(RULES),
     }
 }

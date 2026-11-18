@@ -142,9 +142,32 @@ The black-box suites that start an agent binary and drive it over HTTP and gRPC 
 
 ## Hello features
 
-The agent reports in `Hello.features`: `script_rules` (it runs script rules in its own process) and, only when no engine is
-installed, `no_semantic_engine`. The official agent never sends the last one. The control plane ignores names
-it does not know.
+The agent reports in `Hello.features`: `script_rules` (it runs script rules in its own process), `maintenance_mode` (it
+serves the maintenance page, see below) and, only when no engine is installed, `no_semantic_engine`. The official agent never
+sends the last one. The control plane ignores names it does not know.
+
+## Maintenance mode
+
+An app whose bundle entry carries a `maintenance` object with `enabled: true` answers every request itself with status 503, before
+any other step: no inspection, no challenge, no upstream contact, and it is not recorded as a decision. This holds for every
+method, for a WebSocket handshake (refused, nothing is upgraded), for HEAD (headers only) and in monitor mode. The agent reads the
+whole request body, up to the app's body limit, before it answers.
+
+- `allow_ips`: IP addresses or CIDR ranges. A request from one of them, judged by the client IP after trusted-proxy handling, gets
+  the site and runs the full normal pipeline.
+- `allow_paths`: a request whose decoded, dot-resolved path (the path the upstream receives) equals an entry, lies below it
+  (`/healthz` covers `/healthz/x`, not `/healthzx`), or starts with an entry that ends in `/` gets the site. The match is
+  case-sensitive. An entry of `/` lets every path through.
+- The format follows the `Accept` header: `text/html` gets HTML, else `json` gets JSON, else `xml` gets XML, else HTML. Only the
+  HTML page can be replaced (`custom_html`). `{{WAFIO_MESSAGE}}` is the message, or a default text, escaped for the format.
+  `{{WAFIO_END_TIME}}` is the expected end as `YYYY-MM-DDTHH:MM:SSZ` while it lies ahead, else empty.
+- While the end time lies ahead the answer carries `Retry-After`. The agent never ends maintenance by itself: the control plane
+  has to send a bundle without the object.
+- Every answer carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+
+The agent ignores keys it does not know, drops an entry it cannot read (an end time that is not exactly `YYYY-MM-DDTHH:MM:SSZ`,
+an address that is not an IP or CIDR range, a path that does not start with `/`) with one log line, and never fails the app over
+them. The counter `wafio_waf_maintenance_responses_total` counts the answers.
 
 ## Script rules
 
