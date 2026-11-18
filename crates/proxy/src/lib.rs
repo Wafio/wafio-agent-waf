@@ -21,6 +21,7 @@ pub mod decision;
 pub mod fastcgi;
 pub mod head_parser;
 pub mod listeners;
+pub(crate) mod maintenance;
 pub mod metrics;
 pub mod pipeline;
 pub mod proxy;

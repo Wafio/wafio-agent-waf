@@ -12,13 +12,15 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use pingora::server::ShutdownWatch;
 use pingora::upstreams::peer::HttpPeer;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use wafio_agent_io::client_ip::outgoing_forwarded_for;
 use wafio_agent_io::ws_frame::{
-    OP_BINARY, WS_CLOSE_MESSAGE_TOO_BIG, WS_CLOSE_NORMAL_CLOSURE, WS_CLOSE_POLICY_VIOLATION,
-    WsConnection, WsError, WsRequestHead, WsStream,
+    OP_BINARY, WS_CLOSE_GOING_AWAY, WS_CLOSE_MESSAGE_TOO_BIG, WS_CLOSE_NORMAL_CLOSURE,
+    WS_CLOSE_POLICY_VIOLATION, WsConnection, WsError, WsRequestHead, WsStream,
 };
 use wafio_agent_io::ws_scanner::{
     WsContentScan, WsDetailed, WsFieldCoverage, WsMessageRateLimiter, WsScanBudget, WsScanField,
@@ -32,6 +34,7 @@ use wafio_engine_api::{SemanticConfig, Tier, decision_score, disabled_key_from_r
 
 use crate::config::{Route, Target};
 use crate::decision::{DecisionEvent, DecisionSink, now_unix};
+use crate::maintenance::Watch;
 use crate::proxy::Shared;
 use crate::request::{InboundRequest, title_case_header_key};
 use crate::response::OutboundResponse;
@@ -42,6 +45,8 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_FALLBACK_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Longest preview of a frame payload, in bytes.
 const WS_PREVIEW_BYTE_CAP: usize = 256;
+/// How long the close frames of a session that must end may take before the connections are cut.
+const WS_END_TIMEOUT: Duration = Duration::from_secs(2);
 /// The answer when the upstream cannot be reached.
 const WS_BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
 /// The body of the answer to a refused origin.
@@ -136,6 +141,8 @@ pub(crate) struct WsPlan {
     host: Vec<u8>,
     uri: Vec<u8>,
     remote: String,
+    /// The decoded path of the handshake: with `remote`, what maintenance mode lets a session stay for.
+    forward_path: Vec<u8>,
     sem: Arc<SemanticConfig>,
     scan_upstream_frames: bool,
     /// The route executor's malware engine over a binary frame; `None` when
@@ -268,6 +275,7 @@ pub(crate) fn hook(
         host: req.host.clone(),
         uri: req.request_target.clone(),
         remote: remote.to_string(),
+        forward_path: req.forward_path.clone(),
         sem,
         scan_upstream_frames: route.ws.scan_server_frames,
         binary_scanner: scan_bin,
@@ -546,12 +554,16 @@ async fn bad_gateway(mut client: impl AsyncWrite + Unpin) {
     let _ = client.shutdown().await;
 }
 
-/// Serves the takeover: runs on its own task.
+/// Serves the takeover: runs on its own task. `route` follows the app's route swaps and `stop`
+/// the draining of the listener: the session ends with a close frame when maintenance turns on
+/// for its client or the listener stops (a reload, a shutdown, the app removed).
 pub(crate) async fn serve(
     shared: Arc<Shared>,
     plan: Box<WsPlan>,
     client: pingora::protocols::Stream,
     prefix: Vec<u8>,
+    route: watch::Receiver<Arc<Route>>,
+    stop: ShutdownWatch,
 ) {
     let client = PrefixedStream {
         prefix,
@@ -625,11 +637,27 @@ pub(crate) async fn serve(
             return;
         }
     };
-    relay(Arc::new(client), Arc::new(upstream), Arc::new(*plan)).await;
+    let watch = Watch::new(route, plan.remote.clone(), plan.forward_path.clone());
+    relay(
+        Arc::new(client),
+        Arc::new(upstream),
+        Arc::new(*plan),
+        watch,
+        stop,
+    )
+    .await;
 }
 
-/// Relays messages between the client and the upstream.
-async fn relay(client: Arc<WsConnection>, upstream: Arc<WsConnection>, s: Arc<WsPlan>) {
+/// Relays messages between the client and the upstream until one side ends, or until `watch`
+/// says maintenance mode applies to this client or `stop` says the listener is going away: then
+/// both sides get a close frame (1001) and the connections are cut, without waiting for a reply.
+async fn relay(
+    client: Arc<WsConnection>,
+    upstream: Arc<WsConnection>,
+    s: Arc<WsPlan>,
+    mut watch: Watch,
+    mut stop: ShutdownWatch,
+) {
     let limits = s.limits;
     client.set_max_message_bytes(limits.max_binary_size as i64);
     upstream.set_max_message_bytes(limits.max_binary_size as i64);
@@ -707,44 +735,66 @@ async fn relay(client: Arc<WsConnection>, upstream: Arc<WsConnection>, s: Arc<Ws
             close_both().await;
         })
     };
-    loop {
-        client.set_read_expiry(Some(Instant::now() + s.idle));
-        let (kind, payload) = match client.next_data_message().await {
-            Ok(m) => m,
-            Err(WsError::ReadLimit) => {
-                s.emit_scan_event(b"ws:client", "block", "ws_binary_oversize", 0, b"");
+    let client_loop = async {
+        loop {
+            client.set_read_expiry(Some(Instant::now() + s.idle));
+            let (kind, payload) = match client.next_data_message().await {
+                Ok(m) => m,
+                Err(WsError::ReadLimit) => {
+                    s.emit_scan_event(b"ws:client", "block", "ws_binary_oversize", 0, b"");
+                    break;
+                }
+                Err(e) => {
+                    relay_close_frame(&upstream, &e).await;
+                    break;
+                }
+            };
+            if !limiter.allow() {
+                s.emit_scan_event(b"ws:client", "block", "ws_rate_limited", 0, b"");
+                let _ = client
+                    .send_close(WS_CLOSE_POLICY_VIOLATION, "Rate limit exceeded")
+                    .await;
                 break;
             }
-            Err(e) => {
-                relay_close_frame(&upstream, &e).await;
+            // Binary malware hashing: unconditional block tier, like the rate limit; the payload
+            // never reaches the upstream.
+            if kind == OP_BINARY && s.binary_scanner.as_ref().is_some_and(|scan| scan(&payload)) {
+                s.emit_scan_event(b"ws:client", "block", "ws_binary_malware", 0, &payload);
+                let _ = client
+                    .send_close(WS_CLOSE_POLICY_VIOLATION, "Blocked by WAF")
+                    .await;
                 break;
             }
-        };
-        if !limiter.allow() {
-            s.emit_scan_event(b"ws:client", "block", "ws_rate_limited", 0, b"");
-            let _ = client
-                .send_close(WS_CLOSE_POLICY_VIOLATION, "Rate limit exceeded")
-                .await;
-            break;
+            if s.evaluate_frame(b"ws:client", &client, kind, &payload, limits.max_text_size)
+                .await
+            {
+                break;
+            }
+            upstream.set_write_expiry(Some(Instant::now() + s.idle));
+            if upstream.send_data_message(kind, &payload).await.is_err() {
+                break;
+            }
         }
-        // Binary malware hashing: unconditional block tier, like the rate limit; the payload
-        // never reaches the upstream.
-        if kind == OP_BINARY && s.binary_scanner.as_ref().is_some_and(|scan| scan(&payload)) {
-            s.emit_scan_event(b"ws:client", "block", "ws_binary_malware", 0, &payload);
-            let _ = client
-                .send_close(WS_CLOSE_POLICY_VIOLATION, "Blocked by WAF")
-                .await;
-            break;
+    };
+    let ended = async {
+        tokio::select! {
+            () = watch.maintenance_on() => "Maintenance",
+            () = async { let _ = stop.wait_for(|v| *v).await; } => "Going away",
         }
-        if s.evaluate_frame(b"ws:client", &client, kind, &payload, limits.max_text_size)
-            .await
-        {
-            break;
+    };
+    tokio::select! {
+        biased;
+        reason = ended => {
+            // The client's frame goes first. A peer that does not answer is cut after the timeout.
+            let _ = tokio::time::timeout(WS_END_TIMEOUT, async {
+                tokio::join!(
+                    client.send_close(WS_CLOSE_GOING_AWAY, reason),
+                    upstream.send_close(WS_CLOSE_GOING_AWAY, reason),
+                )
+            })
+            .await;
         }
-        upstream.set_write_expiry(Some(Instant::now() + s.idle));
-        if upstream.send_data_message(kind, &payload).await.is_err() {
-            break;
-        }
+        () = client_loop => {}
     }
     close_both().await;
     let _ = server.await;

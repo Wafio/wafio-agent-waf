@@ -2,6 +2,10 @@
 //! SIGTERM = stop. Every response carries `x-served-by: <pid>`.
 //!
 //!   reload_demo --listen 127.0.0.1:8080 --upstream 127.0.0.1:9000 [--run-dir DIR] [--apply-delay-ms N]
+//!               [--maintenance-file FILE]
+//!
+//! `--maintenance-file`: the file's text (read when the configuration is applied, so a successor
+//! reads the file as it is then) is the app's `maintenance` object; a missing file means none.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +50,9 @@ async fn run() -> std::io::Result<()> {
         rules_json: Vec::new(),
         fcgi_doc_root: String::new(),
         fcgi_index: String::new(),
-        maintenance: Vec::new(),
+        maintenance: arg("--maintenance-file")
+            .and_then(|f| std::fs::read(f).ok())
+            .unwrap_or_default(),
         analysis: Arc::new(wafio_proxy::testing::analysis_setup(br#"{}"#)),
     };
     proxy.apply(vec![app]).map_err(std::io::Error::other)?;

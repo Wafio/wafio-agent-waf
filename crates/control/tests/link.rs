@@ -771,6 +771,64 @@ async fn undecodable_bundles_are_acked_with_the_decoder_error_text() {
     std::fs::remove_dir_all(state).unwrap();
 }
 
+/// A control message may be 4 MiB; a bigger one ends the stream, and the link opens a new one
+/// without applying anything. The control plane keeps every bundle under the limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_over_four_mebibytes_ends_the_stream() {
+    let (addr, mut conns) = start_fake(FakeOptions {
+        malware: b"x".to_vec(),
+        ..Default::default()
+    })
+    .await;
+    let state = tmpdir("size");
+    let (sink, sec) = (Arc::new(Sink::default()), Arc::new(Sec::default()));
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        sec,
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    c.send(In::Welcome(Welcome::default())).await;
+
+    let padded = |total: usize| {
+        let head = r#"{"generation":5,"pad":""#;
+        let tail = r#""}"#;
+        format!(
+            "{head}{}{tail}",
+            "a".repeat(total - head.len() - tail.len())
+        )
+    };
+    let fits = padded((4 << 20) - 1024);
+    c.send(In::Bundle(BundleUpdate {
+        command_id: "fits".into(),
+        generation: 5,
+        bundle_json: fits.clone().into(),
+    }))
+    .await;
+    assert!(c.next_ack("fits").await.ok);
+    assert_eq!(sink.applied.lock().unwrap().len(), 1);
+
+    // The message holds the bundle and a few bytes of framing, so a bundle of exactly the
+    // limit is already too big.
+    c.send(In::Bundle(BundleUpdate {
+        command_id: "big".into(),
+        generation: 6,
+        bundle_json: padded(4 << 20).into(),
+    }))
+    .await;
+    let mut c = next_conn(&mut conns).await;
+    assert_eq!(hello(c.next().await.unwrap()).bundle_generation, 5);
+    assert_eq!(
+        sink.applied.lock().unwrap().len(),
+        1,
+        "the big bundle was not applied"
+    );
+
+    task.abort();
+    std::fs::remove_dir_all(state).unwrap();
+}
+
 /// Conformance scenario `grpc-fetch-security-data`: the server's refusal of
 /// `DownloadMalwareDatabase` arrives on `Recv`, so anything but a connection that cannot take
 /// the call is "interrupted".
