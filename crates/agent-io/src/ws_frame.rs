@@ -213,6 +213,11 @@ struct Writer {
     pending_write_error: Option<WsError>,
 }
 
+/// The sticky error a frame write holds while it runs. A caller that drops the write (a relay
+/// that ends the session, an outer timeout) leaves it there, since an unknown part of the frame
+/// is out: a close frame written after it would arrive as payload bytes.
+const TORN: WsError = WsError::Closed;
+
 enum Frame {
     Data(u8),
     Continuation,
@@ -751,18 +756,17 @@ impl WsConnection {
         if let Some(e) = &w.pending_write_error {
             return Err(e.clone());
         }
+        w.pending_write_error = Some(TORN);
         let res = match tokio::time::timeout_at(deadline, w.wr.write_all(&frame)).await {
             Ok(r) => r.map_err(wrap_io_error),
             Err(_) => Err(WsError::Timeout),
         };
-        if let Err(e) = res {
-            w.pending_write_error.get_or_insert(e.clone());
-            return Err(e);
-        }
-        if op == OP_CLOSE {
-            w.pending_write_error.get_or_insert(WsError::CloseSent);
-        }
-        Ok(())
+        w.pending_write_error = match &res {
+            Err(e) => Some(e.clone()),
+            Ok(()) if op == OP_CLOSE => Some(WsError::CloseSent),
+            Ok(()) => None,
+        };
+        res
     }
 
     /// Sends one complete data message (text or binary) in one frame.
@@ -780,13 +784,12 @@ impl WsConnection {
             w.pending_write_error = Some(WsError::Timeout);
             return Err(WsError::Timeout);
         }
+        w.pending_write_error = Some(TORN);
         let res = self
             .write_deadline
             .run(async { w.wr.write_all(&frame).await.map_err(wrap_io_error) })
             .await;
-        if let Err(e) = &res {
-            w.pending_write_error.get_or_insert(e.clone());
-        }
+        w.pending_write_error = res.as_ref().err().cloned();
         res
     }
 

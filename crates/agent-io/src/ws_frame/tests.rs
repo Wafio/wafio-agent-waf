@@ -189,6 +189,76 @@ async fn pong_io_error_keeps_reading() {
     assert!(server.send_data_message(OP_TEXT, b"x").await.is_err());
 }
 
+/// A write whose caller gives up part way leaves a torn frame on the wire, so nothing follows
+/// it: not a data frame, not the close frame of a relay that ends the session.
+#[tokio::test]
+async fn a_write_dropped_part_way_lets_no_frame_follow() {
+    use tokio::io::AsyncReadExt;
+    let (mut nc, server) = raw_server().await;
+    // The pipe holds 64 KiB, so the 1 MiB frame stops part way and the caller drops it.
+    let big = vec![7u8; 1 << 20];
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            server.send_data_message(OP_BINARY, &big)
+        )
+        .await
+        .is_err()
+    );
+    let mut torn = vec![0u8; 1 << 16];
+    nc.read_exact(&mut torn).await.unwrap();
+    assert_eq!(torn[..2], [0x80 | OP_BINARY, 127]);
+    assert_eq!(
+        server
+            .send_close(WS_CLOSE_GOING_AWAY, "Maintenance")
+            .await
+            .unwrap_err(),
+        WsError::Closed
+    );
+    assert_eq!(
+        server.send_data_message(OP_TEXT, b"x").await.unwrap_err(),
+        WsError::Closed
+    );
+    let mut more = [0u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), nc.read(&mut more))
+            .await
+            .is_err(),
+        "nothing was written after the torn frame"
+    );
+}
+
+/// The same for a control frame that an outer timeout drops.
+#[tokio::test]
+async fn a_close_frame_dropped_part_way_lets_no_frame_follow() {
+    use tokio::io::AsyncReadExt;
+    let (mut nc, server) = raw_server().await;
+    server
+        .send_data_message(OP_BINARY, &vec![0u8; (1 << 16) - 4])
+        .await
+        .unwrap(); // fills the pipe exactly
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            server.send_close(WS_CLOSE_GOING_AWAY, "Maintenance")
+        )
+        .await
+        .is_err()
+    );
+    let mut full = vec![0u8; 1 << 16];
+    nc.read_exact(&mut full).await.unwrap();
+    assert!(
+        server.send_data_message(OP_TEXT, b"x").await.is_err(),
+        "no frame after a close frame that may be torn"
+    );
+    let mut more = [0u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), nc.read(&mut more))
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn close_surfaces_as_typed_error() {
     let (client, server) = connected_pair().await;
