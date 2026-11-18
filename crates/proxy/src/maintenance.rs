@@ -311,6 +311,7 @@ mod tests {
             fcgi_index: String::new(),
             maintenance: maintenance.as_bytes().to_vec(),
             analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
+            tls: None,
         })
         .unwrap()
     }

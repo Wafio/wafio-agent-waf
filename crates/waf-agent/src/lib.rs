@@ -28,6 +28,7 @@ mod setup_ja4;
 mod setup_malware;
 pub mod siem;
 pub mod stderr_log;
+pub mod tls_sites;
 
 use std::process::ExitCode;
 

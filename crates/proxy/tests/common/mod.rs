@@ -203,7 +203,7 @@ impl ReplyParts {
     }
 }
 
-pub async fn read_reply(r: &mut BufReader<TcpStream>) -> io::Result<ReplyParts> {
+pub async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> io::Result<ReplyParts> {
     let (first, headers) = read_head(r).await?.ok_or(io::ErrorKind::UnexpectedEof)?;
     let status = first.split(' ').nth(1).unwrap().parse().unwrap();
     let mut body = Vec::new();
@@ -333,6 +333,7 @@ pub fn app(id: &str, port: u16, upstream: &str) -> AppSpec {
         fcgi_index: String::new(),
         maintenance: Vec::new(),
         analysis: analysis_setup(RULES),
+        tls: None,
     }
 }
 

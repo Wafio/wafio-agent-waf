@@ -181,6 +181,18 @@ fn env_fills_only_empty_flags() {
 }
 
 #[test]
+fn the_tls_sites_file_comes_from_the_flag_or_the_environment() {
+    assert_eq!(parse(&[]).tls_sites_file, "");
+    let vars = [("WAFIO_TLS_SITES_FILE", "/etc/wafio/tls-sites.json")];
+    let mut f = parse(&[]);
+    f.fill_from_env(&env(&vars, &[]));
+    assert_eq!(f.tls_sites_file, "/etc/wafio/tls-sites.json");
+    let mut f = parse(&["--tls-sites-file", "/srv/sites.json"]);
+    f.fill_from_env(&env(&vars, &[]));
+    assert_eq!(f.tls_sites_file, "/srv/sites.json");
+}
+
+#[test]
 fn the_old_data_directory_setting_still_gives_the_directory_with_one_warning() {
     let f = parse(&[
         "--crs-default-dir",

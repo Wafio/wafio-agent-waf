@@ -23,6 +23,7 @@ use wafio_domain::{
     ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config, timeout_or_default_ms,
 };
 
+use crate::cert_store::CertFiles;
 use crate::maintenance::MaintenanceRoute;
 
 /// What one app's requests are analysed with. Immutable once applied; a bundle replaces it as
@@ -61,6 +62,23 @@ pub struct AppSpec {
     /// The `maintenance` object of the bundle app; empty = none.
     pub maintenance: Vec<u8>,
     pub analysis: Arc<AppAnalysisSetup>,
+    /// The agent serves the app over HTTPS itself (the local TLS sites file); `None` = only the
+    /// bundle listener, as before.
+    pub tls: Option<TlsSite>,
+}
+
+/// One app's HTTPS settings, kept on the agent and not sent by the control plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsSite {
+    /// `host:port` of the TLS listener (an IPv6 host in brackets); apps naming the same address
+    /// share it.
+    pub listen: String,
+    /// The host names the app answers for: lower case, no port, no trailing dot. SNI and `Host`
+    /// are matched against them.
+    pub hosts: Vec<String>,
+    pub cert: CertFiles,
+    /// `host:port` of a plain listener that redirects these hosts to HTTPS; `None` = no redirect.
+    pub redirect_listen: Option<String>,
 }
 
 pub(crate) enum Target {
@@ -107,6 +125,9 @@ pub struct Route {
     /// `Some` while maintenance mode is on for the app, with its pages built.
     pub(crate) maintenance: Option<MaintenanceRoute>,
     pub(crate) analysis: Arc<AppAnalysisSetup>,
+    /// The agent is the edge for this app (it terminates TLS): fingerprint headers count only
+    /// from a trusted proxy.
+    pub(crate) edge: bool,
     pub(crate) target: Target,
     /// `timeouts.upstream_ms` resolved (default 30 s); ignored when `upstream_unlimited`.
     pub(crate) upstream_timeout: Duration,
@@ -285,6 +306,7 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
         ws,
         maintenance: parse_maintenance(&app.maintenance).map(MaintenanceRoute::new),
         analysis: app.analysis.clone(),
+        edge: app.tls.is_some(),
         target,
         upstream_timeout: upstream_to,
         upstream_unlimited,

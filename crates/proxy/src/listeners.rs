@@ -1,8 +1,10 @@
-//! Per-app listeners added, changed and removed at runtime.
+//! Listeners added, changed and removed at runtime: the plain listener of an app, an HTTPS
+//! listener shared by the apps that name its address, and a plain listener that redirects to HTTPS.
 //!
 //! Pingora's `Server` fixes its services and listeners before `run_forever`, so the accept loops
-//! are our own: each listener is a tokio socket whose connections go through Pingora's
-//! `route::serve_connection` (head guard, Pingora's HTTP/1 parsing, keep-alive loop) into the route's `RouteApp`.
+//! are our own: each listener is a tokio socket whose connections go through
+//! `route::serve_connection` (head guard, HTTP/1 parsing, keep-alive loop) into the route's
+//! `RouteApp`; an HTTPS listener does its TLS handshake first.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -14,23 +16,93 @@ use std::time::Duration;
 use pingora::protocols::l4::listener::Listener as L4Listener;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::MissedTickBehavior;
 
-use crate::config::Route;
+use crate::cert_store::{CertStore, CertTable};
+use crate::config::{Route, TlsSite};
+use crate::https::{RedirectTable, TlsListener, prepare_certificates, serve_tls};
 use crate::proxy::Shared;
-use crate::route::RouteApp;
+use crate::route::{PlainSite, RouteApp, serve_connection, serve_redirect};
 
 /// How long the connections of a retired route may drain.
 pub const ROUTE_DRAIN_GRACE: Duration = Duration::from_secs(30);
 const LISTEN_BACKLOG: u32 = 4096;
 
+/// What a listener address serves.
+pub enum Serves {
+    /// One app on the plain listener its bundle entry names.
+    App(Arc<Route>),
+    /// Every app that names this address as its HTTPS listener.
+    Tls(Vec<(Arc<Route>, TlsSite)>),
+    /// A plain listener that sends these host names to HTTPS: each with its HTTPS port.
+    Redirect(HashMap<String, u16>),
+}
+
 pub struct RouteSpec {
     /// `listen_host:listen_port` (an IPv6 host in brackets); also the key a reload hands sockets over by.
     pub address: String,
-    pub route: Arc<Route>,
+    pub serves: Serves,
+}
+
+/// `Route::listener_limits`.
+type Limits = (i64, i64, i64, usize);
+
+impl Serves {
+    /// The limits and timeouts a listener cannot change in place; apps that share an HTTPS
+    /// listener must agree on them. `None`: no route is behind the listener.
+    fn limits(&self) -> Result<Option<Limits>, &'static str> {
+        match self {
+            Serves::App(route) => Ok(Some(route.listener_limits())),
+            Serves::Tls(sites) => {
+                let mut all = sites.iter().map(|(route, _)| route.listener_limits());
+                let first = all.next();
+                if all.any(|l| Some(l) != first) {
+                    return Err("apps sharing a TLS listener differ in timeouts or limits");
+                }
+                Ok(first)
+            }
+            Serves::Redirect(_) => Ok(None),
+        }
+    }
+}
+
+/// What a live listener serves.
+#[derive(Clone)]
+enum Served {
+    App(Arc<RouteApp>),
+    Tls(Arc<TlsListener>),
+    Redirect(Arc<RedirectTable>),
+}
+
+impl Served {
+    fn limits(&self) -> Option<Limits> {
+        match self {
+            Served::App(app) => Some(app.route().listener_limits()),
+            Served::Tls(listener) => Some(listener.limits()),
+            Served::Redirect(_) => None,
+        }
+    }
+
+    fn routes(&self) -> Vec<Arc<Route>> {
+        match self {
+            Served::App(app) => vec![app.route()],
+            Served::Tls(listener) => listener.routes(),
+            Served::Redirect(_) => Vec::new(),
+        }
+    }
+
+    fn is_kind_of(&self, serves: &Serves) -> bool {
+        matches!(
+            (self, serves),
+            (Served::App(_), Serves::App(_))
+                | (Served::Tls(_), Serves::Tls(_))
+                | (Served::Redirect(_), Serves::Redirect(_))
+        )
+    }
 }
 
 struct Live {
-    app: Arc<RouteApp>,
+    served: Served,
     stop: watch::Sender<bool>,
     /// A duplicate of the listening socket: stops it on retire, is handed to a successor.
     sock: StdListener,
@@ -47,6 +119,8 @@ struct Inner {
 pub struct RouteManager {
     shared: Arc<Shared>,
     drain: Duration,
+    /// How often the certificate files of an HTTPS listener are checked.
+    cert_poll: Duration,
     inner: Mutex<Inner>,
 }
 
@@ -55,11 +129,13 @@ impl RouteManager {
     pub(crate) fn new(
         shared: Arc<Shared>,
         drain: Duration,
+        cert_poll: Duration,
         inherited: HashMap<String, StdListener>,
     ) -> Self {
         RouteManager {
             shared,
             drain,
+            cert_poll,
             inner: Mutex::new(Inner {
                 live: HashMap::new(),
                 inherited,
@@ -77,14 +153,18 @@ impl RouteManager {
         self.lock().live.keys().cloned().collect()
     }
 
+    /// The route of the app on the plain listener at `addr`.
     pub fn route(&self, addr: &str) -> Option<Arc<Route>> {
-        self.lock().live.get(addr).map(|l| l.app.route())
+        match &self.lock().live.get(addr)?.served {
+            Served::App(app) => Some(app.route()),
+            _ => None,
+        }
     }
 
-    /// Makes the live listeners exactly `specs`. Every new socket is bound first; a bind
-    /// failure changes nothing. Kept listeners get the new config in place (no reconnect),
-    /// removed ones stop accepting at once and drain in the background. Must run inside the
-    /// tokio runtime. The cause of an error is logged.
+    /// Makes the live listeners exactly `specs`. Every certificate is read and every new socket
+    /// bound first; a failure changes nothing. Kept listeners get the new config in place (no
+    /// reconnect), removed ones stop accepting at once and drain in the background. Must run
+    /// inside the tokio runtime. The cause of an error is logged.
     pub fn apply(&self, specs: Vec<RouteSpec>) -> Result<(), String> {
         let mut inner = self.lock();
         if inner.closed {
@@ -94,15 +174,35 @@ impl RouteManager {
         if wanted.len() != specs.len() {
             return Err("duplicate listener in WAF bundle".into());
         }
-        // The listener limits and timeouts cannot change in place.
+        // The kind of a listener and its limits and timeouts cannot change in place.
         for spec in &specs {
-            if let Some(live) = inner.live.get(&spec.address)
-                && live.app.route().listener_limits() != spec.route.listener_limits()
-            {
-                return Err(
-                    "route listener limits or timeouts changed; agent restart required".into(),
-                );
+            let limits = spec.serves.limits().map_err(String::from)?;
+            if let Some(live) = inner.live.get(&spec.address) {
+                if !live.served.is_kind_of(&spec.serves) {
+                    return Err("listener kind changed; agent restart required".into());
+                }
+                if live.served.limits() != limits {
+                    return Err(
+                        "route listener limits or timeouts changed; agent restart required".into(),
+                    );
+                }
             }
+        }
+        // Certificates are read before anything binds or switches.
+        let mut prepared = HashMap::new();
+        for spec in &specs {
+            let Serves::Tls(sites) = &spec.serves else {
+                continue;
+            };
+            let store = match inner.live.get(&spec.address).map(|l| &l.served) {
+                Some(Served::Tls(listener)) => listener.store().clone(),
+                _ => Arc::new(CertStore::default()),
+            };
+            let table = prepare_certificates(&store, sites).map_err(|e| {
+                tracing::warn!("TLS listener {}: {e}", spec.address);
+                "invalid TLS site settings".to_string()
+            })?;
+            prepared.insert(spec.address.clone(), (store, table));
         }
         let mut fresh: HashMap<String, (StdListener, bool)> = HashMap::new();
         for spec in &specs {
@@ -132,14 +232,17 @@ impl RouteManager {
         let mut old_pools: Vec<_> = inner
             .live
             .values()
-            .filter_map(|l| l.app.route().fcgi().cloned())
+            .flat_map(|l| l.served.routes())
+            .filter_map(|r| r.fcgi().cloned())
             .collect();
         for spec in specs {
+            let certs = prepared.remove(&spec.address);
             match inner.live.get(&spec.address) {
-                Some(live) => live.app.set_route(spec.route),
+                Some(live) => self.update(&live.served, spec.serves, certs),
                 None => {
                     let (sock, _) = fresh.remove(&spec.address).expect("bound above");
-                    let live = self.start(sock, spec.route).map_err(|e| {
+                    let served = self.build(spec.serves, certs);
+                    let live = self.start(sock, served).map_err(|e| {
                         tracing::warn!("failed to start WAF route listener {}: {e}", spec.address);
                         "failed to bind WAF route listener".to_string()
                     })?;
@@ -161,7 +264,8 @@ impl RouteManager {
         let live_pools: Vec<_> = inner
             .live
             .values()
-            .filter_map(|l| l.app.route().fcgi().cloned())
+            .flat_map(|l| l.served.routes())
+            .filter_map(|r| r.fcgi().cloned())
             .collect();
         old_pools.retain(|p| !live_pools.iter().any(|l| Arc::ptr_eq(l, p)));
         old_pools.iter().for_each(|p| p.close());
@@ -173,15 +277,50 @@ impl RouteManager {
         Ok(())
     }
 
-    fn start(&self, sock: StdListener, route: Arc<Route>) -> io::Result<Live> {
+    /// The state of a new listener, holding `serves`; `certs` is what the apply read for an
+    /// HTTPS listener.
+    fn build(&self, serves: Serves, certs: Option<(Arc<CertStore>, CertTable)>) -> Served {
+        match (serves, certs) {
+            (Serves::App(route), _) => {
+                Served::App(Arc::new(RouteApp::new(route, self.shared.clone())))
+            }
+            (Serves::Tls(sites), Some((store, table))) => {
+                let listener = Arc::new(TlsListener::new(store, sites[0].0.listener_limits()));
+                listener.set_sites(sites, table, &self.shared);
+                Served::Tls(listener)
+            }
+            (Serves::Redirect(hosts), _) => Served::Redirect(Arc::new(RedirectTable::new(hosts))),
+            (Serves::Tls(_), None) => unreachable!("certificates read above"),
+        }
+    }
+
+    /// Puts `serves` into a live listener of the same kind.
+    fn update(&self, served: &Served, serves: Serves, certs: Option<(Arc<CertStore>, CertTable)>) {
+        match (served, serves, certs) {
+            (Served::App(app), Serves::App(route), _) => app.set_route(route),
+            (Served::Tls(listener), Serves::Tls(sites), Some((_, table))) => {
+                listener.set_sites(sites, table, &self.shared);
+            }
+            (Served::Redirect(table), Serves::Redirect(hosts), _) => table.set(hosts),
+            _ => unreachable!("kinds and certificates checked above"),
+        }
+    }
+
+    fn start(&self, sock: StdListener, served: Served) -> io::Result<Live> {
         let dup = sock.try_clone()?;
         sock.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(sock)?;
         let (stop, rx) = watch::channel(false);
-        let app = Arc::new(RouteApp::new(route, self.shared.clone()));
-        let done = tokio::spawn(accept_loop(listener, app.clone(), rx, self.drain));
+        if let Served::Tls(tls) = &served {
+            tokio::spawn(refresh_certificates(
+                tls.store().clone(),
+                rx.clone(),
+                self.cert_poll,
+            ));
+        }
+        let done = tokio::spawn(accept_loop(listener, served.clone(), rx, self.drain));
         Ok(Live {
-            app,
+            served,
             stop,
             sock: dup,
             done,
@@ -249,9 +388,30 @@ fn bind(addr: &str) -> io::Result<StdListener> {
     sock.listen(LISTEN_BACKLOG)?.into_std()
 }
 
+/// Reads a listener's certificate files again when they change, until the listener stops.
+async fn refresh_certificates(
+    store: Arc<CertStore>,
+    mut stop: watch::Receiver<bool>,
+    every: Duration,
+) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick is immediate and the files were read a moment ago.
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = async { let _ = stop.wait_for(|v| *v).await; } => return,
+            _ = tick.tick() => {}
+        }
+        let store = store.clone();
+        // Reading files must not stall a runtime thread.
+        let _ = tokio::task::spawn_blocking(move || store.refresh()).await;
+    }
+}
+
 async fn accept_loop(
     listener: tokio::net::TcpListener,
-    app: Arc<RouteApp>,
+    served: Served,
     stop: watch::Receiver<bool>,
     drain: Duration,
 ) {
@@ -266,16 +426,38 @@ async fn accept_loop(
             accepted = listener.accept() => match accepted {
                 Ok(mut stream) => {
                     let _ = stream.set_nodelay();
-                    // Past the connection limit the connection gets a 503 and closes.
+                    // Past the connection limit a plain connection gets a 503 and closes; an HTTPS
+                    // one closes before any handshake work.
                     let Ok(permit) = slots.clone().try_acquire_owned() else {
-                        conns.spawn(refuse(Box::new(stream)));
+                        if !matches!(served, Served::Tls(_)) {
+                            conns.spawn(refuse(Box::new(stream)));
+                        }
                         continue;
                     };
-                    let (app, shutdown) = (app.clone(), stop.clone());
-                    conns.spawn(async move {
-                        let _permit = permit;
-                        crate::route::serve_connection(app, Box::new(stream), shutdown).await;
-                    });
+                    let shutdown = stop.clone();
+                    match &served {
+                        Served::App(app) => {
+                            let app = app.clone();
+                            conns.spawn(async move {
+                                let _permit = permit;
+                                serve_connection(PlainSite(app), Box::new(stream), shutdown).await;
+                            });
+                        }
+                        Served::Tls(tls) => {
+                            let tls = tls.clone();
+                            conns.spawn(async move {
+                                let _permit = permit;
+                                serve_tls(tls, stream, shutdown).await;
+                            });
+                        }
+                        Served::Redirect(table) => {
+                            let table = table.clone();
+                            conns.spawn(async move {
+                                let _permit = permit;
+                                serve_redirect(table, Box::new(stream), shutdown).await;
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
                     if *stop.borrow() {

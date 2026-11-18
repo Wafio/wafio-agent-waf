@@ -16,10 +16,13 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod body_reader;
+pub mod cert_store;
+pub mod client_hello;
 pub mod config;
 pub mod decision;
 pub mod fastcgi;
 pub mod head_parser;
+pub(crate) mod https;
 pub mod listeners;
 pub(crate) mod maintenance;
 pub mod metrics;
@@ -36,7 +39,7 @@ pub mod upgrade;
 pub mod upstream;
 pub mod websocket;
 
-pub use config::{AppAnalysisSetup, AppSpec};
+pub use config::{AppAnalysisSetup, AppSpec, TlsSite};
 pub use decision::{DecisionEvent, DecisionSink};
 pub use proxy::{Proxy, ProxyOptions};
 pub use siem::{SiemEvent, SiemEventSender};
