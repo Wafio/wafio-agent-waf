@@ -1,6 +1,7 @@
-//! An app in maintenance mode answers 503 itself, before any other step: every method, a WebSocket
-//! handshake, monitor mode, blocked clients included. Nothing reaches the upstream and no decision is
-//! recorded. Allowed IPs and paths go through the whole normal pipeline.
+//! An app in maintenance mode answers 503 itself, from the request head and before any other step:
+//! every method, a WebSocket handshake, monitor mode, blocked clients included. The body is not read,
+//! nothing reaches the upstream and no decision is recorded. Allowed IPs and paths go through the whole
+//! normal pipeline. The answer carries the CORS headers a browser app needs to read it.
 
 mod common;
 
@@ -8,7 +9,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
 use common::*;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use wafio_proxy::metrics::MAINTENANCE_RESPONSES;
 
 fn on(extra: &str) -> Vec<u8> {
@@ -260,23 +262,415 @@ async fn ipv6_clients_and_the_edges_of_a_range_are_matched() {
 }
 
 #[tokio::test]
-async fn the_connection_stays_open_after_a_maintenance_answer() {
+async fn the_connection_stays_open_after_a_maintenance_answer_when_no_body_follows() {
     let (_h, addr, up) = serve(on(r#","allow_paths":["/ok"]"#)).await;
     let mut c = Client::connect(addr).await.unwrap();
+    assert_eq!(c.send(&get("/shop")).await.unwrap().status, 503);
     let posted = c
-        .send(&post("/upload", "text/plain", b"read and dropped"))
+        .send(b"POST /empty HTTP/1.1\r\nHost: app.test\r\nContent-Length: 0\r\n\r\n")
         .await
         .unwrap();
     assert_eq!((posted.status, posted.header("connection")), (503, None));
     assert_eq!(c.send(&get("/shop")).await.unwrap().status, 503);
     assert_eq!(c.send(&get("/ok")).await.unwrap().status, 200);
     assert_eq!(up.count(), 1);
-    let seen = up.last();
-    assert!(seen.line.starts_with("GET /ok "), "{}", seen.line);
-    assert!(
-        seen.body.is_empty(),
-        "the POST body never reached the upstream"
+    assert!(up.last().line.starts_with("GET /ok "), "{}", up.last().line);
+}
+
+/// The body of a refused request is neither read nor drained for long, so its connection ends
+/// with the answer.
+#[tokio::test]
+async fn a_post_with_a_body_gets_connection_close_and_the_body_never_reaches_the_upstream() {
+    let (_h, addr, up) = serve(on(r#","allow_paths":["/ok"]"#)).await;
+    let mut c = Client::connect(addr).await.unwrap();
+    let posted = c
+        .send(&post("/upload", "text/plain", b"read and dropped"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (posted.status, posted.header("connection")),
+        (503, Some("close"))
     );
+    assert!(
+        at_eof(&mut c.0).await,
+        "the connection ends with the answer"
+    );
+    assert_eq!(up.count(), 0);
+}
+
+#[tokio::test]
+async fn a_huge_upload_gets_503_from_the_head_alone_not_413() {
+    let up = http_upstream().await;
+    let mut a = app("m", free_port(), &format!("http://{}", up.addr));
+    a.proxy_config = br#"{"max_body_bytes":1024}"#.to_vec();
+    a.maintenance = on("");
+    let (_h, addr) = Harness::serve(vec![a]);
+
+    // Only the head is sent: the answer cannot have waited for 100 MiB.
+    let mut c = Client::connect(addr).await.unwrap();
+    let reply = c
+        .send(b"POST /upload HTTP/1.1\r\nHost: app.test\r\nContent-Length: 104857600\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        (reply.status, reply.header("connection")),
+        (503, Some("close"))
+    );
+    assert!(at_eof(&mut c.0).await);
+
+    // A body over the limit that does arrive is still answered 503 and never forwarded.
+    let mut c = Client::connect(addr).await.unwrap();
+    let mut raw =
+        b"POST /upload HTTP/1.1\r\nHost: app.test\r\nContent-Length: 65536\r\n\r\n".to_vec();
+    raw.extend(std::iter::repeat_n(b'x', 65536));
+    let reply = c.send(&raw).await.unwrap();
+    assert_eq!(
+        (reply.status, reply.header("connection")),
+        (503, Some("close"))
+    );
+    assert_eq!(up.count(), 0);
+}
+
+#[tokio::test]
+async fn expect_100_continue_gets_the_final_503_without_a_100() {
+    let (_h, addr, up) = serve(on("")).await;
+    for length in ["10", "0"] {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(
+            format!("POST /upload HTTP/1.1\r\nHost: app.test\r\nExpect: 100-continue\r\nContent-Length: {length}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut first = [0u8; 12];
+        tokio::time::timeout(std::time::Duration::from_secs(2), s.read_exact(&mut first))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert_eq!(&first, b"HTTP/1.1 503", "Content-Length: {length}");
+        let mut rest = Vec::new();
+        s.read_to_end(&mut rest).await.unwrap();
+        let rest = String::from_utf8_lossy(&rest);
+        assert!(!rest.contains("100 Continue"), "{rest}");
+        assert!(rest.contains("Connection: close\r\n"), "{rest}");
+    }
+    assert_eq!(up.accepts(), 0);
+}
+
+#[tokio::test]
+async fn a_chunked_upload_gets_503_and_the_connection_closes() {
+    let (_h, addr, up) = serve(on("")).await;
+    let mut c = Client::connect(addr).await.unwrap();
+    let reply = c
+        .send(b"POST /upload HTTP/1.1\r\nHost: app.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        (reply.status, reply.header("connection")),
+        (503, Some("close"))
+    );
+    assert!(at_eof(&mut c.0).await);
+    // The head alone is enough: no chunk is sent at all.
+    let mut c = Client::connect(addr).await.unwrap();
+    let reply = c
+        .send(b"POST /upload HTTP/1.1\r\nHost: app.test\r\nTransfer-Encoding: chunked\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        (reply.status, reply.header("connection")),
+        (503, Some("close"))
+    );
+    settle().await;
+    assert_eq!((up.count(), up.accepts()), (0, 0));
+}
+
+#[tokio::test]
+async fn pipelined_requests_without_a_body_are_all_answered() {
+    let (_h, addr, _up) = serve(on("")).await;
+    let mut c = Client::connect(addr).await.unwrap();
+    let mut raw = get("/a");
+    raw.extend(get("/b"));
+    c.0.get_mut().write_all(&raw).await.unwrap();
+    for _ in 0..2 {
+        let reply = read_reply(&mut c.0).await.unwrap();
+        assert_eq!((reply.status, reply.header("connection")), (503, None));
+    }
+    assert_eq!(c.send(&get("/c")).await.unwrap().status, 503);
+}
+
+#[tokio::test]
+async fn what_is_pipelined_behind_a_body_is_dropped() {
+    let (_h, addr, up) = serve(on("")).await;
+    let mut c = Client::connect(addr).await.unwrap();
+    let mut raw = post("/upload", "text/plain", b"body");
+    raw.extend(get("/after"));
+    c.0.get_mut().write_all(&raw).await.unwrap();
+    let reply = read_reply(&mut c.0).await.unwrap();
+    assert_eq!(
+        (reply.status, reply.header("connection")),
+        (503, Some("close"))
+    );
+    assert!(at_eof(&mut c.0).await, "no second answer");
+    assert_eq!(up.count(), 0);
+}
+
+#[tokio::test]
+async fn an_allowed_ip_posts_through_with_its_body_intact() {
+    let up = http_upstream().await;
+    let mut a = app("m", free_port(), &format!("http://{}", up.addr));
+    a.maintenance = on(r#","allow_ips":["127.0.0.1"]"#);
+    let (_h, addr) = Harness::serve(vec![a]);
+    let body = vec![b'z'; 100_000];
+    let reply = one(addr, &post("/upload", "application/octet-stream", &body)).await;
+    assert_eq!((reply.status, reply.header("connection")), (200, None));
+    assert_eq!(up.last().body, body);
+}
+
+#[tokio::test]
+async fn an_allowed_path_posts_through_with_its_body_intact() {
+    let (_h, addr, up) = serve(on(r#","allow_paths":["/hook"]"#)).await;
+    let reply = one(
+        addr,
+        &post("/hook/stripe", "application/json", br#"{"a":1}"#),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(up.last().body, br#"{"a":1}"#);
+    assert_eq!(
+        one(addr, &post("/other", "application/json", b"{}"))
+            .await
+            .status,
+        503
+    );
+    assert_eq!(up.count(), 1);
+}
+
+fn with_origin(method: &str, origin: &str, extra: &str) -> Vec<u8> {
+    format!("{method} /api HTTP/1.1\r\nHost: app.test\r\nOrigin: {origin}\r\n{extra}\r\n")
+        .into_bytes()
+}
+
+#[tokio::test]
+async fn a_browser_app_on_another_origin_can_read_the_answer() {
+    let (_h, addr, up) = serve(on(
+        r#","message":"Back soon","end_time":"2099-12-31T23:59:59Z""#,
+    ))
+    .await;
+    for raw in [
+        with_origin("GET", "https://shop.example", "Accept: application/json\r\n"),
+        b"POST /api HTTP/1.1\r\nHost: app.test\r\nOrigin: https://shop.example\r\nAccept: application/json\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi".to_vec(),
+    ] {
+        let reply = one(addr, &raw).await;
+        assert_eq!(reply.status, 503);
+        assert_eq!(
+            reply.header("access-control-allow-origin"),
+            Some("https://shop.example")
+        );
+        assert_eq!(reply.header("access-control-allow-credentials"), Some("true"));
+        assert_eq!(reply.header("access-control-expose-headers"), Some("Retry-After"));
+        assert_eq!(reply.header("vary"), Some("Origin"));
+        assert!(reply.header("retry-after").is_some());
+        assert!(reply.text().contains(r#""message": "Back soon""#), "{}", reply.text());
+        assert_eq!(reply.header("set-cookie"), None);
+    }
+    // `null` is what a sandboxed frame or a local file sends.
+    let reply = one(addr, &with_origin("GET", "null", "")).await;
+    assert_eq!(reply.header("access-control-allow-origin"), Some("null"));
+    assert_eq!(up.count(), 0);
+}
+
+#[tokio::test]
+async fn a_request_without_an_origin_gets_only_vary() {
+    let (_h, addr, _up) = serve(on("")).await;
+    let reply = one(addr, &get("/")).await;
+    assert_eq!(reply.header("vary"), Some("Origin"));
+    for name in [
+        "access-control-allow-origin",
+        "access-control-allow-credentials",
+        "access-control-expose-headers",
+    ] {
+        assert_eq!(reply.header(name), None, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_preflight_is_answered_with_204_and_never_reaches_the_upstream() {
+    let (_h, addr, up) = serve(on("")).await;
+    let before = MAINTENANCE_RESPONSES.load(Ordering::SeqCst);
+    let reply = one(
+        addr,
+        &with_origin(
+            "OPTIONS",
+            "https://shop.example",
+            "Access-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: content-type,x-token\r\n",
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, 204);
+    assert!(reply.body.is_empty());
+    for (name, want) in [
+        ("access-control-allow-origin", "https://shop.example"),
+        ("access-control-allow-methods", "PUT"),
+        ("access-control-allow-headers", "content-type,x-token"),
+        ("access-control-max-age", "0"),
+        (
+            "vary",
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        ),
+        ("cache-control", "no-store"),
+        ("x-content-type-options", "nosniff"),
+    ] {
+        assert_eq!(reply.header(name), Some(want), "{name}");
+    }
+    assert_eq!(reply.header("access-control-allow-credentials"), None);
+    assert_eq!(reply.header("content-length"), None);
+    assert!(
+        MAINTENANCE_RESPONSES.load(Ordering::SeqCst) > before,
+        "counted"
+    );
+    // No requested headers: none allowed.
+    let plain = one(
+        addr,
+        &with_origin("OPTIONS", "null", "Access-Control-Request-Method: GET\r\n"),
+    )
+    .await;
+    assert_eq!(plain.status, 204);
+    assert_eq!(plain.header("access-control-allow-headers"), None);
+    settle().await;
+    assert_eq!((up.count(), up.accepts()), (0, 0));
+}
+
+#[tokio::test]
+async fn the_preflight_keeps_the_connection_open_and_drops_one_with_a_body() {
+    let (_h, addr, _up) = serve(on("")).await;
+    let mut c = Client::connect(addr).await.unwrap();
+    let preflight = with_origin(
+        "OPTIONS",
+        "https://a.example",
+        "Access-Control-Request-Method: GET\r\n",
+    );
+    assert_eq!(c.send(&preflight).await.unwrap().status, 204);
+    assert_eq!(c.send(&preflight).await.unwrap().status, 204);
+    assert_eq!(c.send(&get("/")).await.unwrap().status, 503);
+}
+
+#[tokio::test]
+async fn a_bad_origin_or_preflight_gets_no_cors_approval() {
+    let (_h, addr, up) = serve(on("")).await;
+    let long = format!("https://{}.example", "a".repeat(260));
+    for origin in [
+        "https://a.example/path",
+        "https://a.example,https://b.example",
+        "https://a.example?x",
+        "https://user@a.example",
+        "https://",
+        "ftp",
+        "javascript:alert(1)",
+        "1https://a.example",
+        long.as_str(),
+    ] {
+        let reply = one(addr, &with_origin("GET", origin, "")).await;
+        assert_eq!(reply.status, 503, "{origin}");
+        assert_eq!(
+            reply.header("access-control-allow-origin"),
+            None,
+            "{origin}"
+        );
+        assert_eq!(reply.header("vary"), Some("Origin"), "{origin}");
+        // A preflight with it is the ordinary 503.
+        let pre = one(
+            addr,
+            &with_origin("OPTIONS", origin, "Access-Control-Request-Method: GET\r\n"),
+        )
+        .await;
+        assert_eq!(pre.status, 503, "{origin}");
+        assert_eq!(pre.header("access-control-allow-methods"), None, "{origin}");
+    }
+    // Two Origin lines are not believed.
+    let twice = b"GET / HTTP/1.1\r\nHost: app.test\r\nOrigin: https://a.example\r\nOrigin: https://b.example\r\n\r\n";
+    assert_eq!(
+        one(addr, twice).await.header("access-control-allow-origin"),
+        None
+    );
+    // A method that is not a token, a list that is not tokens and commas.
+    let long_method = "A".repeat(33);
+    for (method, headers, status) in [
+        ("GE T", "", 503),
+        (long_method.as_str(), "", 503),
+        ("GET", "x-a b", 204),
+        ("GET", "x-a;q", 204),
+    ] {
+        let reply = one(
+            addr,
+            &with_origin(
+                "OPTIONS",
+                "https://a.example",
+                &format!("Access-Control-Request-Method: {method}\r\nAccess-Control-Request-Headers: {headers}\r\n"),
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, status, "{method} / {headers}");
+        assert_eq!(
+            reply.header("access-control-allow-headers"),
+            None,
+            "{method} / {headers}"
+        );
+    }
+    assert_eq!(up.count(), 0);
+}
+
+#[tokio::test]
+async fn a_preflight_from_an_allowed_client_reaches_the_upstream_unchanged() {
+    let up = http_upstream().await;
+    let mut a = app("m", free_port(), &format!("http://{}", up.addr));
+    a.maintenance = on(r#","allow_ips":["127.0.0.1"]"#);
+    let (_h, addr) = Harness::serve(vec![a]);
+    let reply = one(
+        addr,
+        &with_origin(
+            "OPTIONS",
+            "https://a.example",
+            "Access-Control-Request-Method: PUT\r\n",
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "the upstream's answer");
+    assert_eq!(reply.header("x-up"), Some("1"));
+    for name in [
+        "access-control-allow-origin",
+        "access-control-allow-methods",
+        "vary",
+    ] {
+        assert_eq!(reply.header(name), None, "{name}");
+    }
+    assert_eq!(up.count(), 1);
+    assert_eq!(
+        up.last().header("access-control-request-method"),
+        Some("PUT")
+    );
+}
+
+#[tokio::test]
+async fn an_app_that_is_not_in_maintenance_proxies_a_preflight_as_before() {
+    let up = http_upstream().await;
+    for maintenance in [&b""[..], br#"{"enabled":false}"#] {
+        let mut a = app("m", free_port(), &format!("http://{}", up.addr));
+        a.maintenance = maintenance.to_vec();
+        let (_h, addr) = Harness::serve(vec![a]);
+        let reply = one(
+            addr,
+            &with_origin(
+                "OPTIONS",
+                "https://a.example",
+                "Access-Control-Request-Method: PUT\r\n",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.header("access-control-allow-origin"), None);
+        assert_eq!(reply.header("vary"), None);
+    }
+    assert_eq!(up.count(), 2);
 }
 
 #[tokio::test]

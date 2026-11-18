@@ -20,9 +20,10 @@ use wafio_agent_pages::challenge::ChallengeSettings;
 use wafio_application::AnalyzeConfig;
 use wafio_domain::text_helpers::quote;
 use wafio_domain::{
-    MaintenanceSettings, ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config,
-    timeout_or_default_ms,
+    ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config, timeout_or_default_ms,
 };
+
+use crate::maintenance::MaintenanceRoute;
 
 /// What one app's requests are analysed with. Immutable once applied; a bundle replaces it as
 /// a whole.
@@ -103,8 +104,8 @@ pub struct Route {
     pub(crate) mode: String,
     pub(crate) proxy_config: ProxyConfig,
     pub(crate) ws: WsAppPolicy,
-    /// `Some` while maintenance mode is on for the app.
-    pub(crate) maintenance: Option<MaintenanceSettings>,
+    /// `Some` while maintenance mode is on for the app, with its pages built.
+    pub(crate) maintenance: Option<MaintenanceRoute>,
     pub(crate) analysis: Arc<AppAnalysisSetup>,
     pub(crate) target: Target,
     /// `timeouts.upstream_ms` resolved (default 30 s); ignored when `upstream_unlimited`.
@@ -282,7 +283,7 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
         }),
         proxy_config: pxy,
         ws,
-        maintenance: parse_maintenance(&app.maintenance),
+        maintenance: parse_maintenance(&app.maintenance).map(MaintenanceRoute::new),
         analysis: app.analysis.clone(),
         target,
         upstream_timeout: upstream_to,

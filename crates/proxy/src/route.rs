@@ -1,23 +1,26 @@
 //! One app listener's connection handler: the request read on the raw stream (read buffer size
 //! and read timeout, the head parsed by `head_parser`, the body framed and read by `body_reader`),
-//! the whole body read before anything is decided, then the pipeline. Nothing of Pingora's
-//! HTTP/1 session is used: the stream is read and written here. The route is swapped in place on
-//! a bundle apply; a running request keeps the route it loaded.
+//! the maintenance gate at the head, the whole body read before anything else is decided, then
+//! the pipeline. Nothing of Pingora's HTTP/1 session is used: the stream is read and written
+//! here. The route is swapped in place on a bundle apply; a running request keeps the route it
+//! loaded, and a WebSocket session or event stream follows later swaps through a subscription.
 
 use std::future::Future;
 use std::net::IpAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, BytesMut};
 use pingora::protocols::Stream;
 use pingora::server::ShutdownWatch;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::body_reader::{self, BodyState};
 use crate::config::Route;
 use crate::head_parser::{self, HeadError};
+use crate::maintenance::{self, Watch};
 use crate::pipeline::{self, Done};
 use crate::proxy::Shared;
 use crate::request::InboundRequest;
@@ -25,7 +28,7 @@ use crate::response::OutboundResponse;
 use crate::upstream::ms;
 
 pub struct RouteApp {
-    route: RwLock<Arc<Route>>,
+    route: watch::Sender<Arc<Route>>,
     shared: Arc<Shared>,
 }
 
@@ -57,17 +60,22 @@ fn only_crlf(b: &[u8]) -> bool {
 impl RouteApp {
     pub(crate) fn new(route: Arc<Route>, shared: Arc<Shared>) -> Self {
         RouteApp {
-            route: RwLock::new(route),
+            route: watch::Sender::new(route),
             shared,
         }
     }
 
     pub fn route(&self) -> Arc<Route> {
-        self.route.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.route.borrow().clone()
     }
 
     pub(crate) fn set_route(&self, route: Arc<Route>) {
-        *self.route.write().unwrap_or_else(|e| e.into_inner()) = route;
+        self.route.send_replace(route);
+    }
+
+    /// Follows the swaps of this app's route, and no other app's.
+    fn subscribe(&self) -> watch::Receiver<Arc<Route>> {
+        self.route.subscribe()
     }
 
     /// One request whose head `read_head` parsed: `buf` holds the head and whatever followed it.
@@ -90,6 +98,10 @@ impl RouteApp {
             reject(stream, malformed_request_response(), write_ms).await;
             return None;
         };
+        // An app in maintenance mode answers from the head: no `100 Continue`, no body read.
+        if let Some(r) = maintenance::gate(&route, &head, peer_ip) {
+            return write_answer(stream, buf, &head, r, head.len, write_ms, shutdown).await;
+        }
         // `Expect: 100-continue` (the exact value) is answered before the body is read.
         if head.expect_continue {
             let send = async {
@@ -151,7 +163,10 @@ impl RouteApp {
             Ok(Done::Respond(r)) => r,
             Ok(Done::Stream(s)) => {
                 let close = head.connection_close || *shutdown.borrow();
-                return relay(&self.shared, stream, buf, &head, *s, close, write_ms)
+                // An event stream has no end of its own: it stops when maintenance turns on.
+                let watch = maintenance::is_event_stream(s.head.content_type())
+                    .then(|| Watch::for_request(self.subscribe(), &route, &head, peer_ip));
+                return relay(&self.shared, stream, buf, &head, *s, close, write_ms, watch)
                     .await
                     .map(|(stream, rest)| (stream, shrink_idle_buffer(rest, consumed)));
             }
@@ -163,6 +178,8 @@ impl RouteApp {
                     plan,
                     stream,
                     buf.to_vec(),
+                    self.subscribe(),
+                    shutdown.clone(),
                 ));
                 let _guard = AbortOnDrop(task.abort_handle());
                 if let Err(e) = task.await
@@ -174,27 +191,40 @@ impl RouteApp {
                 return None;
             }
         };
-        // The connection ends with this answer when the response says so (`Connection: close`,
-        // an upstream HTTP/1.0 answer, a close-delimited body) or the request / the draining
-        // server does.
-        let close = r.close || head.connection_close || *shutdown.borrow();
-        let no_body = head.method == b"HEAD"
-            || (100..200).contains(&r.status)
-            || r.status == 204
-            || r.status == 304;
-        let wire = r.wire(head.http10, no_body, close, now_unix());
-        if close {
-            finish_close(stream, wire, write_ms).await;
-            return None;
-        }
-        let send = async {
-            stream.write_all(&wire).await?;
-            stream.flush().await
-        };
-        match run_until_deadline(ms(write_ms).map(|d| Instant::now() + d), send).await {
-            Ok(Ok(())) => Some((stream, shrink_idle_buffer(buf, consumed))),
-            _ => None,
-        }
+        write_answer(stream, buf, &head, r, consumed, write_ms, shutdown).await
+    }
+}
+
+/// Writes the answer. The connection ends with it when the response says so (`Connection:
+/// close`, an upstream HTTP/1.0 answer, a close-delimited body) or the request / the draining
+/// server does; else it stays open for the next request. `consumed` is what the request took
+/// off the front of `buf`.
+async fn write_answer(
+    mut stream: Stream,
+    buf: BytesMut,
+    head: &head_parser::Head,
+    r: OutboundResponse,
+    consumed: usize,
+    write_ms: i64,
+    shutdown: &ShutdownWatch,
+) -> Option<(Stream, BytesMut)> {
+    let close = r.close || head.connection_close || *shutdown.borrow();
+    let no_body = head.method == b"HEAD"
+        || (100..200).contains(&r.status)
+        || r.status == 204
+        || r.status == 304;
+    let wire = r.wire(head.http10, no_body, close, now_unix());
+    if close {
+        finish_close(stream, wire, write_ms).await;
+        return None;
+    }
+    let send = async {
+        stream.write_all(&wire).await?;
+        stream.flush().await
+    };
+    match run_until_deadline(ms(write_ms).map(|d| Instant::now() + d), send).await {
+        Ok(Ok(())) => Some((stream, shrink_idle_buffer(buf, consumed))),
+        _ => None,
     }
 }
 
@@ -216,7 +246,10 @@ async fn send(stream: &mut Stream, parts: &[&[u8]], write_ms: i64) -> bool {
 /// upstream sends, flushed as it comes, chunked for an HTTP/1.1 client and delimited by the
 /// connection's close otherwise. `closing`: the request or the draining server ends the
 /// connection with this answer. A failure on either side drops the connection with no closing
-/// chunk, which is how the client learns the body is cut.
+/// chunk, which is how the client learns the body is cut. `watch`: an event stream, which ends
+/// with the closing chunk and the connection when maintenance turns on for its client; the
+/// upstream connection is dropped, not pooled.
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     shared: &Shared,
     mut stream: Stream,
@@ -225,6 +258,7 @@ async fn relay(
     mut up: crate::upstream::Streamed,
     closing: bool,
     write_ms: i64,
+    mut watch: Option<Watch>,
 ) -> Option<(Stream, BytesMut)> {
     let chunked = up.head.upstream_chunked() && !req.http10;
     up.head.chunked = chunked;
@@ -234,7 +268,21 @@ async fn relay(
         return None;
     }
     loop {
-        match up.next().await {
+        let next = match watch.as_mut() {
+            Some(w) => tokio::select! {
+                biased;
+                () = w.maintenance_on() => {
+                    if chunked {
+                        send(&mut stream, &[b"0\r\n\r\n"], write_ms).await;
+                    }
+                    finish_close(stream, Vec::new(), write_ms).await;
+                    return None;
+                }
+                next = up.next() => next,
+            },
+            None => up.next().await,
+        };
+        match next {
             Ok(Some(piece)) if piece.is_empty() => {}
             Ok(Some(piece)) => {
                 let size = format!("{:x}\r\n", piece.len());

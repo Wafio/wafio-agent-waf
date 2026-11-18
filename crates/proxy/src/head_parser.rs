@@ -67,7 +67,7 @@ fn take_line(b: &[u8]) -> Result<(&[u8], &[u8]), HeadError> {
 }
 
 /// RFC 9110 tchar (valid in header names and methods).
-fn tchar(c: u8) -> bool {
+pub(crate) fn tchar(c: u8) -> bool {
     c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
 }
 

@@ -18,6 +18,7 @@ use tokio::time::Instant;
 
 /// Close codes used by the relay.
 pub const WS_CLOSE_NORMAL_CLOSURE: u16 = 1000;
+pub const WS_CLOSE_GOING_AWAY: u16 = 1001;
 pub const WS_CLOSE_PROTOCOL_ERROR: u16 = 1002;
 pub const WS_CLOSE_NO_STATUS_RECEIVED: u16 = 1005;
 pub const WS_CLOSE_ABNORMAL_CLOSURE: u16 = 1006;
