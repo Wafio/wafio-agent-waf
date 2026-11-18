@@ -238,6 +238,69 @@ async fn the_client_ip_after_trusted_proxy_handling_is_the_one_matched() {
 }
 
 #[tokio::test]
+async fn ipv6_clients_and_the_edges_of_a_range_are_matched() {
+    let up = http_upstream().await;
+    let mut a = app("m", free_port(), &format!("http://{}", up.addr));
+    a.proxy_config = br#"{"trust_forwarded":true,"trusted_proxies":["127.0.0.1"]}"#.to_vec();
+    a.maintenance = on(r#","allow_ips":["2001:db8::/32","203.0.113.8/30"]"#);
+    let (_h, addr) = Harness::serve(vec![a]);
+    for (client, status) in [
+        ("2001:db8::5", 200),
+        ("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff", 200),
+        ("2001:db9::5", 503),
+        ("203.0.113.8", 200),
+        ("203.0.113.11", 200),
+        ("203.0.113.7", 503),
+        ("203.0.113.12", 503),
+    ] {
+        let raw = format!("GET / HTTP/1.1\r\nHost: app.test\r\nX-Forwarded-For: {client}\r\n\r\n");
+        assert_eq!(one(addr, raw.as_bytes()).await.status, status, "{client}");
+    }
+    assert_eq!(up.count(), 4);
+}
+
+#[tokio::test]
+async fn the_connection_stays_open_after_a_maintenance_answer() {
+    let (_h, addr, up) = serve(on(r#","allow_paths":["/ok"]"#)).await;
+    let mut c = Client::connect(addr).await.unwrap();
+    let posted = c
+        .send(&post("/upload", "text/plain", b"read and dropped"))
+        .await
+        .unwrap();
+    assert_eq!((posted.status, posted.header("connection")), (503, None));
+    assert_eq!(c.send(&get("/shop")).await.unwrap().status, 503);
+    assert_eq!(c.send(&get("/ok")).await.unwrap().status, 200);
+    assert_eq!(up.count(), 1);
+    let seen = up.last();
+    assert!(seen.line.starts_with("GET /ok "), "{}", seen.line);
+    assert!(
+        seen.body.is_empty(),
+        "the POST body never reached the upstream"
+    );
+}
+
+#[tokio::test]
+async fn a_fastcgi_app_answers_without_contacting_the_responder() {
+    let responder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fcgi = responder.local_addr().unwrap();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        while responder.accept().await.is_ok() {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let mut a = app("php", free_port(), &format!("fcgi://{fcgi}"));
+    a.fcgi_doc_root = "/srv".into();
+    a.maintenance = on("");
+    let (h, addr) = Harness::serve(vec![a]);
+    assert_eq!(one(addr, &get("/index.php")).await.status, 503);
+    settle().await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+    assert!(h.events().is_empty());
+}
+
+#[tokio::test]
 async fn a_forwarded_address_from_an_untrusted_peer_is_not_believed() {
     let (_h, addr, up) = serve(on(r#","allow_ips":["203.0.113.9"]"#)).await;
     let spoofed = b"GET / HTTP/1.1\r\nHost: app.test\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n";
