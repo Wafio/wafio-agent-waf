@@ -30,19 +30,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          path: wafio-agent-waf
           persist-credentials: false
+      # The script interpreter is a path dependency: ../uddin-lang-rs. checkout cannot write outside the workspace,
+      # so it is checked out inside and moved next to it.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Wafio/uddin-lang-rs
           path: uddin-lang-rs
           persist-credentials: false
+      - run: mv uddin-lang-rs ../uddin-lang-rs
       - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
           build-mode: none
-          source-root: wafio-agent-waf
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:${{ matrix.language }}
-          checkout_path: ${{ github.workspace }}/wafio-agent-waf
