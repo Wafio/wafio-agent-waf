@@ -170,6 +170,8 @@ unknown body to keep the connection would buy nothing during maintenance.
   HTML page can be replaced (`custom_html`). `{{WAFIO_MESSAGE}}` is the message, or a default text, escaped for the format.
   `{{WAFIO_END_TIME}}` is the expected end as `YYYY-MM-DDTHH:MM:SSZ` while it lies ahead, else empty. The bodies are built once when
   the bundle is applied (HTML, JSON and XML, each with the end time shown and hidden), so a request only picks one and copies it.
+  Each `{{WAFIO_MESSAGE}}` in a custom page becomes the escaped message (up to 2,500 bytes for 500 characters), so a 64 KiB page that
+  repeats it thousands of times makes a body of up to about 10 MB, held twice while an end time is set and copied for every answer.
 - While the end time lies ahead the answer carries `Retry-After`, counted per request from the clock. A past end time counts as no end
   time. The agent never ends maintenance by itself: the control plane has to send a bundle without the object.
 - Every answer carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Vary: Origin`.
@@ -181,18 +183,23 @@ Turning maintenance on, or changing `allow_ips` or `allow_paths`, ends what is a
 connections.
 
 - A WebSocket session gets a close frame with code 1001 and the reason `Maintenance` on both sides, then both connections are cut
-  without waiting for the peers' replies. A session of an allowed client or path keeps running, until a change of the lists takes
-  that permission away.
+  without waiting for the peers' replies. A close frame that cannot be written within two seconds, or that would follow a message
+  the relay was still writing to that side, is left out, and that side sees only the connection close. A session of an allowed
+  client or path keeps running, until a change of the lists takes that permission away.
 - A streamed response with `Content-Type: text/event-stream` ends the same way for a client that is not allowed: the closing chunk
   `0\r\n\r\n` when the response is chunked, then the connection closes, and the upstream connection is dropped, not reused. An
   event stream is open-ended, like a session, and would keep the backend busy through the whole maintenance window.
 - Every other streamed body (a chunked download, an export, a streamed API answer) finishes. It is a request that started before
   maintenance; cutting it hands the visitor a broken file, and the upstream timeout already ends a stalled one. Answers with a
-  `Content-Length` are read whole before they are sent and are not affected.
+  `Content-Length` are read whole before they are sent and are not affected. A request that is still waiting for its answer (a long
+  poll, for example) gets it, within the app's upstream timeout.
 - When the listener stops, which a reload (SIGUSR2) and a shutdown do and removing the app from the bundle does, every open WebSocket
   session gets close 1001 with the reason `Going away`. After a reload the old process never learns of a later bundle, so it closes
   its sessions at once; clients reconnect to the successor, which holds the current bundle and answers the handshake with 503 while
-  maintenance is on. Without this the 30 second drain would have cut them with no close frame.
+  maintenance is on. Without this the 30 second drain would have cut them with no close frame. Event streams are not ended when the
+  listener stops: after a reload the old process keeps them until they end or the drain cuts them, and maintenance turned on in
+  that window does not reach them, since the old process receives no bundle after the handover. Ending every event stream at every
+  reload would cut streamed answers (an API that answers with `text/event-stream`) that finish within the drain.
 
 ### Browser apps on another origin
 
@@ -209,7 +216,9 @@ requests that bypass maintenance and apps that are not in maintenance are untouc
   `Access-Control-Allow-Credentials`, and it is counted like any other maintenance answer. The agent cannot link a preflight to the
   request after it, and maintenance may end in between: an approval that allowed credentials, or stayed in the browser's cache, would let
   a page on another site send a credentialed request that needs a preflight into the upstream. The remaining limit: such a request still
-  fails in the browser during maintenance. No `Access-Control-Allow-Private-Network` is sent.
+  fails in the browser during maintenance. Without credentials the approval can still let one request through to the upstream when
+  maintenance ends between the preflight and that request. It carries no cookie and no HTTP authentication, so it can do nothing a
+  direct request from anywhere could not, except come from the visitor's address. No `Access-Control-Allow-Private-Network` is sent.
 
 The agent ignores keys it does not know, drops an entry it cannot read (an end time that is not exactly `YYYY-MM-DDTHH:MM:SSZ`,
 an address that is not an IP or CIDR range, a path that does not start with `/`) with one log line each, and never fails the app over

@@ -12,7 +12,9 @@
 //! that allowed credentials (or stayed in the browser's cache) would let a page on another site
 //! send a credentialed, non-simple request to the upstream. The limit that follows: a request
 //! with credentials that needs a preflight still fails in the browser during maintenance.
-//! No `Access-Control-Allow-Private-Network` is sent.
+//! Without credentials an approval can still let one request through when maintenance ends in
+//! between; it carries no cookie and no HTTP authentication, so it is a request anyone could
+//! send, only from the visitor's address. No `Access-Control-Allow-Private-Network` is sent.
 
 use std::net::IpAddr;
 use std::sync::Arc;
