@@ -28,13 +28,18 @@ impl MaintenanceSettings {
     /// Whether `path` (decoded, dot segments resolved) is let through: it equals an entry, lies
     /// below an entry (`/a` covers `/a/b`), or starts with an entry that ends in `/`. Case-sensitive.
     pub fn allows_path(&self, path: &[u8]) -> bool {
-        self.allow_paths.iter().any(|entry| {
-            path == entry.as_slice()
-                || path
-                    .strip_prefix(entry.as_slice())
-                    .is_some_and(|rest| entry.last() == Some(&b'/') || rest.first() == Some(&b'/'))
-        })
+        path_matches(&self.allow_paths, path)
     }
+}
+
+/// Whether `path` equals one of `entries`, lies below one, or starts with one that ends in `/`.
+pub fn path_matches(entries: &[Vec<u8>], path: &[u8]) -> bool {
+    entries.iter().any(|entry| {
+        path == entry.as_slice()
+            || path
+                .strip_prefix(entry.as_slice())
+                .is_some_and(|rest| entry.last() == Some(&b'/') || rest.first() == Some(&b'/'))
+    })
 }
 
 /// Reads the `maintenance` object of a bundle app. `None` for an empty value, `null`, an object
@@ -187,6 +192,97 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Collects the text of every tracing event.
+    struct Collect(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Collect {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(&mut self, _: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{v:?} "));
+                }
+            }
+            let mut t = Text(String::new());
+            event.record(&mut t);
+            self.0.lock().unwrap().push(t.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The log lines `parse_maintenance` writes for `raw`.
+    fn warnings(raw: &str) -> Vec<String> {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Collect(lines.clone()), || {
+            parse_maintenance(raw.as_bytes());
+        });
+        lines.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn each_dropped_entry_writes_exactly_one_warning() {
+        let w = warnings(
+            r#"{"enabled":true,"allow_ips":["nope","10.0.0.0/33",7,"fe80::1%eth0","","1.2.3.4"]}"#,
+        );
+        assert_eq!(w.len(), 4, "{w:?}");
+        assert!(w.iter().all(|l| l.contains("allow_ips")), "{w:?}");
+        for (line, entry) in w
+            .iter()
+            .zip(["nope", "10.0.0.0/33", "not a string", "fe80::1%eth0"])
+        {
+            assert!(line.contains(entry), "{line} should name {entry}");
+        }
+
+        let w = warnings(r#"{"enabled":true,"allow_paths":["c",null,"/a"]}"#);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w.iter().all(|l| l.contains("allow_paths")), "{w:?}");
+        assert!(
+            w[0].contains("\"c\"") && w[1].contains("not a string"),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn a_bad_field_value_writes_exactly_one_warning() {
+        for (raw, field) in [
+            (r#"{"enabled":true,"end_time":"tomorrow"}"#, "end_time"),
+            (r#"{"enabled":true,"message":5}"#, "message"),
+            (r#"{"enabled":true,"custom_html":[]}"#, "custom_html"),
+            (r#"{"enabled":true,"allow_ips":"1.2.3.4"}"#, "allow_ips"),
+            (r#"{"enabled":true,"allow_paths":{"a":1}}"#, "allow_paths"),
+            (r#"[1]"#, "not a JSON object"),
+            (r#""on""#, "not a JSON object"),
+        ] {
+            let w = warnings(raw);
+            assert_eq!(w.len(), 1, "{raw}: {w:?}");
+            assert!(w[0].contains(field), "{raw}: {w:?}");
+        }
+    }
+
+    #[test]
+    fn what_is_fine_or_empty_writes_no_warning() {
+        for raw in [
+            r#"{"enabled":true,"end_time":"","message":"","allow_ips":["","  "],"allow_paths":[""]}"#,
+            r#"{"enabled":true,"end_time":null,"allow_ips":null,"allow_paths":null,"message":null}"#,
+            r#"{"enabled":true,"end_time":"2026-11-18T22:00:00Z","allow_ips":["1.2.3.4","::1","10.0.0.0/8"],"allow_paths":["/a"]}"#,
+            "",
+            "null",
+        ] {
+            let w = warnings(raw);
+            assert!(w.is_empty(), "{raw}: {w:?}");
+        }
+    }
 
     fn parsed(raw: &str) -> MaintenanceSettings {
         parse_maintenance(raw.as_bytes()).expect("maintenance on")
