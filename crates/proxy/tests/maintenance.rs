@@ -310,8 +310,11 @@ async fn a_forwarded_address_from_an_untrusted_peer_is_not_believed() {
 
 #[tokio::test]
 async fn an_allowed_path_and_what_lies_below_it_reach_the_upstream() {
-    let (_h, addr, up) = serve(on(r#","allow_paths":["/healthz","/static/"]"#)).await;
+    let (_h, addr, up) = serve(on(r#","allow_paths":["/healthz","/static/","/hook;v=1"]"#)).await;
     for (path, status) in [
+        ("/hook;v=1", 200),
+        ("/hook;v=1/stripe", 200),
+        ("/hook;v=2", 503),
         ("/healthz", 200),
         ("/healthz/x", 200),
         ("/healthz?probe=1", 200),
@@ -328,7 +331,7 @@ async fn an_allowed_path_and_what_lies_below_it_reach_the_upstream() {
     ] {
         assert_eq!(one(addr, &get(path)).await.status, status, "{path}");
     }
-    assert_eq!(up.count(), 6, "only the allowed paths reached the upstream");
+    assert_eq!(up.count(), 8, "only the allowed paths reached the upstream");
 }
 
 #[tokio::test]

@@ -320,12 +320,24 @@ fn note(detail: &[u8], n: &[u8]) -> Vec<u8> {
 }
 
 /// Whether maintenance mode lets the forwarded `path` through. A path that holds a `;` must also
-/// pass with its path parameters removed, since servlet containers route `/healthz/..;/admin` to
-/// `/admin`.
+/// pass with the path parameters removed from it and from the entries, since servlet containers
+/// route `/healthz/..;/admin` to `/admin`.
 fn maintenance_allows_path(m: &MaintenanceSettings, path: &[u8]) -> bool {
-    m.allows_path(path)
-        && (!path.contains(&b';')
-            || m.allows_path(&wafio_engine_rules::forwarded_path_readings(path).0))
+    if !m.allows_path(path) {
+        return false;
+    }
+    if !path.contains(&b';') {
+        return true;
+    }
+    let without_parameters = MaintenanceSettings {
+        allow_paths: m
+            .allow_paths
+            .iter()
+            .map(|entry| wafio_engine_rules::strip_path_parameters(entry))
+            .collect(),
+        ..MaintenanceSettings::default()
+    };
+    without_parameters.allows_path(&wafio_engine_rules::forwarded_path_readings(path).0)
 }
 
 /// The 503 of an app in maintenance mode. It is counted, not recorded as a decision.
