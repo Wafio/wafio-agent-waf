@@ -414,6 +414,32 @@ async fn what_is_pipelined_behind_a_body_is_dropped() {
     assert_eq!(up.count(), 0);
 }
 
+/// A request hidden in a body, framed either way (Content-Length and chunked at once, or one of
+/// them), is never parsed: it would go to an allowed path if it were.
+#[tokio::test]
+async fn a_request_hidden_in_a_refused_body_is_never_served() {
+    let (_h, addr, up) = serve(on(r#","allow_paths":["/ok"]"#)).await;
+    let hidden = "GET /ok HTTP/1.1\r\nHost: app.test\r\n\r\n";
+    for framing in [
+        format!("Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n{hidden}"),
+        format!("Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n{hidden}"),
+        format!("Content-Length: {}\r\n\r\n{hidden}", hidden.len()),
+    ] {
+        let mut c = Client::connect(addr).await.unwrap();
+        let raw = format!("POST /upload HTTP/1.1\r\nHost: app.test\r\n{framing}");
+        c.0.get_mut().write_all(raw.as_bytes()).await.unwrap();
+        let reply = read_reply(&mut c.0).await.unwrap();
+        assert_eq!(
+            (reply.status, reply.header("connection")),
+            (503, Some("close")),
+            "{framing}"
+        );
+        assert!(at_eof(&mut c.0).await, "no second answer: {framing}");
+    }
+    settle().await;
+    assert_eq!((up.count(), up.accepts()), (0, 0));
+}
+
 #[tokio::test]
 async fn an_allowed_ip_posts_through_with_its_body_intact() {
     let up = http_upstream().await;
