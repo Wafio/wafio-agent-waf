@@ -191,7 +191,13 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
-    pub(crate) fn new(route: watch::Receiver<Arc<Route>>, client: String, path: Vec<u8>) -> Watch {
+    pub(crate) fn new(
+        mut route: watch::Receiver<Arc<Route>>,
+        client: String,
+        path: Vec<u8>,
+    ) -> Watch {
+        // The route may have changed since the request was decided: the first wait checks it.
+        route.mark_changed();
         Watch {
             route,
             client,
@@ -210,24 +216,24 @@ impl Watch {
         Watch::new(route, client, path)
     }
 
-    fn blocked(&mut self) -> bool {
-        self.route
-            .borrow_and_update()
-            .maintenance
-            .as_ref()
-            .is_some_and(|m| m.blocks(&self.client, &self.path))
-    }
-
     /// Resolves when the current route puts this client in maintenance, now or after a later
-    /// route change; it never resolves while the client is allowed or maintenance is off.
+    /// route change; it never resolves while the client is allowed or maintenance is off. Each
+    /// route is checked once, when it is new, so a stream that calls this for every piece it
+    /// relays pays for no check in between.
     pub(crate) async fn maintenance_on(&mut self) {
         loop {
-            if self.blocked() {
-                return;
-            }
             if self.route.changed().await.is_err() {
                 // The app is gone; the shutdown signal ends what is left.
                 std::future::pending::<()>().await;
+            }
+            // Cloned, so the channel's lock is not held while the lists are matched.
+            let route = self.route.borrow_and_update().clone();
+            if route
+                .maintenance
+                .as_ref()
+                .is_some_and(|m| m.blocks(&self.client, &self.path))
+            {
+                return;
             }
         }
     }
@@ -322,6 +328,35 @@ mod tests {
         assert_eq!(gate(&on, &head, peer).unwrap().status, 503);
         assert!(ALLOCATIONS.with(Cell::get) > before);
         assert!(gate(&on, &head, Some("198.51.100.1".parse().unwrap())).is_none());
+    }
+
+    async fn resolves(w: &mut Watch) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(50), w.maintenance_on())
+            .await
+            .is_ok()
+    }
+
+    /// A watch checks the route it starts with, since maintenance may have come on after the
+    /// request was decided, and then every new route.
+    #[tokio::test]
+    async fn a_watch_checks_the_route_it_starts_with_and_each_new_one() {
+        let client = || "198.51.100.1".to_string();
+        let (_tx, rx) = watch::channel(Arc::new(route(r#"{"enabled":true}"#)));
+        assert!(resolves(&mut Watch::new(rx, client(), b"/chat".to_vec())).await);
+
+        let (tx, rx) = watch::channel(Arc::new(route("")));
+        let mut w = Watch::new(rx, client(), b"/chat".to_vec());
+        assert!(!resolves(&mut w).await);
+        tx.send_replace(Arc::new(route(
+            r#"{"enabled":true,"allow_ips":["198.51.100.1"]}"#,
+        )));
+        assert!(!resolves(&mut w).await, "an allowed client stays");
+        tx.send_replace(Arc::new(route(
+            r#"{"enabled":true,"allow_paths":["/chat"]}"#,
+        )));
+        assert!(!resolves(&mut w).await, "an allowed path stays");
+        tx.send_replace(Arc::new(route(r#"{"enabled":true}"#)));
+        assert!(resolves(&mut w).await);
     }
 
     #[test]
