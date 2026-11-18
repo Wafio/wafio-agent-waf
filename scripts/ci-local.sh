@@ -31,7 +31,8 @@ echo '== proto'
 scripts/sync-proto.sh --check
 
 echo '== notices'
-python3 scripts/gen-notices.py -o /dev/null
+python3 scripts/test_gen_notices.py
+python3 scripts/gen-notices.py -o /dev/null --spdx /dev/null
 
 echo '== advisories'
 # Asks OSV about the locked crates; offline it warns and passes (scripts/advisories.py).

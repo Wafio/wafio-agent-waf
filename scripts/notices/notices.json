@@ -17,7 +17,7 @@
   "adapted": {
     "heading": "Code adapted from other projects",
     "intro": [
-      "Parts of this agent were written in Rust from the source of the open source projects below.",
+      "Parts of this agent were written in Rust from the source of the open source projects below, and the stock pages carry icons from two icon sets.",
       "Each entry gives the project, its copyright holder and licence, the files of the agent that",
       "contain adapted code, and what was changed. The licence text follows the entry, or is listed",
       "under \"Licence and notice texts\" at the end of this file."
@@ -145,6 +145,30 @@
         "changes": "Only the error message texts and the order of the handshake follow the original; the code is new and written in Rust."
       },
       {
+        "name": "Feather icons: shield, slash and tool",
+        "url": "https://github.com/feathericons/feather",
+        "copyright": "Copyright (c) 2013-2023 Cole Bemis",
+        "licence": "MIT",
+        "licence_file": "feather-mit.txt",
+        "used_for": "The paths of three icons in the inline SVG of the stock pages: shield (the security check page), slash (the blocked page) and tool (the maintenance page).",
+        "files": [
+          "crates/agent-pages/src/templates.rs"
+        ],
+        "changes": "The paths are unchanged; the pages set their own size, stroke width and colour."
+      },
+      {
+        "name": "Lucide icon: shield-check",
+        "url": "https://github.com/lucide-icons/lucide",
+        "copyright": "Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.",
+        "licence": "ISC",
+        "licence_file": "lucide-isc.txt",
+        "used_for": "The shield with a check mark on the verification page. Its outline is the Feather shield listed above; the check mark is Lucide's.",
+        "files": [
+          "crates/agent-pages/src/templates.rs"
+        ],
+        "changes": "The paths are unchanged; the page sets its own size, stroke width and colour."
+      },
+      {
         "name": "Public domain code",
         "version": "",
         "url": "https://github.com/geraintluff/sha256 and Howard Hinnant's date algorithms (https://howardhinnant.github.io/date_algorithms.html)",
@@ -160,6 +184,27 @@
           "crates/malware/src/timestamp.rs"
         ],
         "changes": "Rewritten or reformatted for this agent."
+      }
+    ]
+  },
+
+  "linked_path_crates": {
+    "heading": "Crates from other repositories",
+    "intro": [
+      "These crates are linked into the agent like the crates above, but they are not on crates.io: they",
+      "come from the repository named in each entry, which is checked out next to this one when the agent",
+      "is built. Each entry gives the project, its copyright holder and licence and the crates linked. The",
+      "licence text follows the entry."
+    ],
+    "entries": [
+      {
+        "name": "uddin-lang-rs, the uddin script interpreter",
+        "crates": ["uddin", "uddin-std", "uddin-syntax", "uddin-vm", "uddin-waf"],
+        "url": "https://github.com/Wafio/uddin-lang-rs",
+        "copyright": "Copyright (c) 2025 Uddin-Lang Contributors",
+        "licence": "MIT",
+        "licence_file": "uddin-lang.txt",
+        "used_for": "Running the script rules of a rule bundle (the uddin-waf crate and the crates it builds on)."
       }
     ]
   },
