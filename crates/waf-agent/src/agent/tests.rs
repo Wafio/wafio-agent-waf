@@ -11,6 +11,8 @@ use crate::ready::ReadyActions;
 #[derive(Default)]
 struct FakeProxy {
     applied: Mutex<Vec<Vec<(String, u16, String)>>>,
+    /// The HTTPS address of each app of each apply.
+    tls: Mutex<Vec<Vec<Option<String>>>>,
     fail: Mutex<Option<String>>,
 }
 
@@ -22,6 +24,11 @@ impl RouteSink for FakeProxy {
         self.applied.lock().unwrap().push(
             apps.iter()
                 .map(|a| (a.app_id.clone(), a.listen_port, a.mode.clone()))
+                .collect(),
+        );
+        self.tls.lock().unwrap().push(
+            apps.iter()
+                .map(|a| a.tls.as_ref().map(|t| t.listen.clone()))
                 .collect(),
         );
         Ok(())
@@ -70,6 +77,41 @@ fn first_bundle_applies_and_signals_ready() {
     let e = a.app_executor("a1").unwrap();
     assert_eq!(e.analyze.project_id, "p1");
     assert!(a.shared_executor().is_some());
+}
+
+#[test]
+fn only_an_app_named_in_the_tls_sites_is_served_over_https() {
+    let stores = Stores::new();
+    let base = startup_executor(&stores, "", None).unwrap();
+    let proxy = Arc::new(FakeProxy::default());
+    let site = wafio_proxy::TlsSite {
+        listen: "0.0.0.0:443".into(),
+        hosts: vec!["shop.example.com".into()],
+        cert: wafio_proxy::cert_store::CertFiles {
+            certificate: "/etc/wafio/tls/shop.crt".into(),
+            key: "/etc/wafio/tls/shop.key".into(),
+        },
+        redirect_listen: None,
+    };
+    let a = Agent::new(
+        base,
+        stores,
+        proxy.clone(),
+        Arc::new(VerifiedBotChecker::new()),
+        Arc::new(Ready::new(ReadyActions::default())),
+    )
+    .with_tls_sites(HashMap::from([("a1".to_string(), site)]));
+    let other = APP.replace("a1", "a2").replace("18080", "18081");
+    apply(
+        &a,
+        &format!(r#"{{"agent_id":"x","project_id":"p1","apps":[{APP},{other}]}}"#),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        proxy.tls.lock().unwrap()[0],
+        vec![Some("0.0.0.0:443".to_string()), None]
+    );
 }
 
 /// Collects the text of every tracing event.

@@ -2,6 +2,7 @@
 //! harness built through the public API (`Proxy::apply` with `AppSpec`s).
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -203,7 +204,7 @@ impl ReplyParts {
     }
 }
 
-pub async fn read_reply(r: &mut BufReader<TcpStream>) -> io::Result<ReplyParts> {
+pub async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> io::Result<ReplyParts> {
     let (first, headers) = read_head(r).await?.ok_or(io::ErrorKind::UnexpectedEof)?;
     let status = first.split(' ').nth(1).unwrap().parse().unwrap();
     let mut body = Vec::new();
@@ -333,6 +334,7 @@ pub fn app(id: &str, port: u16, upstream: &str) -> AppSpec {
         fcgi_index: String::new(),
         maintenance: Vec::new(),
         analysis: analysis_setup(RULES),
+        tls: None,
     }
 }
 
@@ -378,4 +380,113 @@ pub fn s(b: &[u8]) -> &str {
 
 pub async fn settle() {
     tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[derive(Clone, Default)]
+pub struct Fake {
+    pub accepts: Arc<AtomicUsize>,
+    pub open: Arc<AtomicUsize>,
+    pub params: Arc<Mutex<Vec<HashMap<String, String>>>>,
+}
+
+/// Minimal FastCGI responder: echoes stdin, `X-Conn: <connection number>`, honours KEEP_CONN.
+pub async fn fake_fcgi() -> (SocketAddr, Fake) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let f = Fake::default();
+    let f2 = f.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            let id = f2.accepts.fetch_add(1, Ordering::SeqCst) + 1;
+            f2.open.fetch_add(1, Ordering::SeqCst);
+            let f3 = f2.clone();
+            tokio::spawn(async move {
+                'conn: loop {
+                    let (mut keep, mut params, mut stdin) = (false, Vec::new(), Vec::new());
+                    loop {
+                        let mut h = [0u8; 8];
+                        if s.read_exact(&mut h).await.is_err() {
+                            break 'conn;
+                        }
+                        let len = (h[4] as usize) << 8 | h[5] as usize;
+                        let mut c = vec![0; len + h[6] as usize];
+                        s.read_exact(&mut c).await.unwrap();
+                        c.truncate(len);
+                        match (h[1], len) {
+                            (1, _) => keep = c[2] & 1 == 1,
+                            (4, _) => params.extend_from_slice(&c),
+                            (5, 0) => break,
+                            (5, _) => stdin.extend_from_slice(&c),
+                            _ => {}
+                        }
+                    }
+                    f3.params.lock().unwrap().push(decode_params(&params));
+                    let mut out = format!(
+                        "Status: 201 Created\r\nX-Conn: {id}\r\nContent-Type: text/plain\r\n\r\n"
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(&stdin);
+                    let mut w = Vec::new();
+                    for chunk in out.chunks(65535) {
+                        w.extend_from_slice(&[
+                            1,
+                            6,
+                            0,
+                            1,
+                            (chunk.len() >> 8) as u8,
+                            chunk.len() as u8,
+                            0,
+                            0,
+                        ]);
+                        w.extend_from_slice(chunk);
+                    }
+                    w.extend_from_slice(&[
+                        1, 6, 0, 1, 0, 0, 0, 0, 1, 3, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ]);
+                    if s.write_all(&w).await.is_err() || !keep {
+                        break;
+                    }
+                }
+                f3.open.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    (addr, f)
+}
+
+fn decode_params(mut b: &[u8]) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    let len = |b: &mut &[u8]| {
+        if b[0] < 128 {
+            let n = b[0] as usize;
+            *b = &b[1..];
+            n
+        } else {
+            let n = (u32::from_be_bytes([b[0], b[1], b[2], b[3]]) & 0x7fff_ffff) as usize;
+            *b = &b[4..];
+            n
+        }
+    };
+    while !b.is_empty() {
+        let (k, v) = (len(&mut b), len(&mut b));
+        m.insert(
+            String::from_utf8_lossy(&b[..k]).into(),
+            String::from_utf8_lossy(&b[k..k + v]).into(),
+        );
+        b = &b[k + v..];
+    }
+    m
+}
+
+pub fn fcgi_app(
+    port: u16,
+    upstream: String,
+    doc_root: &str,
+    proxy_config: &str,
+) -> wafio_proxy::AppSpec {
+    let mut a = app("php", port, &upstream);
+    a.fcgi_doc_root = doc_root.into();
+    a.proxy_config = proxy_config.as_bytes().to_vec();
+    a
 }

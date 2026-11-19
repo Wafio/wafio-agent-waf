@@ -375,8 +375,8 @@ start and names every missing one): `--grpc-server` (`WAFIO_GRPC_SERVER`), `--cl
 `--ca-cert`, `--agent-name`, `--geo-country-db`, `--geo-city-db`, `--geo-asn-db`, `--bot-ua-file`, and one of
 `--bot-ja4-file` or `--bot-ja3-file` (when `--bot-ja4-file` is empty the agent uses the first non-empty `ja4.txt` it finds under
 `security-data/ja4/`, `/etc/wafio/security-data/ja4/` and `/usr/local/share/wafio/ja4/`). Optional ones include `--host-key`,
-`--state-dir`, `--bundle-cache-max-age` (default `168h0m0s`), the IP reputation and jail files and `--pid-file`.
-`wafio-waf-agent-open --help` lists all of them.
+`--state-dir`, `--bundle-cache-max-age` (default `168h0m0s`), `--tls-sites-file` (see "HTTPS from the agent"), the IP reputation and
+jail files and `--pid-file`. `wafio-waf-agent-open --help` lists all of them.
 
 The security data (GeoIP databases, user-agent and fingerprint lists, IP reputation lists, malware hashes) lives in one
 directory: `--security-data-dir` (`WAFIO_SECURITY_DATA_DIR`, default `/etc/wafio/security-data`). The control plane
@@ -400,6 +400,44 @@ The agent sends `READY=1` after its first bundle (live or cached). The unit runs
 unit file lists, with what stays writable. The Rust
 agent has not been started under the unit on a real systemd yet: test a start, a reload and a script rule on a test host
 before a production host.
+
+## HTTPS from the agent
+
+By default an app listens on plain HTTP, where its bundle says, and a proxy or load balancer in front of the agent ends TLS. An
+app can instead be served over HTTPS by the agent itself. The settings stay on the agent, in a JSON file that the control
+plane does not send: `--tls-sites-file` (`WAFIO_TLS_SITES_FILE`, empty by default). An app that the file does not name
+behaves exactly as before. The file is read once at start, so `systemctl reload wafio-waf-agent` applies a change to it; a file
+that does not parse, or names a certificate or key file that cannot be read, stops the start and names the reason.
+
+```json
+{"apps": {"<app id>": {"tls": true, "listen": "0.0.0.0:443",
+  "hosts": ["shop.example.com", "www.shop.example.com"],
+  "certificate": "/etc/wafio/tls/shop/fullchain.pem", "key": "/etc/wafio/tls/shop/privkey.pem",
+  "redirect_listen": "0.0.0.0:80"}}}
+```
+
+- `tls: false` leaves the entry out, so it can stay in the file while the app is off. `redirect_listen` is optional. An app id that
+  the bundle does not have serves nothing. Unknown fields are an error.
+- `hosts` are exact names: no port and no wildcard, lower case, written without a trailing dot. A name belongs to one app on a
+  listener. Apps that give the same `listen` share the listener, and then must agree on the read and write timeouts, the body
+  limit and the read buffer size of their `proxy_config`.
+- The app keeps the plain listener its bundle names, so the dashboard still shows it. An address in the file that the bundle also
+  uses fails the apply with `duplicate listener in WAF bundle`.
+- TLS 1.2 and 1.3, with ALPN `http/1.1` only. The SNI name picks the certificate and the `Host` header picks the app. A client
+  that sends no name, or a name no `hosts` list has, gets no handshake. A `Host` that differs from the SNI name gets `421`
+  and the connection closes, so no request reaches another app's upstream over a certificate that was not made for it.
+- The certificate file holds the chain with the leaf first, the key file one private key (PKCS#8, PKCS#1 or SEC1). The agent checks
+  every 30 seconds whether either file changed (modification time, size or inode, so a symlink swap counts) and loads the new pair for
+  the next handshake. Open connections go on. A pair that cannot be read, or whose key does not match its certificate, keeps the
+  previous one and is logged once with the file name. Private keys are never logged. The files must be readable by the user the
+  agent runs as.
+- `redirect_listen` answers every method with `308` to `https://<host>[:port]` and the same path and query, for the hosts of the file, and
+  `404` for any other, then closes the connection.
+- The agent computes the JA4 fingerprint from the ClientHello of each TLS connection, and the bot checks use it. For an app in the
+  file, the JA4 and JA3 headers of a proxy in front are read only from a peer that `proxy_config` trusts as a proxy; `X-Forwarded-Proto`
+  is `https` for a TLS connection. A ClientHello that spans two TLS records gets no JA4.
+- Every TLS connection counts against the listener's connection limit, and the handshake has 10 seconds. A failed handshake closes
+  without an answer.
 
 ## Switching inspection off
 
@@ -532,7 +570,7 @@ Cargo.toml  Cargo.lock       workspace of 18 crates
 crates/
   waf-agent                  the library and the binary wafio-waf-agent-open: flags, run loop, bundle apply, reload
   control                    gRPC link to the control plane, bundle cache, telemetry
-  proxy                      per-application reverse proxy and WebSocket handling
+  proxy                      per-application reverse proxy and WebSocket handling, HTTPS listeners and certificates
   application                request analysis pipeline, in-memory block and rate-limit stores
   engine-api                 the engine boundary: scan configuration, finding names, coverage marks, the Engine trait
   engine-abi                 the C interface to an engine in a shared library: structs, symbols, header, encodings

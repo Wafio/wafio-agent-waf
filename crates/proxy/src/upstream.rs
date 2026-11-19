@@ -229,7 +229,13 @@ pub(crate) fn upstream_request(
     let proto = req.peek("X-Forwarded-Proto");
     u.set(
         b"X-Forwarded-Proto",
-        if proto.is_empty() { b"http" } else { proto },
+        if req.tls.is_some() {
+            b"https"
+        } else if proto.is_empty() {
+            b"http"
+        } else {
+            proto
+        },
     );
     for name in &route.proxy_config.request_headers.remove {
         u.del(name.as_bytes());

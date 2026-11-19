@@ -225,6 +225,14 @@ pub struct AgentArgs {
         hide_default_value = true
     )]
     pub state_dir: String,
+    /// JSON file naming the apps this agent serves over HTTPS itself, with their host names and certificate files (env WAFIO_TLS_SITES_FILE; optional; read at start, a reload applies a change)
+    #[arg(
+        allow_hyphen_values = true,
+        long = "tls-sites-file",
+        default_value = "",
+        hide_default_value = true
+    )]
+    pub tls_sites_file: String,
     /// the semantic engine library to load (env WAFIO_ENGINE_LIB; default /usr/lib/wafio/libwafio_semantic_engine.so). Only an agent without the engine linked in loads one
     #[arg(
         allow_hyphen_values = true,
@@ -307,6 +315,7 @@ impl AgentArgs {
         fill(&mut self.bot_ja3_file, "WAFIO_JA3_BLACKLIST_FILE");
         fill(&mut self.iprep_level1_file, "WAFIO_IPREP_LEVEL1_FILE");
         fill(&mut self.iprep_level2_file, "WAFIO_IPREP_LEVEL2_FILE");
+        fill(&mut self.tls_sites_file, "WAFIO_TLS_SITES_FILE");
         self.state_dir = choose_state_dir(
             &self.state_dir,
             &env.get("WAFIO_STATE_DIR"),

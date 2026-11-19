@@ -11,7 +11,7 @@ use wafio_application::blocklist::BlockStore;
 use wafio_control::{BundleError, BundleSink};
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
-use wafio_proxy::{AppAnalysisSetup, AppSpec};
+use wafio_proxy::{AppAnalysisSetup, AppSpec, TlsSite};
 
 use crate::bundle::{Bundle, BundleApp, UnblockEntry, decode_bundle};
 use crate::executor::{BaseExecutor, Stores, executor_for_rules};
@@ -50,6 +50,8 @@ pub struct Agent {
     routes: Arc<dyn RouteSink>,
     good_bots: Arc<VerifiedBotChecker>,
     ready: Arc<Ready>,
+    /// The apps the agent also serves over HTTPS itself, by app id (the local TLS sites file).
+    tls_sites: HashMap<String, TlsSite>,
 }
 
 fn apply_error(s: &str) -> BundleError {
@@ -79,7 +81,15 @@ impl Agent {
             routes,
             good_bots,
             ready,
+            tls_sites: HashMap::new(),
         }
+    }
+
+    /// The apps served over HTTPS by the agent: an app in the map gets its `TlsSite`, one that is
+    /// not behaves as the bundle says.
+    pub fn with_tls_sites(mut self, sites: HashMap<String, TlsSite>) -> Agent {
+        self.tls_sites = sites;
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -228,7 +238,7 @@ impl Agent {
             exec.analyze.custom_tuning_rules = tuning;
             let exec = Arc::new(exec);
             executors.insert(app.app_id.clone(), (exec.clone(), stores));
-            let spec = app_spec(app, exec);
+            let spec = app_spec(app, exec, self.tls_sites.get(&app.app_id).cloned());
             // The route is built here, so a bad route fails before later apps are built.
             if let Err(e) = wafio_proxy::config::build_route(&spec) {
                 tracing::info!("[waf-bundle] {e}");
@@ -274,7 +284,7 @@ impl Agent {
 
 /// The `AppSpec` of a bundle app (`listen_port` ≤ 0 = no listener; > 65535 is refused by
 /// `install_bundle` before this is used).
-fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>) -> AppSpec {
+fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>, tls: Option<TlsSite>) -> AppSpec {
     AppSpec {
         app_id: app.app_id.clone(),
         listen_host: app.listen_host.clone(),
@@ -287,6 +297,7 @@ fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>) -> AppSpec {
         fcgi_index: app.fcgi_index.clone(),
         maintenance: app.maintenance.clone(),
         analysis: executor,
+        tls,
     }
 }
 

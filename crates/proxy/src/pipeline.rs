@@ -102,8 +102,20 @@ fn rules_for_request_path(
         .collect()
 }
 
-/// JA4/JA3 from proxy headers.
-fn read_client_fingerprints(req: &InboundRequest) -> (Vec<u8>, Vec<u8>) {
+/// JA4 and JA3 of the client. The JA4 of a handshake the agent terminated wins; otherwise they
+/// come from the headers of a proxy in front. When the agent is the edge of the app, a client
+/// could write them itself, so they count only from a peer the route trusts as a proxy.
+fn read_client_fingerprints(
+    req: &InboundRequest,
+    route: &Route,
+    peer: &IpAddress,
+) -> (Vec<u8>, Vec<u8>) {
+    if let Some(ja4) = req.tls.as_ref().and_then(|t| t.ja4.as_ref()) {
+        return (ja4.clone().into_bytes(), Vec::new());
+    }
+    if route.edge && !route.proxy_config.may_supply_forwarded_headers(peer) {
+        return (Vec::new(), Vec::new());
+    }
     let first = |names: &[&str]| {
         names
             .iter()
@@ -138,8 +150,7 @@ fn challenge_request<'a>(
         sec_fetch_site: req.peek("Sec-Fetch-Site"),
         x_forwarded_proto: req.peek("X-Forwarded-Proto"),
         challenge_cookie: req.cookie(wafio_agent_pages::challenge::CHALLENGE_COOKIE.as_bytes()),
-        // Agent listeners are plain HTTP.
-        over_tls: false,
+        over_tls: req.tls.is_some(),
         local_socket_client: local,
         submitted_body: post_body,
     }
@@ -266,7 +277,7 @@ fn detect(
         skipped = bi.skipped;
         notes = bi.notes;
     }
-    let (ja4, ja3) = read_client_fingerprints(req);
+    let (ja4, ja3) = read_client_fingerprints(req, route, peer);
     let mut dreq = IncomingRequest {
         method: req.method.clone(),
         uri: req.request_target.clone(),
@@ -673,12 +684,16 @@ pub(crate) async fn handle(
             // Every spelling that becomes the same CGI param (`X_Forwarded_For`, `X-Real_IP`) goes
             // too: PHP-FPM keeps the last of a repeated param and the sorted map put such a
             // spelling after ours, so a client could name its own address.
-            hm.retain(|k, _| {
-                !matches!(
-                    cgi_header_param(k).as_slice(),
-                    b"HTTP_X_REAL_IP" | b"HTTP_X_FORWARDED_FOR"
-                )
+            // Over TLS the scheme is ours to state too: PHP derives `HTTPS` and the port from it.
+            let over_tls = req.tls.is_some();
+            hm.retain(|k, _| match cgi_header_param(k).as_slice() {
+                b"HTTP_X_REAL_IP" | b"HTTP_X_FORWARDED_FOR" => false,
+                b"HTTP_X_FORWARDED_PROTO" => !over_tls,
+                _ => true,
             });
+            if over_tls {
+                hm.insert(b"X-Forwarded-Proto".to_vec(), vec![b"https".to_vec()]);
+            }
             hm.insert(b"X-Real-IP".to_vec(), vec![remote.as_bytes().to_vec()]);
             hm.insert(
                 b"X-Forwarded-For".to_vec(),
