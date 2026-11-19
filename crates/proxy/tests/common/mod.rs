@@ -386,10 +386,13 @@ pub async fn settle() {
 pub struct Fake {
     pub accepts: Arc<AtomicUsize>,
     pub open: Arc<AtomicUsize>,
+    /// The flags byte of each FCGI_BEGIN_REQUEST.
+    pub begin_flags: Arc<Mutex<Vec<u8>>>,
     pub params: Arc<Mutex<Vec<HashMap<String, String>>>>,
 }
 
-/// Minimal FastCGI responder: echoes stdin, `X-Conn: <connection number>`, honours KEEP_CONN.
+/// Minimal FastCGI responder: echoes stdin, `X-Conn: <connection number>`. It never closes a
+/// connection itself, so `open` falls only when the agent closes one.
 pub async fn fake_fcgi() -> (SocketAddr, Fake) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -403,7 +406,7 @@ pub async fn fake_fcgi() -> (SocketAddr, Fake) {
             let f3 = f2.clone();
             tokio::spawn(async move {
                 'conn: loop {
-                    let (mut keep, mut params, mut stdin) = (false, Vec::new(), Vec::new());
+                    let (mut params, mut stdin) = (Vec::new(), Vec::new());
                     loop {
                         let mut h = [0u8; 8];
                         if s.read_exact(&mut h).await.is_err() {
@@ -414,7 +417,7 @@ pub async fn fake_fcgi() -> (SocketAddr, Fake) {
                         s.read_exact(&mut c).await.unwrap();
                         c.truncate(len);
                         match (h[1], len) {
-                            (1, _) => keep = c[2] & 1 == 1,
+                            (1, _) => f3.begin_flags.lock().unwrap().push(c[2]),
                             (4, _) => params.extend_from_slice(&c),
                             (5, 0) => break,
                             (5, _) => stdin.extend_from_slice(&c),
@@ -444,7 +447,7 @@ pub async fn fake_fcgi() -> (SocketAddr, Fake) {
                     w.extend_from_slice(&[
                         1, 6, 0, 1, 0, 0, 0, 0, 1, 3, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     ]);
-                    if s.write_all(&w).await.is_err() || !keep {
+                    if s.write_all(&w).await.is_err() {
                         break;
                     }
                 }

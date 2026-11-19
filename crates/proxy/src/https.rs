@@ -95,12 +95,6 @@ impl TlsListener {
         *self.sites.write().unwrap_or_else(PoisonError::into_inner) = next;
     }
 
-    /// The routes of the apps on the listener.
-    pub(crate) fn routes(&self) -> Vec<Arc<Route>> {
-        let sites = self.sites.read().unwrap_or_else(PoisonError::into_inner);
-        sites.apps.iter().map(|a| a.route()).collect()
-    }
-
     fn app_for(&self, name: &[u8]) -> Option<Arc<RouteApp>> {
         let sites = self.sites.read().unwrap_or_else(PoisonError::into_inner);
         sites.hosts.get(name).map(|&i| sites.apps[i].clone())

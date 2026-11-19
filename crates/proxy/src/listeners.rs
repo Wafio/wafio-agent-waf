@@ -83,14 +83,6 @@ impl Served {
         }
     }
 
-    fn routes(&self) -> Vec<Arc<Route>> {
-        match self {
-            Served::App(app) => vec![app.route()],
-            Served::Tls(listener) => listener.routes(),
-            Served::Redirect(_) => Vec::new(),
-        }
-    }
-
     fn is_kind_of(&self, serves: &Serves) -> bool {
         matches!(
             (self, serves),
@@ -237,12 +229,6 @@ impl RouteManager {
                 }
             }
         }
-        let mut old_pools: Vec<_> = inner
-            .live
-            .values()
-            .flat_map(|l| l.served.routes())
-            .filter_map(|r| r.fcgi().cloned())
-            .collect();
         for spec in specs {
             let certs = prepared.remove(&spec.address);
             match inner.live.get(&spec.address) {
@@ -268,15 +254,6 @@ impl RouteManager {
             let live = inner.live.remove(&addr).expect("listed");
             retire(live);
         }
-        // FastCGI pools of replaced routes: every pooled connection pins a PHP-FPM worker.
-        let live_pools: Vec<_> = inner
-            .live
-            .values()
-            .flat_map(|l| l.served.routes())
-            .filter_map(|r| r.fcgi().cloned())
-            .collect();
-        old_pools.retain(|p| !live_pools.iter().any(|l| Arc::ptr_eq(l, p)));
-        old_pools.iter().for_each(|p| p.close());
         if !inner.first_applied {
             // Handed-over sockets the first configuration does not use close now.
             inner.inherited.clear();
