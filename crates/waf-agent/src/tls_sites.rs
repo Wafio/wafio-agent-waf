@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use wafio_proxy::TlsSite;
-use wafio_proxy::cert_store::CertFiles;
+use wafio_proxy::cert_store::{CertFiles, load_certified_key};
 
 use crate::agent::format_host_port;
 
@@ -41,7 +41,16 @@ pub fn load(path: &str) -> Result<HashMap<String, TlsSite>, String> {
             crate::flags::path_error_text("open", path, &e)
         )
     })?;
-    parse(&bytes).map_err(|e| format!("--tls-sites-file {path}: {e}"))
+    let sites = parse(&bytes).map_err(|e| format!("--tls-sites-file {path}: {e}"))?;
+    // A pair the proxy cannot read fails the whole bundle apply and leaves every app unserved, so
+    // the start refuses it here.
+    let mut apps: Vec<_> = sites.iter().collect();
+    apps.sort_by_key(|(app, _)| *app);
+    for (app, site) in apps {
+        load_certified_key(&site.cert)
+            .map_err(|e| format!("--tls-sites-file {path}: app {app}: {e}"))?;
+    }
+    Ok(sites)
 }
 
 fn parse(bytes: &[u8]) -> Result<HashMap<String, TlsSite>, String> {
@@ -77,6 +86,12 @@ impl Entry {
         hosts.dedup();
         if self.certificate.as_os_str().is_empty() || self.key.as_os_str().is_empty() {
             return Err("certificate and key are required".into());
+        }
+        for (field, path) in [("certificate", &self.certificate), ("key", &self.key)] {
+            // A PEM pasted here would be printed by every later error that names the file.
+            if path.as_os_str().as_encoded_bytes().contains(&b'\n') {
+                return Err(format!("{field} must be the name of a file, not its text"));
+            }
         }
         Ok(TlsSite {
             listen,

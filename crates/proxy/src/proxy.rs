@@ -15,7 +15,9 @@ use wafio_agent_pages::iprep::ReputationChecker;
 use crate::cert_store::CERT_POLL_INTERVAL;
 use crate::config::{AppSpec, Route, TlsSite, build_route};
 use crate::decision::DecisionSink;
+use crate::https::TLS_HANDSHAKE_TIMEOUT;
 use crate::listeners::{ROUTE_DRAIN_GRACE, RouteManager, RouteSpec, Serves};
+use crate::route::CONNECTION_LIMIT;
 
 /// Process-wide dependencies, set once at start.
 pub struct ProxyOptions {
@@ -34,6 +36,10 @@ pub struct ProxyOptions {
     pub drain_timeout: Duration,
     /// How often the certificate files of an HTTPS listener are checked for a change.
     pub cert_poll_interval: Duration,
+    /// How long a client of an HTTPS listener has for its first TLS record and the handshake.
+    pub tls_handshake_timeout: Duration,
+    /// Connections one listener serves at once; more are closed (a plain listener answers 503).
+    pub connection_limit: usize,
 }
 
 impl ProxyOptions {
@@ -46,6 +52,8 @@ impl ProxyOptions {
             inherited: HashMap::new(),
             drain_timeout: ROUTE_DRAIN_GRACE,
             cert_poll_interval: CERT_POLL_INTERVAL,
+            tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
+            connection_limit: CONNECTION_LIMIT,
         }
     }
 }
@@ -87,6 +95,8 @@ impl Proxy {
                 shared,
                 opts.drain_timeout,
                 opts.cert_poll_interval,
+                opts.tls_handshake_timeout,
+                opts.connection_limit,
                 opts.inherited,
             ),
         }

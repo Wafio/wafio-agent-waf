@@ -1,25 +1,28 @@
 //! HTTPS listeners through the public API: the certificate chosen by SNI, the app chosen by
-//! `Host`, the redirect listener, certificate files swapped under a running listener, and the JA4
-//! of the handshake. Keys are made by `openssl` into a temporary directory and never leave it.
+//! `Host`, the redirect listener, certificate files swapped under a running listener, the JA4
+//! of the handshake, the scheme a FastCGI app is told, and what bounds a client that is slow or
+//! many. Keys are made by `openssl` into a temporary directory and never leave it.
 
 mod common;
 
+use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pingora::tls::{
     CertificateDer, ClientConfig, ClientTlsStream, RootCertStore, ServerName, TlsConnector,
 };
 use rustls_pki_types::pem::PemObject;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 use wafio_proxy::cert_store::CertFiles;
 use wafio_proxy::{AppSpec, Proxy, ProxyOptions, TlsSite};
@@ -153,6 +156,8 @@ impl Drop for Pki {
 struct Tap {
     inner: TcpStream,
     written: Arc<Mutex<Vec<u8>>>,
+    /// Splits the first write: `at` bytes go out at once, the rest once `pause` has run.
+    cut: Option<(usize, Pin<Box<tokio::time::Sleep>>)>,
 }
 
 impl AsyncRead for Tap {
@@ -171,9 +176,18 @@ impl AsyncWrite for Tap {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let polled = Pin::new(&mut self.inner).poll_write(cx, data);
+        let this = &mut *self;
+        let mut data = data;
+        if let Some((at, pause)) = &mut this.cut {
+            if this.written.lock().unwrap().is_empty() {
+                data = &data[..data.len().min(*at)];
+            } else if pause.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+        }
+        let polled = Pin::new(&mut this.inner).poll_write(cx, data);
         if let Poll::Ready(Ok(n)) = &polled {
-            self.written.lock().unwrap().extend_from_slice(&data[..*n]);
+            this.written.lock().unwrap().extend_from_slice(&data[..*n]);
         }
         polled
     }
@@ -193,9 +207,21 @@ struct Https(BufReader<ClientTlsStream<Tap>>);
 impl Https {
     /// Connects to `port` with `sni` as the server name; an error when the handshake fails.
     async fn connect(port: u16, pki: &Pki, sni: &str) -> io::Result<Https> {
+        Https::connect_cut(port, pki, sni, None).await
+    }
+
+    /// As `connect`; with `cut` = `(at, pause)` the ClientHello goes out in two TCP writes, `at`
+    /// bytes in and the rest `pause` after connecting.
+    async fn connect_cut(
+        port: u16,
+        pki: &Pki,
+        sni: &str,
+        cut: Option<(usize, Duration)>,
+    ) -> io::Result<Https> {
         let tap = Tap {
             inner: TcpStream::connect(("127.0.0.1", port)).await?,
             written: Arc::default(),
+            cut: cut.map(|(at, pause)| (at, Box::pin(tokio::time::sleep(pause)))),
         };
         let name = ServerName::try_from(sni.to_owned()).unwrap();
         let tls = TlsConnector::from(pki.client_config())
@@ -237,15 +263,8 @@ fn url(upstream: &TestUpstream) -> String {
     format!("http://{}", upstream.addr)
 }
 
-/// An app served over HTTPS on `port` for `hosts` and not on any bundle listener.
-fn tls_app(
-    id: &str,
-    upstream: &TestUpstream,
-    port: u16,
-    hosts: &[&str],
-    files: &CertFiles,
-) -> AppSpec {
-    let mut a = app(id, 0, &url(upstream));
+/// `a` also served over HTTPS on `port` for `hosts`.
+fn with_tls(mut a: AppSpec, port: u16, hosts: &[&str], files: &CertFiles) -> AppSpec {
     a.tls = Some(TlsSite {
         listen: format!("127.0.0.1:{port}"),
         hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
@@ -255,16 +274,32 @@ fn tls_app(
     a
 }
 
-/// A proxy that looks at certificate files every `poll`.
-fn harness_polling(poll: Duration) -> Harness {
+/// An app served over HTTPS on `port` for `hosts` and not on any bundle listener.
+fn tls_app(
+    id: &str,
+    upstream: &TestUpstream,
+    port: u16,
+    hosts: &[&str],
+    files: &CertFiles,
+) -> AppSpec {
+    with_tls(app(id, 0, &url(upstream)), port, hosts, files)
+}
+
+/// A proxy whose options `configure` changes.
+fn harness_with(configure: impl FnOnce(&mut ProxyOptions)) -> Harness {
     let events: Events = Arc::default();
     let sink = events.clone();
     let mut opts = ProxyOptions::new(Arc::new(move |e| sink.lock().unwrap().push(e)));
-    opts.cert_poll_interval = poll;
+    configure(&mut opts);
     Harness {
         proxy: Proxy::new(opts),
         events,
     }
+}
+
+/// A proxy that looks at certificate files every `poll`.
+fn harness_polling(poll: Duration) -> Harness {
+    harness_with(|opts| opts.cert_poll_interval = poll)
 }
 
 /// Runs `attempt` until it gives a value.
@@ -313,7 +348,6 @@ async fn an_https_request_reaches_the_upstream_on_a_connection_that_stays_open()
 
 #[tokio::test]
 async fn a_client_that_does_not_speak_tls_is_closed_without_an_http_answer() {
-    use tokio::io::AsyncReadExt;
     let up = http_upstream().await;
     let pki = Pki::new();
     let files = pki.leaf("shop", &["shop.test"]);
@@ -752,4 +786,250 @@ async fn plain_listener_status(
     )
     .await
     .status
+}
+
+#[tokio::test]
+async fn a_client_hello_sent_in_two_tcp_writes_still_handshakes_and_gets_its_ja4() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let port = free_port();
+    let h = Harness::new();
+    let site = |rules: &str| {
+        let mut a = tls_app("shop", &up, port, &["shop.test"], &files);
+        a.analysis = analysis_setup(rules);
+        a
+    };
+    h.proxy.apply(vec![site(RULES)]).unwrap();
+    let ja4 = Https::connect(port, &pki, "shop.test").await.unwrap().ja4();
+
+    // Only a JA4 the agent computed from the whole hello can match the one listed here.
+    h.proxy.apply(vec![site(&block_ja4(&ja4))]).unwrap();
+    let pause = Duration::from_millis(150);
+    // Inside the record header, between header and payload, inside the hello.
+    for at in [3, 5, 40] {
+        let mut c = Https::connect_cut(port, &pki, "shop.test", Some((at, pause)))
+            .await
+            .unwrap_or_else(|e| panic!("cut at {at}: {e}"));
+        assert_eq!(c.ja4(), ja4, "cut at {at}: the client sent the same hello");
+        let r = c.send(&get_host("shop.test", "/")).await.unwrap();
+        assert_eq!(r.status, 403, "cut at {at}");
+        let detail = h.last_event().match_detail;
+        assert!(s(&detail).contains(&format!("ja4:{ja4}")), "cut at {at}");
+    }
+}
+
+/// A client that sent `sent` to an HTTPS port and nothing more holds the port's only connection
+/// slot until the handshake deadline, when the agent closes it without an answer.
+async fn stalled_handshake_is_closed_at_the_deadline(sent: &[u8]) {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let port = free_port();
+    let deadline = Duration::from_millis(500);
+    let h = harness_with(|opts| {
+        opts.tls_handshake_timeout = deadline;
+        opts.connection_limit = 1;
+    });
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+
+    let mut stalled = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stalled.write_all(sent).await.unwrap();
+    let start = Instant::now();
+    assert!(
+        Https::connect(port, &pki, "shop.test").await.is_err(),
+        "the stalled client holds the only slot"
+    );
+    let mut answer = Vec::new();
+    let read = stalled.read_to_end(&mut answer);
+    let closed = tokio::time::timeout(Duration::from_secs(5), read).await;
+    assert!(
+        matches!(closed, Ok(Ok(_))),
+        "closed by the agent: {closed:?}"
+    );
+    assert!(
+        start.elapsed() >= deadline / 2,
+        "closed at the deadline, not before: {:?}",
+        start.elapsed()
+    );
+    assert!(answer.is_empty(), "no answer");
+
+    let mut c = until("the slot of the stalled client", || async {
+        Https::connect(port, &pki, "shop.test").await.ok()
+    })
+    .await;
+    assert_eq!(
+        c.send(&get_host("shop.test", "/")).await.unwrap().status,
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_sends_nothing_is_closed_at_the_handshake_deadline_and_its_slot_is_free_again()
+ {
+    stalled_handshake_is_closed_at_the_deadline(b"").await;
+}
+
+#[tokio::test]
+async fn a_client_that_announces_the_largest_record_and_sends_none_of_it_is_closed_at_the_handshake_deadline()
+ {
+    // The header of a handshake record whose payload is 16384 bytes long.
+    stalled_handshake_is_closed_at_the_deadline(&[0x16, 0x03, 0x01, 0x40, 0x00]).await;
+}
+
+#[tokio::test]
+async fn past_the_connection_limit_a_tls_client_is_closed_unanswered_and_a_freed_slot_is_usable_again()
+ {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let port = free_port();
+    let h = harness_with(|opts| opts.connection_limit = 2);
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    let ask = get_host("shop.test", "/");
+    let mut a = Https::connect(port, &pki, "shop.test").await.unwrap();
+    let mut b = Https::connect(port, &pki, "shop.test").await.unwrap();
+    assert_eq!(a.send(&ask).await.unwrap().status, 200);
+    assert_eq!(b.send(&ask).await.unwrap().status, 200);
+
+    // Neither a handshake nor an HTTP answer: the connection is closed as it is accepted.
+    let mut third = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut answer = Vec::new();
+    let read = third.read_to_end(&mut answer);
+    let closed = tokio::time::timeout(Duration::from_secs(5), read).await;
+    assert!(
+        matches!(closed, Ok(Ok(_))),
+        "closed by the agent: {closed:?}"
+    );
+    assert!(answer.is_empty(), "no answer");
+    assert!(Https::connect(port, &pki, "shop.test").await.is_err());
+    assert_eq!(a.send(&ask).await.unwrap().status, 200);
+    assert_eq!(b.send(&ask).await.unwrap().status, 200);
+
+    drop(a);
+    let mut c = until("the slot of the closed connection", || async {
+        Https::connect(port, &pki, "shop.test").await.ok()
+    })
+    .await;
+    assert_eq!(c.send(&ask).await.unwrap().status, 200);
+    assert_eq!(b.send(&ask).await.unwrap().status, 200);
+    assert!(
+        Https::connect(port, &pki, "shop.test").await.is_err(),
+        "the limit still holds with the freed slot taken"
+    );
+}
+
+/// A FastCGI app served over HTTPS on `port` and on no bundle listener.
+fn php_app(fcgi: SocketAddr, port: u16, files: &CertFiles) -> AppSpec {
+    let a = fcgi_app(0, format!("fcgi://{fcgi}"), "/var/www", "");
+    with_tls(a, port, &["shop.test"], files)
+}
+
+/// The params of the last request the fake FastCGI responder got.
+fn last_params(fake: &Fake) -> HashMap<String, String> {
+    fake.params.lock().unwrap().last().cloned().unwrap()
+}
+
+#[tokio::test]
+async fn a_fastcgi_app_over_tls_is_told_https_and_the_https_port() {
+    let (fcgi, fake) = fake_fcgi().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let port = free_port();
+    let h = Harness::new();
+    h.proxy.apply(vec![php_app(fcgi, port, &files)]).unwrap();
+
+    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
+    let r = c.send(&get_host("shop.test", "/index.php")).await.unwrap();
+    assert_eq!(r.status, 201);
+    let p = last_params(&fake);
+    assert_eq!(
+        (p["HTTPS"].as_str(), p["SERVER_PORT"].as_str()),
+        ("on", "443")
+    );
+    assert_eq!(p["HTTP_X_FORWARDED_PROTO"], "https");
+
+    // A Host that names the port keeps it: the app is on that port.
+    let named = get_host(&format!("shop.test:{port}"), "/index.php");
+    assert_eq!(c.send(&named).await.unwrap().status, 201);
+    let p = last_params(&fake);
+    assert_eq!(
+        (p["HTTPS"].as_str(), p["SERVER_PORT"].as_str()),
+        ("on", port.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_client_header_in_any_spelling_cannot_turn_https_off_for_a_fastcgi_app_over_tls() {
+    let (fcgi, fake) = fake_fcgi().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let port = free_port();
+    let h = Harness::new();
+    h.proxy.apply(vec![php_app(fcgi, port, &files)]).unwrap();
+
+    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
+    // Each spelling becomes HTTP_X_FORWARDED_PROTO; the last of a repeated param wins in PHP-FPM.
+    for headers in [
+        "X-Forwarded-Proto: http",
+        "x-forwarded-proto: http",
+        "X_Forwarded_Proto: http",
+        "x-forwarded_proto: http",
+        "X-FORWARDED-PROTO: HTTP",
+        "X-Forwarded-Proto: http\r\nX_Forwarded_Proto: http\r\nx-forwarded_proto: http",
+    ] {
+        let raw = format!("GET /index.php HTTP/1.1\r\nHost: shop.test\r\n{headers}\r\n\r\n");
+        assert_eq!(c.send(raw.as_bytes()).await.unwrap().status, 201);
+        let p = last_params(&fake);
+        assert_eq!(
+            (
+                p.get("HTTPS").map(String::as_str),
+                p["SERVER_PORT"].as_str(),
+                p["HTTP_X_FORWARDED_PROTO"].as_str()
+            ),
+            (Some("on"), "443", "https"),
+            "{headers:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_plain_listener_of_an_app_served_over_tls_still_passes_the_clients_forwarded_proto() {
+    let (fcgi, fake) = fake_fcgi().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let (port, plain) = (free_port(), free_port());
+    let mut a = php_app(fcgi, port, &files);
+    a.listen_port = plain;
+    let h = Harness::new();
+    h.proxy.apply(vec![a]).unwrap();
+    let to: SocketAddr = format!("127.0.0.1:{plain}").parse().unwrap();
+
+    for (header, https, server_port, proto) in [
+        (
+            "X-Forwarded-Proto: https\r\n",
+            Some("on"),
+            "443",
+            Some("https"),
+        ),
+        ("X-Forwarded-Proto: http\r\n", None, "80", Some("http")),
+        ("", None, "80", None),
+    ] {
+        let raw = format!("GET /index.php HTTP/1.1\r\nHost: shop.test\r\n{header}\r\n");
+        assert_eq!(one(to, raw.as_bytes()).await.status, 201);
+        let p = last_params(&fake);
+        assert_eq!(
+            (
+                p.get("HTTPS").map(String::as_str),
+                p["SERVER_PORT"].as_str(),
+                p.get("HTTP_X_FORWARDED_PROTO").map(String::as_str)
+            ),
+            (https, server_port, proto),
+            "{header:?}"
+        );
+    }
 }

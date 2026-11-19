@@ -407,7 +407,7 @@ By default an app listens on plain HTTP, where its bundle says, and a proxy or l
 app can instead be served over HTTPS by the agent itself. The settings stay on the agent, in a JSON file that the control
 plane does not send: `--tls-sites-file` (`WAFIO_TLS_SITES_FILE`, empty by default). An app that the file does not name
 behaves exactly as before. The file is read once at start, so `systemctl reload wafio-waf-agent` applies a change to it; a file
-that does not parse stops the start and names the reason.
+that does not parse, or names a certificate or key file that cannot be read, stops the start and names the reason.
 
 ```json
 {"apps": {"<app id>": {"tls": true, "listen": "0.0.0.0:443",

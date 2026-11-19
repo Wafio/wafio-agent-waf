@@ -22,7 +22,7 @@ use crate::route::{HeadLimits, RouteApp, Site, serve_connection};
 use crate::upstream::ms;
 
 /// One deadline for reading the first TLS record and finishing the handshake.
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The apps of an HTTPS listener and the host names each answers for.
 #[derive(Default)]
@@ -148,9 +148,15 @@ pub(crate) fn prepare_certificates(
 }
 
 /// An accepted connection of an HTTPS listener: the handshake, then the HTTP/1 loop. A failed
-/// handshake closes the connection without an answer.
-pub(crate) async fn serve_tls(listener: Arc<TlsListener>, stream: TcpStream, stop: ShutdownWatch) {
-    let handshake = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, listener.handshake(stream));
+/// handshake, or one not finished within `handshake_timeout`, closes the connection without an
+/// answer.
+pub(crate) async fn serve_tls(
+    listener: Arc<TlsListener>,
+    stream: TcpStream,
+    stop: ShutdownWatch,
+    handshake_timeout: Duration,
+) {
+    let handshake = tokio::time::timeout(handshake_timeout, listener.handshake(stream));
     let Ok(Some((stream, client))) = handshake.await else {
         return;
     };

@@ -121,6 +121,10 @@ pub struct RouteManager {
     drain: Duration,
     /// How often the certificate files of an HTTPS listener are checked.
     cert_poll: Duration,
+    /// The deadline of an HTTPS client's first record and handshake.
+    handshake_timeout: Duration,
+    /// Connections one listener serves at once.
+    connection_limit: usize,
     inner: Mutex<Inner>,
 }
 
@@ -130,12 +134,16 @@ impl RouteManager {
         shared: Arc<Shared>,
         drain: Duration,
         cert_poll: Duration,
+        handshake_timeout: Duration,
+        connection_limit: usize,
         inherited: HashMap<String, StdListener>,
     ) -> Self {
         RouteManager {
             shared,
             drain,
             cert_poll,
+            handshake_timeout,
+            connection_limit,
             inner: Mutex::new(Inner {
                 live: HashMap::new(),
                 inherited,
@@ -318,7 +326,14 @@ impl RouteManager {
                 self.cert_poll,
             ));
         }
-        let done = tokio::spawn(accept_loop(listener, served.clone(), rx, self.drain));
+        let done = tokio::spawn(accept_loop(
+            listener,
+            served.clone(),
+            rx,
+            self.drain,
+            self.connection_limit,
+            self.handshake_timeout,
+        ));
         Ok(Live {
             served,
             stop,
@@ -414,10 +429,12 @@ async fn accept_loop(
     served: Served,
     stop: watch::Receiver<bool>,
     drain: Duration,
+    connection_limit: usize,
+    handshake_timeout: Duration,
 ) {
     let listener = L4Listener::from(listener);
     let mut conns = JoinSet::new();
-    let slots = Arc::new(tokio::sync::Semaphore::new(crate::route::CONNECTION_LIMIT));
+    let slots = Arc::new(tokio::sync::Semaphore::new(connection_limit));
     let mut stopped = stop.clone();
     loop {
         tokio::select! {
@@ -447,7 +464,7 @@ async fn accept_loop(
                             let tls = tls.clone();
                             conns.spawn(async move {
                                 let _permit = permit;
-                                serve_tls(tls, stream, shutdown).await;
+                                serve_tls(tls, stream, shutdown, handshake_timeout).await;
                             });
                         }
                         Served::Redirect(table) => {
