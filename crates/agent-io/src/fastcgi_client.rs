@@ -79,13 +79,19 @@ pub struct FastCgiConnection {
 
 impl FastCgiConnection {
     /// Whether bytes are waiting to be read, or the peer closed or broke the connection. It never
-    /// waits: a reply left on the connection would go to the next request.
+    /// waits: a reply left on the connection would go to the next request. The probe runs outside
+    /// the task budget, which makes every tokio stream poll as Pending once it is spent.
     fn has_unread_input(&mut self) -> bool {
+        let probe = std::future::poll_fn(|cx| {
+            Poll::Ready(
+                Pin::new(&mut self.buffered_stream)
+                    .poll_fill_buf(cx)
+                    .is_ready(),
+            )
+        });
+        let mut probe = std::pin::pin!(tokio::task::coop::unconstrained(probe));
         let mut cx = Context::from_waker(Waker::noop());
-        !matches!(
-            Pin::new(&mut self.buffered_stream).poll_fill_buf(&mut cx),
-            Poll::Pending
-        )
+        matches!(probe.as_mut().poll(&mut cx), Poll::Ready(true))
     }
 }
 

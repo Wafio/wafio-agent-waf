@@ -1031,6 +1031,38 @@ async fn an_idle_connection_that_got_input_or_was_closed_is_not_reused() {
     drop(c);
 }
 
+/// A task that spent its budget on ready reads polls every tokio stream as Pending. The check for
+/// waiting input must not read that as "no input".
+#[tokio::test]
+async fn input_is_seen_after_the_task_budget_is_spent() {
+    let (near, mut far) = tokio::io::duplex(64);
+    let near = Mutex::new(Some(near));
+    let mut pool = FastCgiConnectionPool::new("tcp", "fake-addr", 4, FastCgiDeadlines::default())
+        .with_dial(move || {
+            let stream = near.lock().unwrap().take().expect("dialled once");
+            Box::pin(async move { Ok(Box::new(stream) as Box<dyn FcgiStream>) })
+        });
+    Arc::get_mut(&mut pool).unwrap().keep_conn = true;
+    let conn = pool.get().await.unwrap();
+    far.write_all(b"x").await.unwrap();
+    let mut conn = Some(conn);
+    std::future::poll_fn(|cx| {
+        let mut source = tokio::io::repeat(0);
+        let mut byte = [0u8; 1];
+        for _ in 0..1000 {
+            let _ = Pin::new(&mut source).poll_read(cx, &mut ReadBuf::new(&mut byte));
+        }
+        assert!(
+            !tokio::task::coop::has_budget_remaining(),
+            "the task budget was not spent"
+        );
+        pool.put(conn.take().unwrap());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(pool.idle_count(), 0, "a connection with input was pooled");
+}
+
 #[tokio::test]
 async fn read_timeout_and_dial_error() {
     let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
