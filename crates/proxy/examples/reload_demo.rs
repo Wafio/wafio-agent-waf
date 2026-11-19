@@ -50,6 +50,7 @@ async fn run() -> std::io::Result<()> {
         rules_json: Vec::new(),
         fcgi_doc_root: String::new(),
         fcgi_index: String::new(),
+        fcgi_keep_conn: false,
         maintenance: arg("--maintenance-file")
             .and_then(|f| std::fs::read(f).ok())
             .unwrap_or_default(),

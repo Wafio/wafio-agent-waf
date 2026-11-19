@@ -309,6 +309,7 @@ mod tests {
             rules_json: Vec::new(),
             fcgi_doc_root: String::new(),
             fcgi_index: String::new(),
+            fcgi_keep_conn: false,
             maintenance: maintenance.as_bytes().to_vec(),
             analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
             tls: None,

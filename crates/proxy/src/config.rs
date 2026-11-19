@@ -59,6 +59,9 @@ pub struct AppSpec {
     pub rules_json: Vec<u8>,
     pub fcgi_doc_root: String,
     pub fcgi_index: String,
+    /// Keep FastCGI connections open between requests (nginx `fastcgi_keep_conn`); off closes
+    /// each one after its reply. Read only for an `fcgi:` upstream.
+    pub fcgi_keep_conn: bool,
     /// The `maintenance` object of the bundle app; empty = none.
     pub maintenance: Vec<u8>,
     pub analysis: Arc<AppAnalysisSetup>,

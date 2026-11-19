@@ -21,6 +21,9 @@ pub struct BundleApp {
     pub proxy_config: Vec<u8>,
     pub fcgi_doc_root: String,
     pub fcgi_index: String,
+    /// Keep FastCGI connections open between requests; the control plane sends the key only
+    /// when it is on.
+    pub fcgi_keep_conn: bool,
     pub custom_gui_rules: Vec<Vec<u8>>,
     pub custom_script_rules: Vec<Vec<u8>>,
     pub custom_tuning_rules: Vec<Vec<u8>>,
@@ -147,7 +150,7 @@ fn raw_slice(
     })
 }
 
-const APP_FIELDS: [&str; 15] = [
+const APP_FIELDS: [&str; 16] = [
     "app_id",
     "listen_host",
     "listen_port",
@@ -163,6 +166,7 @@ const APP_FIELDS: [&str; 15] = [
     "custom_script_rules",
     "custom_tuning_rules",
     "maintenance",
+    "fcgi_keep_conn",
 ];
 
 fn decode_app(
@@ -193,7 +197,8 @@ fn decode_app(
                 11 => raw_slice(d, sp, v, &mut a.custom_gui_rules)?,
                 12 => raw_slice(d, sp, v, &mut a.custom_script_rules)?,
                 13 => raw_slice(d, sp, v, &mut a.custom_tuning_rules)?,
-                _ => a.maintenance = sp.raw(v),
+                14 => a.maintenance = sp.raw(v),
+                _ => json_decode::boolean(d, v, &mut a.fcgi_keep_conn),
             }
             Ok(())
         },
@@ -307,6 +312,19 @@ mod tests {
         );
         assert!(b.apps[1].maintenance.is_empty(), "absent stays empty");
         assert_eq!(b.apps[2].maintenance, b"null".to_vec());
+    }
+
+    #[test]
+    fn fcgi_keep_conn_is_read_and_defaults_to_off() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"x","fcgi_keep_conn":true,"maintenance":{"enabled":true}},
+               {"app_id":"y"},{"app_id":"z","fcgi_keep_conn":false}]}"#,
+        )
+        .unwrap();
+        let on: Vec<bool> = b.apps.iter().map(|a| a.fcgi_keep_conn).collect();
+        assert_eq!(on, [true, false, false]);
+        assert_eq!(b.apps[0].maintenance, br#"{"enabled":true}"#.to_vec());
+        assert!(b.apps[1].maintenance.is_empty());
     }
 
     #[test]
