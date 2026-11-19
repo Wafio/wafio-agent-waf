@@ -106,38 +106,33 @@ async fn pool_exhausted_after_wait() {
     );
 }
 
-/// A write that fails is retried once on a new connection. Neither connection stays open, and the
-/// first one's slot is free for the retry although the cap is 1.
+/// A write that fails is not retried: the one connection is closed, its slot is free and the error
+/// is the write error. PHP-FPM may already be running the script, so a second copy could run it twice.
 #[tokio::test]
-async fn failed_attempts_close_their_connections() {
+async fn a_failed_write_is_not_retried() {
     let flags: CloseFlags = Arc::default();
     let dialled = flags.clone();
     let pool = FastCgiConnectionPool::new("tcp", "fake-addr", 1, FastCgiDeadlines::default())
         .with_dial(move || {
             let closed = Arc::new(AtomicBool::new(false));
-            let mut all = dialled.lock().unwrap();
-            all.push(closed.clone());
-            let broken_write = all.len() == 1;
+            dialled.lock().unwrap().push(closed.clone());
             Box::pin(async move {
                 Ok(Box::new(FakeConn {
                     closed,
-                    broken_write,
+                    broken_write: true,
                 }) as Box<dyn FcgiStream>)
             })
         });
     let err = pool
-        .send_request(b"GET", b"/", b"h", b"r", &[], b"")
+        .send_request(b"POST", b"/", b"h", b"r", &[], b"body")
         .await
         .unwrap_err();
-    assert_eq!(
-        err, "fcgi: read header: unexpected EOF",
-        "the retry did not run"
-    );
+    assert_eq!(err, "broken pipe");
     let all = flags.lock().unwrap();
-    assert_eq!(all.len(), 2);
+    assert_eq!(all.len(), 1, "the request was sent again");
     assert!(
-        all.iter().all(|f| f.load(Ordering::SeqCst)),
-        "a connection was left open"
+        all[0].load(Ordering::SeqCst),
+        "the connection was left open"
     );
     assert_eq!(pool.open_connection_count(), 0);
 }

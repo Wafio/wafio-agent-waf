@@ -334,8 +334,8 @@ impl FastCgiConnectionPool {
         params
     }
 
-    /// One request over FastCGI on its own connection, closed when this returns. A failed write is
-    /// retried once on a new connection.
+    /// One request over FastCGI on its own connection, closed when this returns. A failed write is not
+    /// retried: PHP-FPM starts the script before it has read the whole body, so a retry could run a POST twice.
     pub async fn send_request(
         self: &Arc<Self>,
         method: &[u8],
@@ -346,35 +346,16 @@ impl FastCgiConnectionPool {
         body: &[u8],
     ) -> Result<FastCgiReply, String> {
         let mut c = self.get().await?;
-        if let Err(err) = self
-            .execute(
-                &mut c,
-                method,
-                request_uri,
-                host,
-                remote_addr,
-                headers,
-                body,
-            )
-            .await
-        {
-            // The slot must be free before the retry asks for one.
-            drop(c);
-            let Ok(mut c2) = self.get().await else {
-                return Err(err);
-            };
-            self.execute(
-                &mut c2,
-                method,
-                request_uri,
-                host,
-                remote_addr,
-                headers,
-                body,
-            )
-            .await?;
-            return self.collect_reply(&mut c2).await;
-        }
+        self.execute(
+            &mut c,
+            method,
+            request_uri,
+            host,
+            remote_addr,
+            headers,
+            body,
+        )
+        .await?;
         self.collect_reply(&mut c).await
     }
 
