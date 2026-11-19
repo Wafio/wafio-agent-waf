@@ -392,8 +392,8 @@ pub struct Fake {
     pub params: Arc<Mutex<Vec<HashMap<String, String>>>>,
 }
 
-/// Minimal FastCGI responder: echoes stdin, `X-Conn: <connection number>`. It never closes a
-/// connection itself, so `open` falls only when the agent closes one.
+/// Minimal FastCGI responder: echoes stdin and the request id, `X-Conn: <connection number>`. It
+/// never closes a connection itself, so `open` falls only when the agent closes one.
 pub async fn fake_fcgi() -> (SocketAddr, Fake) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -408,6 +408,7 @@ pub async fn fake_fcgi() -> (SocketAddr, Fake) {
             tokio::spawn(async move {
                 'conn: loop {
                     let (mut params, mut stdin) = (Vec::new(), Vec::new());
+                    let mut rid = [0, 1];
                     loop {
                         let mut h = [0u8; 8];
                         if s.read_exact(&mut h).await.is_err() {
@@ -418,7 +419,10 @@ pub async fn fake_fcgi() -> (SocketAddr, Fake) {
                         s.read_exact(&mut c).await.unwrap();
                         c.truncate(len);
                         match (h[1], len) {
-                            (1, _) => f3.begin_flags.lock().unwrap().push(c[2]),
+                            (1, _) => {
+                                f3.begin_flags.lock().unwrap().push(c[2]);
+                                rid = [h[2], h[3]];
+                            }
                             (4, _) => params.extend_from_slice(&c),
                             (5, 0) => break,
                             (5, _) => stdin.extend_from_slice(&c),
@@ -436,8 +440,8 @@ pub async fn fake_fcgi() -> (SocketAddr, Fake) {
                         w.extend_from_slice(&[
                             1,
                             6,
-                            0,
-                            1,
+                            rid[0],
+                            rid[1],
                             (chunk.len() >> 8) as u8,
                             chunk.len() as u8,
                             0,
@@ -445,8 +449,9 @@ pub async fn fake_fcgi() -> (SocketAddr, Fake) {
                         ]);
                         w.extend_from_slice(chunk);
                     }
+                    w.extend_from_slice(&[1, 6, rid[0], rid[1], 0, 0, 0, 0]);
                     w.extend_from_slice(&[
-                        1, 6, 0, 1, 0, 0, 0, 0, 1, 3, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        1, 3, rid[0], rid[1], 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     ]);
                     if s.write_all(&w).await.is_err() {
                         break;
@@ -481,6 +486,12 @@ fn decode_params(mut b: &[u8]) -> HashMap<String, String> {
         b = &b[k + v..];
     }
     m
+}
+
+/// `a` with FastCGI connections kept open between requests.
+pub fn keeping_connections(mut a: wafio_proxy::AppSpec) -> wafio_proxy::AppSpec {
+    a.fcgi_keep_conn = true;
+    a
 }
 
 pub fn fcgi_app(

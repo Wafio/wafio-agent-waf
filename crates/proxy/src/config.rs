@@ -266,11 +266,13 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
                 timeout_or_default_ms(pxy.timeouts.connect_ms, 5000).max(0) as u64,
             ),
             slot_wait: Duration::from_millis(pxy.conn_wait_ms.max(0) as u64),
+            max_idle_age: resolve_idle_timeout(pxy.idle_conn_ms),
         };
         let pool = parse_upstream_spec(
             upstream,
             &app.fcgi_doc_root,
             &app.fcgi_index,
+            app.fcgi_keep_conn,
             pxy.max_conns,
             to,
         )
