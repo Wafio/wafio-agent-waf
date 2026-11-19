@@ -1,7 +1,7 @@
-//! FastCGI routes through the public API (pool semantics themselves are agent-io's tests):
-//! CGI params from the forwarded request-target, client headers, FCGI_KEEP_CONN
-//! reuse, idle connections reaped after `idle_conn_ms`, the pool closed when the route goes,
-//! PHP-FPM end to end when `php-fpm8.3` (or $WAFIO_TEST_PHP_FPM) exists.
+//! FastCGI routes through the public API (the client's own protocol tests are agent-io's):
+//! CGI params from the forwarded request-target, client headers, one connection for each
+//! request with no FCGI_KEEP_CONN, PHP-FPM end to end when `php-fpm8.3` (or $WAFIO_TEST_PHP_FPM)
+//! exists.
 
 mod common;
 
@@ -19,10 +19,13 @@ use tokio::net::TcpListener;
 struct Fake {
     accepts: Arc<AtomicUsize>,
     open: Arc<AtomicUsize>,
+    /// The flags byte of each FCGI_BEGIN_REQUEST.
+    begin_flags: Arc<Mutex<Vec<u8>>>,
     params: Arc<Mutex<Vec<HashMap<String, String>>>>,
 }
 
-/// Minimal FastCGI responder: echoes stdin, `X-Conn: <connection number>`, honours KEEP_CONN.
+/// Minimal FastCGI responder: echoes stdin, `X-Conn: <connection number>`. It never closes a connection
+/// itself, so `open` falls only when the agent closes one.
 async fn fake_fcgi() -> (SocketAddr, Fake) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -36,7 +39,7 @@ async fn fake_fcgi() -> (SocketAddr, Fake) {
             let f3 = f2.clone();
             tokio::spawn(async move {
                 'conn: loop {
-                    let (mut keep, mut params, mut stdin) = (false, Vec::new(), Vec::new());
+                    let (mut params, mut stdin) = (Vec::new(), Vec::new());
                     loop {
                         let mut h = [0u8; 8];
                         if s.read_exact(&mut h).await.is_err() {
@@ -47,7 +50,7 @@ async fn fake_fcgi() -> (SocketAddr, Fake) {
                         s.read_exact(&mut c).await.unwrap();
                         c.truncate(len);
                         match (h[1], len) {
-                            (1, _) => keep = c[2] & 1 == 1,
+                            (1, _) => f3.begin_flags.lock().unwrap().push(c[2]),
                             (4, _) => params.extend_from_slice(&c),
                             (5, 0) => break,
                             (5, _) => stdin.extend_from_slice(&c),
@@ -77,7 +80,7 @@ async fn fake_fcgi() -> (SocketAddr, Fake) {
                     w.extend_from_slice(&[
                         1, 6, 0, 1, 0, 0, 0, 0, 1, 3, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     ]);
-                    if s.write_all(&w).await.is_err() || !keep {
+                    if s.write_all(&w).await.is_err() {
                         break;
                     }
                 }
@@ -151,9 +154,10 @@ async fn route_answers_over_fastcgi_with_cgi_params() {
     let resp = c.send(&get("/index.php")).await.unwrap();
     assert_eq!(
         (resp.status, resp.header("x-conn")),
-        (201, Some("1")),
-        "FCGI_KEEP_CONN connection reused"
+        (201, Some("2")),
+        "a new connection for the second request"
     );
+    assert_eq!(*fake.begin_flags.lock().unwrap(), [0, 0]);
     let p = fake.params.lock().unwrap()[0].clone();
     // PHP routes on the forwarded (decoded, dot-resolved, re-quoted) target.
     assert_eq!(p["REQUEST_URI"], "/a/b%20c.php?x=1");
@@ -201,37 +205,26 @@ async fn client_spelling_of_agent_headers_and_proxy_never_reach_php() {
 }
 
 #[tokio::test]
-async fn idle_connection_is_reaped_and_route_removal_closes_the_pool() {
+async fn no_connection_stays_open_after_a_request() {
     let (addr, fake) = fake_fcgi().await;
-    let (p1, p2) = (free_port(), free_port());
-    let (h, proxy) = Harness::serve(vec![fcgi_app(
-        p1,
+    let (_h, proxy) = Harness::serve(vec![fcgi_app(
+        free_port(),
         format!("fcgi://{addr}"),
         "/srv",
-        r#"{"idle_conn_ms":200}"#,
+        "",
     )]);
-    assert_eq!(one(proxy, &get("/")).await.status, 201);
-    assert_eq!(fake.open.load(Ordering::SeqCst), 1);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..3 {
+        assert_eq!(one(proxy, &get("/")).await.status, 201);
+    }
+    let end = Instant::now() + Duration::from_secs(5);
+    while fake.open.load(Ordering::SeqCst) != 0 && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(fake.accepts.load(Ordering::SeqCst), 3);
     assert_eq!(
         fake.open.load(Ordering::SeqCst),
         0,
-        "reaper closed the idle connection (slot released)"
-    );
-
-    // A long-lived pool: its kept connection pins a PHP-FPM worker until the route goes.
-    h.proxy
-        .apply(vec![fcgi_app(p2, format!("fcgi://{addr}"), "/srv", "")])
-        .unwrap();
-    let p2: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
-    assert_eq!(one(p2, &get("/")).await.status, 201);
-    assert_eq!(fake.open.load(Ordering::SeqCst), 1);
-    h.proxy.apply(vec![]).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        fake.open.load(Ordering::SeqCst),
-        0,
-        "pooled FastCGI connection of the removed route closed"
+        "the agent closed each connection (slot released)"
     );
 }
 
@@ -311,7 +304,7 @@ fn start_fpm(bin: &str, max_children: usize) -> Fpm {
 }
 
 #[tokio::test]
-async fn php_fpm_end_to_end_and_keep_conn() {
+async fn php_fpm_end_to_end() {
     let Some(bin) = php_fpm() else {
         return eprintln!("skipped: no php-fpm");
     };
@@ -333,13 +326,8 @@ async fn php_fpm_end_to_end_and_keep_conn() {
         r1.text(),
         format!("POST {}/index.php hello", fpm.root.display())
     );
-    let worker = r1.header("x-worker").unwrap().to_string();
     for _ in 0..5 {
         let r = c.send(&get("/")).await.unwrap();
-        assert_eq!(
-            r.header("x-worker"),
-            Some(worker.as_str()),
-            "same kept connection, same worker"
-        );
+        assert_eq!(r.status, 201, "{:?}", r.text());
     }
 }
