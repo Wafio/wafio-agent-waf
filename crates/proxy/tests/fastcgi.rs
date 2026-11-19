@@ -1,10 +1,12 @@
 //! FastCGI routes through the public API (the client's own protocol tests are agent-io's):
 //! CGI params from the forwarded request-target, client headers, one connection for each
-//! request with no FCGI_KEEP_CONN, PHP-FPM end to end when `php-fpm8.3` (or $WAFIO_TEST_PHP_FPM)
-//! exists.
+//! request with no FCGI_KEEP_CONN by default, connections kept and reused when the app asks
+//! for it, idle connections reaped after `idle_conn_ms`, the pool closed when the route goes,
+//! PHP-FPM end to end when `php-fpm8.3` (or $WAFIO_TEST_PHP_FPM) exists.
 
 mod common;
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -112,6 +114,65 @@ async fn no_connection_stays_open_after_a_request() {
 }
 
 #[tokio::test]
+async fn an_app_that_keeps_connections_reuses_one_with_keep_conn_set() {
+    let (addr, fake) = fake_fcgi().await;
+    let (_h, proxy) = Harness::serve(vec![keeping_connections(fcgi_app(
+        free_port(),
+        format!("fcgi://{addr}"),
+        "/srv",
+        "",
+    ))]);
+    let mut c = Client::connect(proxy).await.unwrap();
+    for _ in 0..3 {
+        let resp = c.send(&get("/")).await.unwrap();
+        assert_eq!((resp.status, resp.header("x-conn")), (201, Some("1")));
+    }
+    assert_eq!(fake.accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(*fake.begin_flags.lock().unwrap(), [1, 1, 1]);
+    assert_eq!(fake.open.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn idle_connection_is_reaped_and_route_removal_closes_the_pool() {
+    let (addr, fake) = fake_fcgi().await;
+    let (p1, p2) = (free_port(), free_port());
+    let (h, proxy) = Harness::serve(vec![keeping_connections(fcgi_app(
+        p1,
+        format!("fcgi://{addr}"),
+        "/srv",
+        r#"{"idle_conn_ms":200}"#,
+    ))]);
+    assert_eq!(one(proxy, &get("/")).await.status, 201);
+    assert_eq!(fake.open.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fake.open.load(Ordering::SeqCst),
+        0,
+        "reaper closed the idle connection (slot released)"
+    );
+
+    // A long-lived pool: its kept connection pins a PHP-FPM worker until the route goes.
+    h.proxy
+        .apply(vec![keeping_connections(fcgi_app(
+            p2,
+            format!("fcgi://{addr}"),
+            "/srv",
+            "",
+        ))])
+        .unwrap();
+    let p2: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
+    assert_eq!(one(p2, &get("/")).await.status, 201);
+    assert_eq!(fake.open.load(Ordering::SeqCst), 1);
+    h.proxy.apply(vec![]).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fake.open.load(Ordering::SeqCst),
+        0,
+        "pooled FastCGI connection of the removed route closed"
+    );
+}
+
+#[tokio::test]
 async fn fastcgi_down_is_502() {
     let port = free_port();
     let (h, proxy) = Harness::serve(vec![fcgi_app(
@@ -212,5 +273,38 @@ async fn php_fpm_end_to_end() {
     for _ in 0..5 {
         let r = c.send(&get("/")).await.unwrap();
         assert_eq!(r.status, 201, "{:?}", r.text());
+    }
+}
+
+#[tokio::test]
+async fn php_fpm_with_keep_conn_serves_every_request_from_one_worker() {
+    let Some(bin) = php_fpm() else {
+        return eprintln!("skipped: no php-fpm");
+    };
+    let fpm = start_fpm(&bin, 2);
+    let (_h, proxy) = Harness::serve(vec![keeping_connections(fcgi_app(
+        free_port(),
+        format!("fcgi://{}", fpm.addr),
+        &fpm.root.display().to_string(),
+        "",
+    ))]);
+    let mut c = Client::connect(proxy).await.unwrap();
+    let r1 = c
+        .send(&post("/app/route", "text/plain", b"hello"))
+        .await
+        .unwrap();
+    assert_eq!(r1.status, 201, "{:?}", r1.text());
+    assert_eq!(
+        r1.text(),
+        format!("POST {}/index.php hello", fpm.root.display())
+    );
+    let worker = r1.header("x-worker").unwrap().to_string();
+    for _ in 0..5 {
+        let r = c.send(&get("/")).await.unwrap();
+        assert_eq!(
+            r.header("x-worker"),
+            Some(worker.as_str()),
+            "the kept connection stays on one worker"
+        );
     }
 }

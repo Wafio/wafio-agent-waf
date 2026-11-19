@@ -295,6 +295,7 @@ fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>, tls: Option<TlsSit
         rules_json: app.rules_json.clone(),
         fcgi_doc_root: app.fcgi_doc_root.clone(),
         fcgi_index: app.fcgi_index.clone(),
+        fcgi_keep_conn: app.fcgi_keep_conn,
         maintenance: app.maintenance.clone(),
         analysis: executor,
         tls,

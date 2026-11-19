@@ -230,6 +230,28 @@ them. The counter `wafio_waf_maintenance_responses_total` counts the answers, pr
 The agent accepts control messages of at most 4 MiB, a bundle included (tonic's limit, set explicitly). The control plane keeps a bundle
 under it; a larger one would end the stream and the agent would keep its last bundle.
 
+## FastCGI upstreams
+
+An app whose upstream starts with `fcgi:` talks FastCGI to PHP-FPM, over a Unix socket (`fcgi:unix:/run/php/php-fpm.sock`) or
+TCP (`fcgi://127.0.0.1:9000`). The bundle keys `fcgi_doc_root` and `fcgi_index` say where the scripts are.
+
+The option `fcgi_keep_conn` is off by default, as nginx without `fastcgi_keep_conn`. The agent then opens one connection for each
+request, sends FCGI_BEGIN_REQUEST without FCGI_KEEP_CONN and closes the connection after the reply. The open connections are still
+limited to `max_conns` of the app's `proxy_config`. The control plane sends the bundle key `fcgi_keep_conn: true` only when the
+option is on for the app, and an agent that does not know the key ignores it.
+
+With the option on, the agent sends FCGI_KEEP_CONN, puts the connection back in a pool after the reply and reuses the newest idle one
+until it has been idle for `idle_conn_ms`. A kept connection pins one PHP-FPM worker while it is open.
+
+Turn it on only when PHP is at least 8.2.36, 8.3.37, 8.4.28 or 8.5.13 for its 8.2, 8.3, 8.4 or 8.5 series. On any other series leave
+it off. PHP-FPM before these releases runs request body bytes that the application left unread as a second request on a kept
+connection (CVE-2026-129289). The agent takes two precautions on a kept connection: every request carries a random id, and a reply
+record with another id breaks the connection and fails the request with 502; a connection with input waiting is closed instead of
+pooled or reused. These checks narrow the risk. They do not replace the PHP update.
+
+With the option on or off, the agent never sends a request again after a write to PHP-FPM failed: the script may already be running,
+and a second copy could run a POST twice.
+
 ## Script rules
 
 The agent runs the script rules of a bundle with the uddin interpreter (crate `uddin-waf`), in its own process. There is no
