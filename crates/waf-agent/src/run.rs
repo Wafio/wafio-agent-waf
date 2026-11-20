@@ -24,6 +24,7 @@ use crate::executor::{Stores, startup_executor};
 use crate::flags::{AgentArgs, OsEnv};
 use crate::ready::{Ready, ReadyActions};
 use crate::reload::{UpgradeState, spawn_successor};
+use crate::tls::dir::KeyDir;
 
 /// The control link, once created (the proxy's decision sink exists before it).
 static LINK: OnceLock<Arc<ControlLink>> = OnceLock::new();
@@ -32,6 +33,8 @@ static LINK: OnceLock<Arc<ControlLink>> = OnceLock::new();
 const READY_FALLBACK: Duration = Duration::from_secs(20);
 /// Store cleaner period.
 const CLEANUP_EVERY: Duration = Duration::from_secs(120);
+/// How often a process that is waiting for the key directory lock tries to take it.
+const KEY_LOCK_POLL: Duration = Duration::from_millis(200);
 /// FireHOL refresh period.
 const IPREP_REFRESH: Duration = Duration::from_secs(24 * 3600);
 /// The `Hello.features` entry of an agent that serves the maintenance page.
@@ -249,7 +252,12 @@ fn apply_challenge_limit(name: &str, parse: fn(&str) -> (i64, bool), set: fn(i64
 }
 
 /// Everything after flag validation and the engine environment export. Runs inside the Tokio runtime.
-pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), String> {
+/// `keys` is the key directory, opened at start; without one the apps' `tls` objects are ignored.
+pub async fn run_waf_agent(
+    f: AgentArgs,
+    metrics_addr: String,
+    keys: Option<KeyDir>,
+) -> Result<(), String> {
     // Successor side of an upgrade: take the predecessor's sockets before anything else
     // (it waits on the handover while this process does its first handshake).
     let mut inherited: HashMap<String, StdListener> =
@@ -378,21 +386,17 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
     }));
     opts.inherited = inherited;
     let proxy = Arc::new(wafio_proxy::Proxy::new(opts));
-    let tls_sites = if f.tls_sites_file.is_empty() {
-        HashMap::new()
-    } else {
-        crate::tls_sites::load(&f.tls_sites_file)?
-    };
-    let agent = Arc::new(
-        Agent::new(
-            base,
-            stores,
-            proxy.clone(),
-            good_bots.clone(),
-            ready.clone(),
-        )
-        .with_tls_sites(tls_sites),
+    let mut agent = Agent::new(
+        base,
+        stores,
+        proxy.clone(),
+        good_bots.clone(),
+        ready.clone(),
     );
+    if let Some(dir) = keys {
+        agent = agent.with_key_dir(dir);
+    }
+    let agent = Arc::new(agent);
 
     let link = ControlLink::new(
         cfg,
@@ -502,6 +506,27 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
         }
     });
 
+    // A process that finds the key directory lock taken (the one it replaces holds it until it has
+    // stopped accepting) takes it as soon as it is free.
+    if agent.waits_for_keys() {
+        info!(
+            "[tls] another process holds the key directory lock: this one reads what that one wrote and writes nothing in it until that one lets go"
+        );
+        let a = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(KEY_LOCK_POLL).await;
+                let a = a.clone();
+                if tokio::task::spawn_blocking(move || a.take_over_keys())
+                    .await
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+        });
+    }
+
     let stream = link.start();
     let upgrade = UpgradeState::default();
     let handed_over = loop {
@@ -542,6 +567,10 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
     }
     stream.abort();
     agent.close();
+    // A successor writes in the key directory from the moment this process no longer accepts.
+    proxy.stop_accepting(handed_over).await;
+    let a = agent.clone();
+    let _ = tokio::task::spawn_blocking(move || a.release_keys()).await;
     proxy.shutdown(handed_over).await;
     Ok(())
 }

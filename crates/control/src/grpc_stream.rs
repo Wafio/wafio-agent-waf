@@ -1,7 +1,7 @@
 //! The WAF agent's mTLS gRPC stream to the control plane (`AgentControl.Stream`). Its state lives
 //! in one [`ControlLink`] per process.
 
-use crate::bundle_cache::BUNDLE_SOURCE_LIVE;
+use crate::bundle_cache::{BUNDLE_SOURCE_LIVE, CacheStart, CachedBundle};
 use crate::bundle_puller::{BundleError, BundleProbe, BundleSink, is_management_only};
 use crate::certificates::{AckCode, CertificateSink, run_install};
 use crate::grpc_reconnect::{
@@ -42,7 +42,8 @@ pub const DEFAULT_SECURITY_DATA_DIR: &str = "/etc/wafio/security-data";
 /// Retry bounds for a WAF configuration bundle whose apply failed.
 pub(crate) const WAF_BUNDLE_RETRY_MIN: Duration = Duration::from_secs(2);
 pub(crate) const WAF_BUNDLE_RETRY_MAX: Duration = Duration::from_secs(60);
-/// About 8 minutes of retries; a bundle refused for good must not cost a rebuild forever.
+/// About 8 minutes of retries; a bundle refused for good must not cost a rebuild forever. A bundle
+/// refused because an address is taken is another case: it retries without a limit.
 pub(crate) const WAF_BUNDLE_RETRY_ATTEMPTS: u32 = 10;
 
 /// The security-data components of the agent profile.
@@ -311,6 +312,9 @@ pub struct ControlLink {
     statuses: Mutex<BTreeMap<String, CertificateStatus>>,
     /// Wakes the status task; one pending wake-up is enough, as it drains `statuses`.
     status_wake: mpsc::Sender<()>,
+    /// Orders the applies and retries of bundles, the cached one at start included, so a retry
+    /// never lands after a newer bundle.
+    bundle_retry: Arc<BundleRetry>,
 }
 
 impl ControlLink {
@@ -328,6 +332,7 @@ impl ControlLink {
             malware_lock: tokio::sync::Mutex::const_new(()),
             statuses: Mutex::new(BTreeMap::new()),
             status_wake,
+            bundle_retry: Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX)),
         });
         (link.hooks.on_dial)(&link.config().server_address);
         if let Some(rx) = link.telemetry.rx.lock().unwrap().take() {
@@ -396,22 +401,33 @@ impl ControlLink {
         }
     }
 
-    /// Apply the cached bundle, then keep the stream up with backoff. Abort the handle to
-    /// stop.
+    /// Apply the cached bundle, then keep the stream up with backoff. A cached bundle that cannot
+    /// bind an address is applied again every minute until it binds or a live bundle arrives.
+    /// Abort the handle to stop: that ends every bundle retry too.
     pub fn start(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let link = self.clone();
         tokio::spawn(async move {
             let l = link.clone();
-            let _ = tokio::task::spawn_blocking(move || l.install_cached_bundle()).await;
-            link.run_stream_loop().await;
+            // Bundle retries outlive a stream and end with this task.
+            let mut retries = JoinSet::new();
+            if let Ok(CacheStart::Bind(cached)) =
+                tokio::task::spawn_blocking(move || l.install_cached_bundle()).await
+            {
+                let generation = cached.generation;
+                let attempt = link.cached_attempt(cached);
+                link.bundle_retry
+                    .retry_cached(generation, attempt, &mut retries)
+                    .await;
+            }
+            link.run_stream_loop(&mut retries).await;
         })
     }
 
-    async fn run_stream_loop(self: Arc<Self>) {
+    async fn run_stream_loop(self: Arc<Self>, retries: &mut JoinSet<()>) {
         let mut backoff = ReconnectBackoff::default();
         loop {
             let started = Instant::now();
-            let res = self.connect_and_serve().await;
+            let res = self.connect_and_serve(retries).await;
             let wait = backoff.delay(started.elapsed());
             if let Err(e) = res {
                 info!(
@@ -423,13 +439,16 @@ impl ControlLink {
         }
     }
 
-    async fn connect_and_serve(self: &Arc<Self>) -> Result<(), LinkError> {
+    async fn connect_and_serve(
+        self: &Arc<Self>,
+        retries: &mut JoinSet<()>,
+    ) -> Result<(), LinkError> {
         let cfg = self.config();
         (self.hooks.on_dial)(&cfg.server_address);
         let client = connect(&cfg).await?;
         let (tx, rx) = mpsc::channel(STREAM_SEND_BUFFER);
         let (send, alive) = StreamSender::new(tx);
-        let retry = Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX));
+        let retry = self.bundle_retry.clone();
 
         let known_gen = *self.last_gen.lock().unwrap();
         send.send(hello(&cfg, known_gen))
@@ -450,7 +469,7 @@ impl ControlLink {
             cfg.server_address, cfg.agent_name
         );
 
-        // Everything this stream starts ends with it.
+        // Everything this stream starts ends with it, except a bundle retry.
         let mut tasks = JoinSet::new();
         tasks.spawn(self.clone().heartbeat_loop(send.clone()));
 
@@ -462,6 +481,7 @@ impl ControlLink {
             .into_inner();
         loop {
             while tasks.try_join_next().is_some() {}
+            while retries.try_join_next().is_some() {}
             let msg = match inbound.message().await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Ok(()),
@@ -473,8 +493,11 @@ impl ControlLink {
                     tasks.spawn(self.clone().on_welcome(client.clone(), send.clone()));
                 }
                 Some(In::Bundle(bu)) => {
+                    // The retry outlives this stream: a reconnect does not wait for an address to
+                    // come free, and its ack on the closed stream is dropped (the next hello
+                    // carries the generation).
                     retry
-                        .handle(bu, self.bundle_attempt(), send.clone(), &mut tasks)
+                        .handle(bu, self.bundle_attempt(), send.clone(), retries)
                         .await
                 }
                 Some(In::KeyRotation(kr)) => {
@@ -595,9 +618,20 @@ impl ControlLink {
         Arc::new(move |bu: &BundleUpdate| link.apply_bundle_update(bu))
     }
 
+    /// Applies the cached bundle `cached` again. It is the bundle the attempt carries, not the one
+    /// it is given.
+    fn cached_attempt(self: &Arc<Self>, cached: CachedBundle) -> Attempt {
+        let link = self.clone();
+        Arc::new(move |_| match link.apply_cached_bundle(&cached) {
+            Ok(()) => (Retry::No, Ok(())),
+            Err(BundleError::Bind(e)) => (Retry::UntilBound, Err(e)),
+            Err(e) => (Retry::No, Err(e.to_string())),
+        })
+    }
+
     /// Decodes and applies a bundle update, and on success records the generation, the
-    /// provenance and the cache. Returns whether a later attempt could succeed.
-    pub(crate) fn apply_bundle_update(&self, bu: &BundleUpdate) -> (bool, Result<(), String>) {
+    /// provenance and the cache. Returns whether and how a later attempt could succeed.
+    pub(crate) fn apply_bundle_update(&self, bu: &BundleUpdate) -> (Retry, Result<(), String>) {
         let probe = match BundleProbe::parse(&bu.bundle_json) {
             Ok(p) => p,
             Err(e) => {
@@ -605,7 +639,7 @@ impl ControlLink {
                 // reads four fields only.
                 let e = self.sink().check(&bu.bundle_json).err().unwrap_or(e);
                 info!("[agent-grpc] decode bundle: {e}");
-                return (false, Err(e));
+                return (Retry::No, Err(e));
             }
         };
         // The control plane's generation wins over the embedded one.
@@ -618,16 +652,18 @@ impl ControlLink {
             Ok(()) => {}
             Err(BundleError::Decode(e)) => {
                 info!("[agent-grpc] decode bundle: {e}");
-                return (false, Err(e));
+                return (Retry::No, Err(e));
             }
-            Err(BundleError::Apply(e)) => return (!probe.management_only, Err(e)),
+            Err(BundleError::Apply(e)) if probe.management_only => return (Retry::No, Err(e)),
+            Err(BundleError::Apply(e)) => return (Retry::Backoff, Err(e)),
+            Err(BundleError::Bind(e)) => return (Retry::UntilBound, Err(e)),
         }
         if !probe.management_only {
             *self.last_gen.lock().unwrap() = generation;
             self.set_bundle_status(BUNDLE_SOURCE_LIVE, generation);
             self.save_applied_bundle(&bu.bundle_json, generation);
         }
-        (false, Ok(()))
+        (Retry::No, Ok(()))
     }
 
     /// The observer, then the "applied" log line for configuration bundles.
@@ -1000,13 +1036,26 @@ async fn send_certificate_statuses(link: Weak<ControlLink>, mut wake: mpsc::Rece
     }
 }
 
-/// One apply of a bundle: (retryable, result).
-pub(crate) type Attempt = Arc<dyn Fn(&BundleUpdate) -> (bool, Result<(), String>) + Send + Sync>;
+/// What follows a failed apply of a bundle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retry {
+    /// Nothing: the same bundle would fail the same way.
+    No,
+    /// Again with a growing wait, a limited number of times.
+    Backoff,
+    /// Again at the longest wait, without a limit: an address stays taken for as long as the
+    /// program that holds it runs.
+    UntilBound,
+}
 
-/// Re-applies the newest failed configuration bundle with backoff until
-/// it applies (then acks it ok under its command id), a newer bundle arrives, the attempts
-/// run out, or the stream ends (the retry runs in the stream's task set). Applies are
-/// serialised through `seq`, so a retry never lands after a newer bundle.
+/// One apply of a bundle: (what follows a failure, result).
+pub(crate) type Attempt = Arc<dyn Fn(&BundleUpdate) -> (Retry, Result<(), String>) + Send + Sync>;
+
+/// Re-applies the newest failed configuration bundle with backoff until it applies (then acks it
+/// ok under its command id), a newer bundle arrives, the attempts run out, or the link stops: the
+/// retry runs in the task set of `start`, so a stream that ends does not end it. Applies are
+/// serialised through `seq`, so a retry never lands after a newer bundle. The cached bundle of
+/// the start is retried the same way, and a live bundle ends that retry.
 pub(crate) struct BundleRetry {
     seq: tokio::sync::Mutex<u64>,
     min_wait: Duration,
@@ -1040,48 +1089,81 @@ impl BundleRetry {
             *seq += 1; // supersedes any pending retry
         }
         let my_seq = *seq;
-        let (retryable, res) = run_attempt(&attempt, &bu).await;
+        let (retry, res) = run_attempt(&attempt, &bu).await;
         drop(seq);
         send_bundle_ack(&send, &bu.command_id, &res).await;
         let Err(e) = res else { return };
-        if !retryable || management {
+        if retry == Retry::No || management {
             return;
         }
         info!(
             "[agent-grpc] WAF bundle generation {} not applied: {e} (retrying)",
             bu.generation
         );
-        tasks.spawn(self.clone().run_retries(bu, attempt, send, my_seq));
+        tasks.spawn(
+            self.clone()
+                .run_retries(bu, attempt, Some(send), my_seq, retry),
+        );
     }
 
+    /// Retries the cached bundle of `generation` that could not bind an address, without a limit.
+    /// `attempt` applies it. Call before the stream starts: any bundle that arrives later ends
+    /// the retry.
+    pub(crate) async fn retry_cached(
+        self: &Arc<Self>,
+        generation: i64,
+        attempt: Attempt,
+        tasks: &mut JoinSet<()>,
+    ) {
+        let bu = Arc::new(BundleUpdate {
+            generation,
+            ..Default::default()
+        });
+        let my_seq = *self.seq.lock().await;
+        tasks.spawn(
+            self.clone()
+                .run_retries(bu, attempt, None, my_seq, Retry::UntilBound),
+        );
+    }
+
+    /// `send` is where the ack of a retry that applies goes; the cached bundle has none.
     async fn run_retries(
         self: Arc<Self>,
         bu: Arc<BundleUpdate>,
         attempt: Attempt,
-        send: StreamSender,
+        send: Option<StreamSender>,
         my_seq: u64,
+        mut retry: Retry,
     ) {
         let mut wait = self.min_wait;
         let mut n = 1;
         loop {
-            tokio::time::sleep(wait).await;
+            tokio::time::sleep(if retry == Retry::UntilBound {
+                self.max_wait
+            } else {
+                wait
+            })
+            .await;
             let seq = self.seq.lock().await;
             if *seq != my_seq {
                 return; // a newer bundle arrived
             }
-            let (retryable, res) = run_attempt(&attempt, &bu).await;
+            let (next, res) = run_attempt(&attempt, &bu).await;
             drop(seq);
+            retry = next;
             match res {
                 Ok(()) => {
                     info!(
                         "[agent-grpc] WAF bundle generation {} applied on retry",
                         bu.generation
                     );
-                    send_bundle_ack(&send, &bu.command_id, &Ok(())).await;
+                    if let Some(send) = &send {
+                        send_bundle_ack(send, &bu.command_id, &Ok(())).await;
+                    }
                     return;
                 }
-                Err(_) if !retryable => return,
-                Err(e) if n >= WAF_BUNDLE_RETRY_ATTEMPTS => {
+                Err(_) if retry == Retry::No => return,
+                Err(e) if retry == Retry::Backoff && n >= WAF_BUNDLE_RETRY_ATTEMPTS => {
                     info!(
                         "[agent-grpc] WAF bundle generation {} still not applied after {n} retries: {e} (giving up until the next bundle or reconnect)",
                         bu.generation
@@ -1090,18 +1172,20 @@ impl BundleRetry {
                 }
                 Err(_) => {}
             }
-            wait = (wait * 2).min(self.max_wait);
-            n += 1;
+            if retry == Retry::Backoff {
+                wait = (wait * 2).min(self.max_wait);
+                n += 1;
+            }
         }
     }
 }
 
 /// Runs the (blocking) apply off the async workers. A panicking sink is a retryable failure.
-async fn run_attempt(attempt: &Attempt, bu: &Arc<BundleUpdate>) -> (bool, Result<(), String>) {
+async fn run_attempt(attempt: &Attempt, bu: &Arc<BundleUpdate>) -> (Retry, Result<(), String>) {
     let (a, b) = (attempt.clone(), bu.clone());
     tokio::task::spawn_blocking(move || a(&b))
         .await
-        .unwrap_or_else(|_| (true, Err("bundle apply panicked".into())))
+        .unwrap_or_else(|_| (Retry::Backoff, Err("bundle apply panicked".into())))
 }
 
 #[derive(serde::Serialize)]
@@ -1264,9 +1348,12 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             if c.fetch_add(1, Ordering::SeqCst) < 2 {
-                (true, Err("WAF bundle observer is not ready".into()))
+                (
+                    Retry::Backoff,
+                    Err("WAF bundle observer is not ready".into()),
+                )
             } else {
-                (false, Ok(()))
+                (Retry::No, Ok(()))
             }
         });
         let r = Arc::new(BundleRetry::new(
@@ -1288,7 +1375,7 @@ mod tests {
         assert!(got[1].ok && got[1].command_id == "init-1");
     }
 
-    // A newer bundle supersedes the retry of an older one; a retry ends with the stream.
+    // A newer bundle supersedes the retry of an older one; a retry ends with its task set.
     #[tokio::test]
     async fn bundle_retry_superseded_and_stream_bound() {
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -1296,10 +1383,10 @@ mod tests {
         let attempt: Attempt = Arc::new(move |b: &BundleUpdate| {
             if b.command_id == "old" {
                 a.lock().unwrap().push("old-failed".to_string());
-                return (true, Err("bind failed".into()));
+                return (Retry::Backoff, Err("bind failed".into()));
             }
             a.lock().unwrap().push(b.command_id.clone());
-            (false, Ok(()))
+            (Retry::No, Ok(()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(5),
@@ -1318,7 +1405,7 @@ mod tests {
         let c = calls.clone();
         let failing: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("still failing".into()))
+            (Retry::Backoff, Err("still failing".into()))
         });
         let r2 = Arc::new(BundleRetry::new(
             Duration::from_millis(5),
@@ -1326,7 +1413,7 @@ mod tests {
         ));
         let mut tasks2 = JoinSet::new();
         r2.handle(bu("x", 3, "{}"), failing, s, &mut tasks2).await;
-        drop(tasks2); // stream ended
+        drop(tasks2); // the link stopped
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -1338,7 +1425,7 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("unsupported unblock command".into()))
+            (Retry::Backoff, Err("unsupported unblock command".into()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(1),
@@ -1364,7 +1451,7 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("port taken".into()))
+            (Retry::Backoff, Err("port taken".into()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(1),
@@ -1379,6 +1466,177 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1 + WAF_BUNDLE_RETRY_ATTEMPTS);
+    }
+
+    /// An address that stays taken is tried again every minute and never given up on, long past
+    /// the ten attempts of any other refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_bind_failure_retries_every_minute_without_a_limit() {
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (t, b) = (times.clone(), bound.clone());
+        let attempt: Attempt = Arc::new(move |_| {
+            t.lock().unwrap().push(tokio::time::Instant::now());
+            if b.load(Ordering::SeqCst) {
+                (Retry::No, Ok(()))
+            } else {
+                (
+                    Retry::UntilBound,
+                    Err("failed to bind WAF route listener".into()),
+                )
+            }
+        });
+        let r = Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX));
+        let (s, _alive, mut rx) = sender();
+        let mut tasks = JoinSet::new();
+        r.handle(bu("g", 9, "{}"), attempt, s, &mut tasks).await;
+        assert_eq!(times.lock().unwrap().len(), 1);
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(times.lock().unwrap().len(), 1, "not before a minute");
+        tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+        let tried = times.lock().unwrap().clone();
+        assert!(
+            tried.len() > 1 + WAF_BUNDLE_RETRY_ATTEMPTS as usize,
+            "still trying after half an hour: {} attempts",
+            tried.len()
+        );
+        assert!(
+            tried
+                .windows(2)
+                .all(|w| w[1] - w[0] >= Duration::from_secs(60)),
+            "no attempt sooner than a minute after the one before"
+        );
+        assert!(!tasks.is_empty(), "the retry is still waiting");
+
+        bound.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let got = acks(&mut rx);
+        assert!(
+            got.last().is_some_and(|a| a.ok && a.command_id == "g"),
+            "{got:?}"
+        );
+    }
+
+    struct BindSink;
+    impl BundleSink for BindSink {
+        fn apply(&self, _: &[u8], _: i64) -> Result<(), BundleError> {
+            Err(BundleError::Bind(
+                "failed to bind WAF route listener".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bind_error_of_the_sink_is_retried_until_it_binds() {
+        let l = bare_link_with(Arc::new(BindSink));
+        let (retry, res) = l.apply_bundle_update(&bu("g", 7, "{}"));
+        assert_eq!(retry, Retry::UntilBound);
+        assert_eq!(res.unwrap_err(), "failed to bind WAF route listener");
+        assert_eq!(*l.last_gen.lock().unwrap(), 0);
+    }
+
+    /// Cannot bind for its first `bind_failures` applies, then applies.
+    struct BindThenOk {
+        calls: AtomicU32,
+        bind_failures: u32,
+    }
+
+    impl BundleSink for BindThenOk {
+        fn apply(&self, _: &[u8], _: i64) -> Result<(), BundleError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.bind_failures {
+                Err(BundleError::Bind(
+                    "failed to bind WAF route listener".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A link not yet started, whose state directory holds a cached bundle of `generation`.
+    fn link_with_cache(
+        tag: &str,
+        sink: Arc<BindThenOk>,
+        generation: i64,
+    ) -> (Arc<ControlLink>, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("wafio-cache-retry-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = format!(r#"{{"agent_id":"a","generation":{generation},"apps":[]}}"#);
+        crate::bundle_cache::save_bundle_cache(
+            &dir,
+            bundle.as_bytes(),
+            generation,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let link = bare_link_with(sink);
+        link.control_config.lock().unwrap().state_dir = dir.to_string_lossy().into_owned();
+        (link, dir)
+    }
+
+    /// With the control plane out of reach and another program on the address, the agent still
+    /// comes up from its cache once the address is free.
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_bundle_that_cannot_bind_is_applied_every_minute_until_it_binds() {
+        let sink = Arc::new(BindThenOk {
+            calls: AtomicU32::new(0),
+            bind_failures: 2,
+        });
+        let (l, dir) = link_with_cache("until-bound", sink.clone(), 5);
+        let task = l.start();
+        let calls = || sink.calls.load(Ordering::SeqCst);
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(calls(), 1, "the start applies it once, the retry waits");
+        assert_eq!(l.bundle_status(), (String::new(), 0));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(calls(), 2);
+        assert_eq!(l.bundle_status(), (String::new(), 0));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(calls(), 3, "bound at about 120 seconds");
+        assert_eq!(l.bundle_status(), ("cache".to_string(), 5));
+        assert_eq!(*l.last_gen.lock().unwrap(), 5);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(calls(), 3, "applied once, not again");
+        task.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_bundle_ends_the_retry_of_the_cached_one() {
+        let sink = Arc::new(BindThenOk {
+            calls: AtomicU32::new(0),
+            bind_failures: 2,
+        });
+        let (l, dir) = link_with_cache("superseded", sink.clone(), 5);
+        let task = l.start();
+        let calls = || sink.calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(calls(), 2);
+
+        let (s, _alive, _rx) = sender();
+        let mut tasks = JoinSet::new();
+        l.bundle_retry
+            .handle(bu("live", 9, "{}"), l.bundle_attempt(), s, &mut tasks)
+            .await;
+        assert_eq!(calls(), 3);
+        assert_eq!(l.bundle_status(), ("live".to_string(), 9));
+
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            calls(),
+            3,
+            "the cached bundle is not applied after a live one"
+        );
+        assert_eq!(l.bundle_status(), ("live".to_string(), 9));
+        task.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -1483,17 +1741,17 @@ mod tests {
     async fn negative_ack_keeps_generation_and_no_percentiles_without_samples() {
         let l = bare_link();
         *l.last_gen.lock().unwrap() = 5;
-        let (retryable, res) = l.apply_bundle_update(&bu("failed", 999, "{}"));
-        assert!(retryable && res.is_err());
+        let (retry, res) = l.apply_bundle_update(&bu("failed", 999, "{}"));
+        assert!(retry == Retry::Backoff && res.is_err());
         assert_eq!(*l.last_gen.lock().unwrap(), 5);
         assert_eq!(l.bundle_status(), (String::new(), 0));
-        let (retryable, res) = l.apply_bundle_update(&bu("bad", 1, "{"));
+        let (retry, res) = l.apply_bundle_update(&bu("bad", 1, "{"));
         assert!(
-            !retryable && res.is_err(),
+            retry == Retry::No && res.is_err(),
             "a decode error is never retried"
         );
-        let (retryable, _) = l.apply_bundle_update(&bu("u", 0, r#"{"management_only":true}"#));
-        assert!(!retryable, "a management command is never retried");
+        let (retry, _) = l.apply_bundle_update(&bu("u", 0, r#"{"management_only":true}"#));
+        assert!(retry == Retry::No, "a management command is never retried");
 
         let hb = l.heartbeat(None);
         assert_eq!(hb.analyze_latency_samples, Some(0));
@@ -1503,6 +1761,10 @@ mod tests {
     }
 
     fn bare_link() -> Arc<ControlLink> {
+        bare_link_with(Arc::new(FailSink))
+    }
+
+    fn bare_link_with(bundles: Arc<dyn BundleSink>) -> Arc<ControlLink> {
         ControlLink::new(
             ControlConfig {
                 server_address: "127.0.0.1:1".into(),
@@ -1521,7 +1783,7 @@ mod tests {
                 component_paths: BTreeMap::new(),
             },
             Hooks {
-                bundles: Arc::new(FailSink),
+                bundles,
                 certificates: Arc::new(NoCerts),
                 stats: Arc::new(ZeroStats),
                 security_data: Arc::new(NoSec),

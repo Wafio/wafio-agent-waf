@@ -11,10 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs;
 use std::hash::Hash;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use pingora::tls::sign::CertifiedKey;
 use pingora::tls::{CryptoProvider, ResolvesServerCert, RusTlsError, ServerConfig, version};
@@ -25,13 +23,6 @@ use sha2::{Digest, Sha256};
 /// The ALPN protocol of a TLS-ALPN-01 validation.
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
-/// A certificate chain (leaf first) and its private key, both PEM files.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CertFiles {
-    pub certificate: PathBuf,
-    pub key: PathBuf,
-}
-
 /// What the book serves for one app.
 #[derive(Clone)]
 pub struct BookEntry {
@@ -40,6 +31,18 @@ pub struct BookEntry {
     /// is answered HTTP-01 challenges and `503`, and the redirect listener does not send the
     /// app's hosts to HTTPS.
     pub placeholder: bool,
+}
+
+/// What an apply does to the entry of one app in the book.
+#[derive(Clone)]
+pub enum BookChange {
+    /// Serve this entry from the next handshake on.
+    Set(BookEntry),
+    /// Leave what the book holds: the previous certificate while the wanted one is not ready.
+    Keep,
+    /// Hold nothing. The bundle names no certificate for the app, so the one it had is not served
+    /// on.
+    Clear,
 }
 
 /// What is offered under one name, oldest first, each with the id of its offer. The newest answers
@@ -67,16 +70,10 @@ impl State {
     }
 }
 
-/// A chain: SHA-256 of the DER of every certificate in it, so a changed intermediate is seen too.
-type ChainHash = [u8; 32];
-
 /// The book of all TLS listeners of the process.
 #[derive(Default)]
 pub struct CertBook {
     state: RwLock<State>,
-    /// Keys read from files that something still holds: a pair is parsed once per file and chain.
-    /// Weak, so a replaced certificate frees its key.
-    loaded: Mutex<HashMap<(CertFiles, ChainHash), Weak<CertifiedKey>>>,
 }
 
 /// Prints no field: the book holds private keys.
@@ -115,16 +112,20 @@ impl CertBook {
         true
     }
 
-    /// Makes the book hold exactly the apps of `wanted`. `Some` switches the app to that entry;
-    /// `None` keeps what it holds now (the previous certificate while the wanted one is not ready).
+    /// Makes the book hold exactly the apps of `wanted`, each changed as its [`BookChange`] says.
     /// An app that is not in `wanted` is dropped, and `set` refuses it until a later `follow` names
-    /// it again. Challenge entries stay.
-    pub fn follow(&self, wanted: HashMap<String, Option<BookEntry>>) {
+    /// it again. One that is named and cleared holds nothing but can be `set`. Challenge entries
+    /// stay.
+    pub fn follow(&self, wanted: HashMap<String, BookChange>) {
         let mut state = self.write();
         let names: HashSet<String> = wanted.keys().cloned().collect();
         let mut next = HashMap::with_capacity(wanted.len());
-        for (app, entry) in wanted {
-            let entry = entry.or_else(|| state.apps.remove(&app));
+        for (app, change) in wanted {
+            let entry = match change {
+                BookChange::Set(entry) => Some(entry),
+                BookChange::Keep => state.apps.remove(&app),
+                BookChange::Clear => None,
+            };
             if let Some(entry) = entry {
                 next.insert(app, entry);
             }
@@ -188,24 +189,6 @@ impl CertBook {
             entry: Offered::Http01(name),
         }
     }
-
-    /// The key of a pair of files. A pair whose chain is already loaded is not parsed again, and
-    /// its key file is not read. The error names the file, never key bytes.
-    pub fn load(&self, files: &CertFiles) -> Result<Arc<CertifiedKey>, String> {
-        let chain = read_chain(files)?;
-        let mut hash = Sha256::new();
-        chain.iter().for_each(|der| hash.update(der.as_ref()));
-        let chain_hash: ChainHash = hash.finalize().into();
-        let mut loaded = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
-        loaded.retain(|_, key| key.strong_count() > 0);
-        let slot = (files.clone(), chain_hash);
-        if let Some(key) = loaded.get(&slot).and_then(Weak::upgrade) {
-            return Ok(key);
-        }
-        let key = Arc::new(certified_key(chain, files)?);
-        loaded.insert(slot, Arc::downgrade(&key));
-        Ok(key)
-    }
 }
 
 enum Offered {
@@ -244,51 +227,69 @@ fn withdraw<K: Hash + Eq, T>(offers: &mut HashMap<K, Offers<T>>, name: &K, id: u
     }
 }
 
-/// The certificate chain of a pair of files, leaf first.
-fn read_chain(files: &CertFiles) -> Result<Vec<CertificateDer<'static>>, String> {
-    let bytes = fs::read(&files.certificate).map_err(|e| read_error(&files.certificate, &e))?;
-    let chain = CertificateDer::pem_slice_iter(&bytes)
+/// Why a PEM text is not a usable certificate chain with its key. The texts say nothing of the input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairFault {
+    NotPem,
+    NoCertificate,
+    NoKey,
+    KeyUnusable,
+    KeyMismatch,
+}
+
+impl fmt::Display for PairFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PairFault::NotPem => "not valid PEM",
+            PairFault::NoCertificate => "no certificate",
+            PairFault::NoKey => "no private key",
+            PairFault::KeyUnusable => "private key not usable",
+            PairFault::KeyMismatch => "key does not match the certificate",
+        })
+    }
+}
+
+/// The certificate blocks of a PEM text, leaf first. Other blocks are skipped.
+fn parse_chain(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, PairFault> {
+    let chain = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| format!("{}: not valid PEM", files.certificate.display()))?;
+        .map_err(|_| PairFault::NotPem)?;
     if chain.is_empty() {
-        return Err(format!("{}: no certificate", files.certificate.display()));
+        return Err(PairFault::NoCertificate);
     }
     Ok(chain)
 }
 
-fn read_error(path: &Path, e: &std::io::Error) -> String {
-    format!("{}: cannot read ({})", path.display(), e.kind())
-}
-
-/// The chain with the one PKCS#8, PKCS#1 or SEC1 key of `files.key`, which must match its leaf.
-fn certified_key(
-    chain: Vec<CertificateDer<'static>>,
-    files: &CertFiles,
-) -> Result<CertifiedKey, String> {
-    let bytes = fs::read(&files.key).map_err(|e| read_error(&files.key, &e))?;
-    let key = PrivateKeyDer::from_pem_slice(&bytes).map_err(|e| match e {
-        PemError::NoItemsFound => format!("{}: no private key", files.key.display()),
-        _ => format!("{}: not valid PEM", files.key.display()),
+/// `chain` with the first PKCS#8, PKCS#1 or SEC1 key block of `pem`, which must match the leaf.
+fn parse_key(chain: Vec<CertificateDer<'static>>, pem: &[u8]) -> Result<CertifiedKey, PairFault> {
+    let key = PrivateKeyDer::from_pem_slice(pem).map_err(|e| match e {
+        PemError::NoItemsFound => PairFault::NoKey,
+        _ => PairFault::NotPem,
     })?;
     pingora::tls::install_default_crypto_provider();
     let Some(provider) = CryptoProvider::get_default() else {
-        return Err("no TLS crypto provider installed".to_owned());
+        return Err(PairFault::KeyUnusable);
     };
     // `from_der` also checks that the key belongs to the leaf, which a half-copied pair fails.
     CertifiedKey::from_der(chain, key, provider).map_err(|e| match e {
-        RusTlsError::InconsistentKeys(_) => format!(
-            "{}: key does not match {}",
-            files.key.display(),
-            files.certificate.display()
-        ),
-        _ => format!("{}: private key not usable", files.key.display()),
+        RusTlsError::InconsistentKeys(_) => PairFault::KeyMismatch,
+        _ => PairFault::KeyUnusable,
     })
 }
 
-/// Reads a certificate chain and one PKCS#8, PKCS#1 or SEC1 key that matches its leaf. The error
-/// names the file and the kind of failure, never key bytes.
-pub fn load_certified_key(files: &CertFiles) -> Result<CertifiedKey, String> {
-    certified_key(read_chain(files)?, files)
+/// The key and chain of one PEM text: a private key block and the certificate blocks, leaf first,
+/// in any order. The key must match the leaf.
+pub fn certified_key_from_pem(pem: &[u8]) -> Result<CertifiedKey, PairFault> {
+    parse_key(parse_chain(pem)?, pem)
+}
+
+/// Lower case hex SHA-256 of the DER of the leaf of the chain of `key`, which is how the control
+/// plane names a certificate.
+pub fn leaf_sha256(key: &CertifiedKey) -> String {
+    Sha256::digest(key.cert[0].as_ref())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The rustls config of a TLS listener: TLS 1.2 and 1.3, certificates from `resolver`. ALPN lists
@@ -307,10 +308,29 @@ pub fn server_config(resolver: Arc<dyn ResolvesServerCert>) -> Arc<ServerConfig>
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use pingora::tls::SignatureScheme;
+
+    /// A certificate chain (leaf first) and its private key, both PEM files.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct CertFiles {
+        pub(crate) certificate: PathBuf,
+        pub(crate) key: PathBuf,
+    }
+
+    /// The key of a pair of files, for the tests that make them with openssl.
+    pub(crate) fn load_certified_key(files: &CertFiles) -> Result<CertifiedKey, PairFault> {
+        let pem = [
+            fs::read(&files.key).unwrap(),
+            fs::read(&files.certificate).unwrap(),
+        ]
+        .concat();
+        certified_key_from_pem(&pem)
+    }
 
     /// A scratch directory in the system temp dir, removed on drop. The keys never leave it.
     pub(crate) struct Scratch(PathBuf);
@@ -370,102 +390,55 @@ pub(crate) mod tests {
         load_certified_key(files).unwrap().cert
     }
 
-    fn entry(key: &Arc<CertifiedKey>) -> Option<BookEntry> {
-        Some(BookEntry {
+    fn entry(key: &Arc<CertifiedKey>) -> BookChange {
+        BookChange::Set(BookEntry {
             key: key.clone(),
             placeholder: false,
         })
     }
 
     #[test]
-    fn a_pair_is_parsed_once_per_file_and_chain_and_a_new_leaf_is_read() {
+    fn one_pem_text_holds_a_key_and_its_chain_in_either_order() {
         let dir = Scratch::new();
-        let (live, next) = (dir.pair("live"), dir.pair("next"));
-        let book = CertBook::default();
-        let first = book.load(&live).unwrap();
-        assert!(Arc::ptr_eq(&first, &book.load(&live).unwrap()));
-
-        // A hit does not read the key file: it can be gone.
-        let key_text = fs::read(&live.key).unwrap();
-        fs::remove_file(&live.key).unwrap();
-        assert!(Arc::ptr_eq(&first, &book.load(&live).unwrap()));
-        fs::write(&live.key, key_text).unwrap();
-
-        // The same names with another leaf (a renewal written over the files) is a new key.
-        fs::rename(&next.certificate, &live.certificate).unwrap();
-        fs::rename(&next.key, &live.key).unwrap();
-        let renewed = book.load(&live).unwrap();
-        assert!(!Arc::ptr_eq(&first, &renewed));
-        assert_eq!(renewed.cert, chain_of(&live));
-        assert_ne!(first.cert, renewed.cert);
-    }
-
-    #[test]
-    fn a_chain_that_changes_under_the_same_leaf_is_read_again() {
-        let dir = Scratch::new();
-        let (live, issuer) = (dir.pair("live"), dir.pair("issuer"));
-        let book = CertBook::default();
-        let leaf_only = book.load(&live).unwrap();
-        assert_eq!(leaf_only.cert.len(), 1);
-
-        // The operator appends the intermediate to the certificate file: same leaf, longer chain.
-        let mut chain = fs::read(&live.certificate).unwrap();
-        chain.extend(fs::read(&issuer.certificate).unwrap());
-        fs::write(&live.certificate, chain).unwrap();
-        let with_issuer = book.load(&live).unwrap();
-        assert!(!Arc::ptr_eq(&leaf_only, &with_issuer));
-        assert_eq!(with_issuer.cert.len(), 2);
-        assert_eq!(with_issuer.cert[0], leaf_only.cert[0]);
-        assert!(Arc::ptr_eq(&with_issuer, &book.load(&live).unwrap()));
-    }
-
-    #[test]
-    fn a_key_nothing_holds_is_dropped_from_the_cache() {
-        let dir = Scratch::new();
-        let live = dir.pair("live");
-        let book = CertBook::default();
-        let first = book.load(&live).unwrap();
-        let weak = Arc::downgrade(&first);
-        drop(first);
-        assert!(weak.upgrade().is_none());
-        // The next load reads it again and prunes the dead slot.
-        let again = book.load(&live).unwrap();
-        assert_eq!(book.loaded.lock().unwrap().len(), 1);
-        drop(again);
-    }
-
-    #[test]
-    fn load_names_the_file_that_fails_and_never_the_key() {
-        let dir = Scratch::new();
-        let (live, next) = (dir.pair("live"), dir.pair("next"));
-        let book = CertBook::default();
-
-        fs::write(&live.certificate, "not a certificate").unwrap();
-        let err = book.load(&live).err().unwrap();
-        assert!(
-            err.contains("live.crt") && err.contains("no certificate"),
-            "{err}"
+        let (live, other) = (dir.pair("live"), dir.pair("other"));
+        let (cert, key) = (
+            fs::read(&live.certificate).unwrap(),
+            fs::read(&live.key).unwrap(),
         );
+        let expected = chain_of(&live);
+        for pem in [
+            [key.clone(), cert.clone()].concat(),
+            [cert.clone(), key.clone()].concat(),
+        ] {
+            assert_eq!(certified_key_from_pem(&pem).unwrap().cert, expected);
+        }
+        let both = [
+            key.clone(),
+            cert.clone(),
+            fs::read(&other.certificate).unwrap(),
+        ]
+        .concat();
+        assert_eq!(certified_key_from_pem(&both).unwrap().cert.len(), 2);
 
-        // A half-copied pair: the new certificate, the old key.
-        fs::rename(&next.certificate, &live.certificate).unwrap();
-        let err = book.load(&live).err().unwrap();
-        assert!(
-            err.contains("does not match") && err.contains("live.key"),
-            "{err}"
-        );
-        assert!(!err.contains("PRIVATE KEY"), "{err}");
-
-        let absent = CertFiles {
-            certificate: dir.0.join("absent.crt"),
-            key: dir.0.join("absent.key"),
-        };
-        let err = book.load(&absent).err().unwrap();
-        assert!(err.contains("absent.crt"), "{err}");
+        let fault = |pem: &[u8]| certified_key_from_pem(pem).err().unwrap();
+        assert_eq!(fault(b"nothing here"), PairFault::NoCertificate);
+        assert_eq!(fault(&cert), PairFault::NoKey);
+        assert_eq!(fault(&key), PairFault::NoCertificate);
+        let swapped = [fs::read(&other.key).unwrap(), cert.clone()].concat();
+        assert_eq!(fault(&swapped), PairFault::KeyMismatch);
+        let torn = [key, b"-----BEGIN CERTIFICATE-----\nMIIB".to_vec()].concat();
+        assert_eq!(fault(&torn), PairFault::NotPem);
+        for f in [PairFault::NotPem, PairFault::KeyMismatch, PairFault::NoKey] {
+            assert!(!f.to_string().contains("PRIVATE"), "{f}");
+        }
     }
 
     fn wants(book: &CertBook, apps: &[&str]) {
-        book.follow(apps.iter().map(|a| ((*a).to_owned(), None)).collect());
+        book.follow(
+            apps.iter()
+                .map(|a| ((*a).to_owned(), BookChange::Keep))
+                .collect(),
+        );
     }
 
     #[test]
@@ -528,24 +501,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn follow_sets_keeps_and_drops() {
+    fn follow_sets_keeps_clears_and_drops() {
         let dir = Scratch::new();
         let book = CertBook::default();
         let key = |name: &str| Arc::new(load_certified_key(&dir.pair(name)).unwrap());
         let (kept, replaced, dropped, added) =
             (key("kept"), key("replaced"), key("dropped"), key("added"));
-        let replacement = key("replacement");
-        wants(&book, &["kept", "replaced", "dropped"]);
+        let (cleared, replacement) = (key("cleared"), key("replacement"));
+        wants(&book, &["kept", "replaced", "dropped", "cleared"]);
         assert!(book.set("kept", kept.clone(), false));
         assert!(book.set("replaced", replaced, false));
         assert!(book.set("dropped", dropped, false));
+        assert!(book.set("cleared", cleared.clone(), false));
 
         book.follow(HashMap::from([
-            ("kept".to_owned(), None),
+            ("kept".to_owned(), BookChange::Keep),
             ("replaced".to_owned(), entry(&replacement)),
             ("added".to_owned(), entry(&added)),
+            ("cleared".to_owned(), BookChange::Clear),
             // Nothing held and nothing wanted yet: stays out.
-            ("waiting".to_owned(), None),
+            ("waiting".to_owned(), BookChange::Keep),
         ]));
 
         assert!(Arc::ptr_eq(&book.get("kept").unwrap().key, &kept));
@@ -556,6 +531,9 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(&book.get("added").unwrap().key, &added));
         assert!(book.get("dropped").is_none());
         assert!(book.get("waiting").is_none());
+        // A cleared app holds nothing, and stays one the book takes a certificate for.
+        assert!(book.get("cleared").is_none());
+        assert!(book.set("cleared", cleared, false));
     }
 
     #[test]

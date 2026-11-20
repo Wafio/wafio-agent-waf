@@ -4,7 +4,7 @@
 //! configuration in force came from (`live` | `cache` | `cache_stale`). The envelope is the
 //! format earlier agent versions wrote and read, in both directions.
 
-use crate::bundle_puller::BundleProbe;
+use crate::bundle_puller::{BundleError, BundleProbe};
 use crate::grpc_reconnect::random_u64;
 use crate::grpc_stream::ControlLink;
 use crate::json_members;
@@ -12,7 +12,7 @@ use crate::timestamp::{Timestamp, duration_nanos, round_nanos, whole_seconds_tex
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::info;
 
@@ -38,6 +38,18 @@ pub struct CachedBundle {
     pub bundle: Vec<u8>,
     pub generation: i64,
     pub saved_at: Timestamp,
+}
+
+/// How starting from the cached bundle ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheStart {
+    /// No cached bundle, an unusable one, or one the sink refused.
+    NotApplied,
+    /// The cached bundle is in force.
+    Applied,
+    /// The sink could not bind an address the bundle names. [`ControlLink::start`] applies this
+    /// bundle again every minute, until it binds or a live bundle arrives.
+    Bind(CachedBundle),
 }
 
 #[derive(Debug)]
@@ -79,16 +91,9 @@ pub fn save_bundle_cache(
         .mode(0o700)
         .create(dir)
         .map_err(|e| format!("create state dir: {e}"))?;
-    let (mut tmp, tmp_name) = create_temp(dir).map_err(|e| format!("create temp: {e}"))?;
-    struct Cleanup<'a>(&'a Path, bool);
-    impl Drop for Cleanup<'_> {
-        fn drop(&mut self) {
-            if !self.1 {
-                let _ = std::fs::remove_file(self.0);
-            }
-        }
-    }
-    let mut cleanup = Cleanup(&tmp_name, false);
+    let (mut tmp, tmp_name) =
+        create_temp(dir, ".last-bundle-", ".tmp").map_err(|e| format!("create temp: {e}"))?;
+    let mut cleanup = TempGuard::new(&tmp_name);
     tmp.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("chmod temp: {e}"))?;
     tmp.write_all(&env)
@@ -97,7 +102,7 @@ pub fn save_bundle_cache(
     drop(tmp);
     std::fs::rename(&tmp_name, dir.join(BUNDLE_CACHE_FILE_NAME))
         .map_err(|e| format!("rename: {e}"))?;
-    cleanup.1 = true;
+    cleanup.keep();
     // Persist the rename itself; best effort.
     if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
@@ -105,10 +110,11 @@ pub fn save_bundle_cache(
     Ok(())
 }
 
-/// A new temporary file `.last-bundle-*.tmp` in `dir`, created exclusively with mode 0600.
-fn create_temp(dir: &Path) -> std::io::Result<(File, std::path::PathBuf)> {
+/// A new file `<prefix><random><suffix>` in `dir`, created exclusively (so never through a link)
+/// with mode 0600 from the first moment: no other user can read it before anything is written.
+pub fn create_temp(dir: &Path, prefix: &str, suffix: &str) -> std::io::Result<(File, PathBuf)> {
     for _ in 0..10_000 {
-        let name = dir.join(format!(".last-bundle-{}.tmp", random_u64() as u32));
+        let name = dir.join(format!("{prefix}{}{suffix}", random_u64() as u32));
         match OpenOptions::new()
             .read(true)
             .write(true)
@@ -125,6 +131,36 @@ fn create_temp(dir: &Path) -> std::io::Result<(File, std::path::PathBuf)> {
         ErrorKind::AlreadyExists,
         "too many temp file collisions",
     ))
+}
+
+/// Removes a temporary file when it drops, on every path out of the write that made it (an error
+/// or a panic), unless `keep` says it was renamed into place.
+#[must_use = "the temporary file is removed when the guard drops"]
+pub struct TempGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl TempGuard {
+    pub fn new(path: &Path) -> TempGuard {
+        TempGuard {
+            path: path.to_owned(),
+            keep: false,
+        }
+    }
+
+    /// The file is where it belongs now: leave it.
+    pub fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Load and validate `dir/last-bundle.json`. `check` is the full bundle decode
@@ -229,32 +265,49 @@ impl ControlLink {
         }
     }
 
-    /// Apply the cached bundle, if any, through the sink; true when one was applied. Run before
-    /// the stream starts so a live bundle always wins ([`ControlLink::start`] does). Blocking.
-    pub fn install_cached_bundle(&self) -> bool {
-        let (dir, max_age) = self.bundle_cache_config();
+    /// Apply the cached bundle, if any, through the sink. Run before the stream starts so a live
+    /// bundle always wins ([`ControlLink::start`] does). Blocking.
+    pub fn install_cached_bundle(&self) -> CacheStart {
+        let (dir, _) = self.bundle_cache_config();
         if dir.is_empty() {
-            return false;
+            return CacheStart::NotApplied;
         }
         let c = match load_bundle_cache(Path::new(&dir), &|b| self.sink().check(b)) {
             Ok(c) => c,
-            Err(CacheReadError::NotFound) => return false,
+            Err(CacheReadError::NotFound) => return CacheStart::NotApplied,
             Err(e) => {
                 info!(
                     "[waf-bundle] ignoring cached bundle {}: {e}",
                     Path::new(&dir).join(BUNDLE_CACHE_FILE_NAME).display()
                 );
-                return false;
+                return CacheStart::NotApplied;
             }
         };
-        let probe = BundleProbe::parse(&c.bundle).unwrap_or_default();
-        if let Err(e) = self.hand_bundle_to_sink(&c.bundle, c.generation, &probe) {
-            info!(
-                "[waf-bundle] cached bundle generation {} not applied: {e}",
-                c.generation
-            );
-            return false;
+        match self.apply_cached_bundle(&c) {
+            Ok(()) => CacheStart::Applied,
+            Err(BundleError::Bind(e)) => {
+                info!(
+                    "[waf-bundle] cached bundle generation {} not applied: {e} (retrying)",
+                    c.generation
+                );
+                CacheStart::Bind(c)
+            }
+            Err(e) => {
+                info!(
+                    "[waf-bundle] cached bundle generation {} not applied: {e}",
+                    c.generation
+                );
+                CacheStart::NotApplied
+            }
         }
+    }
+
+    /// Hands a cached bundle to the sink and, once it is in force, records where the configuration
+    /// came from.
+    pub(crate) fn apply_cached_bundle(&self, c: &CachedBundle) -> Result<(), BundleError> {
+        let (_, max_age) = self.bundle_cache_config();
+        let probe = BundleProbe::parse(&c.bundle).unwrap_or_default();
+        self.hand_bundle_to_sink(&c.bundle, c.generation, &probe)?;
         let age = c.saved_at.nanos_until(SystemTime::now());
         let max = duration_nanos(max_age);
         let source = if age > max {
@@ -275,7 +328,7 @@ impl ControlLink {
         };
         self.set_bundle_status(source, c.generation);
         *self.last_gen.lock().unwrap() = c.generation;
-        true
+        Ok(())
     }
 }
 

@@ -190,6 +190,8 @@ fn starts_from_cache_signals_ready_and_hands_over_on_sigusr2() {
         ])
         .env("NOTIFY_SOCKET", &notify_path)
         .env("RUNTIME_DIRECTORY", &dir)
+        // A key directory of its own: the fixed one may belong to an agent installed on this host.
+        .env("WAFIO_TEST_TLS_DIR", dir.join("tls"))
         .env("WAFIO_METRICS_ADDR", format!("127.0.0.1:{metrics}"))
         // A library installed on this host must not give the agent an engine: name one that does not exist.
         .env("WAFIO_ENGINE_LIB", dir.join("no-engine.so"))
@@ -321,6 +323,7 @@ fn refuses_to_start_without_cache_or_control_plane() {
             d,
         ])
         .args(["--state-dir", dir.join("state").to_str().unwrap()])
+        .env("WAFIO_TEST_TLS_DIR", dir.join("tls"))
         .env_remove("NOTIFY_SOCKET")
         .output()
         .unwrap();

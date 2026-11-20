@@ -45,8 +45,10 @@ scripts/gen-test-certs.sh
 echo '== fmt'
 cargo fmt --all --check
 
+# test-tls: the agent reads its key directory from WAFIO_TEST_TLS_DIR, which the tests of the binary need, as it cannot be
+# made owned by the user the tests run as at the fixed path. No release build enables it.
 echo '== clippy'
-cargo clippy --locked --workspace --all-targets --profile "$profile" -- -D warnings
+cargo clippy --locked --workspace --all-targets --profile "$profile" --features wafio-waf-agent/test-tls -- -D warnings
 
 echo '== test'
-cargo test --locked --workspace --profile "$profile"
+cargo test --locked --workspace --profile "$profile" --features wafio-waf-agent/test-tls

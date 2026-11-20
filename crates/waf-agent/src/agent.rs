@@ -11,11 +11,15 @@ use wafio_application::blocklist::BlockStore;
 use wafio_control::{AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink};
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
+use wafio_proxy::cert_store::BookChange;
 use wafio_proxy::{AppAnalysisSetup, AppSpec, TlsSite};
 
 use crate::bundle::{Bundle, BundleApp, UnblockEntry, decode_bundle};
 use crate::executor::{BaseExecutor, Stores, executor_for_rules};
 use crate::ready::Ready;
+use crate::tls::dir::KeyDir;
+use crate::tls::entry::Settings;
+use crate::tls::{Applied, Keys, book_entry};
 
 /// The proxy side (`wafio_proxy::Proxy::apply`): builds every route, binds every new
 /// address, then switches; any error changes nothing. A trait so tests can fake it.
@@ -39,6 +43,9 @@ struct State {
     generation: i64,
     agent_id: String,
     closed: bool,
+    /// The key directory and what the apps with a `tls` object are served with; `None` when the
+    /// agent has no usable key directory, which leaves the `tls` objects unread.
+    tls: Option<Keys>,
 }
 
 /// The agent state minus the request path (the proxy crate's).
@@ -50,8 +57,6 @@ pub struct Agent {
     routes: Arc<dyn RouteSink>,
     good_bots: Arc<VerifiedBotChecker>,
     ready: Arc<Ready>,
-    /// The apps the agent also serves over HTTPS itself, by app id (the local TLS sites file).
-    tls_sites: HashMap<String, TlsSite>,
 }
 
 fn apply_error(s: &str) -> BundleError {
@@ -81,14 +86,14 @@ impl Agent {
             routes,
             good_bots,
             ready,
-            tls_sites: HashMap::new(),
         }
     }
 
-    /// The apps served over HTTPS by the agent: an app in the map gets its `TlsSite`, one that is
-    /// not behaves as the bundle says.
-    pub fn with_tls_sites(mut self, sites: HashMap<String, TlsSite>) -> Agent {
-        self.tls_sites = sites;
+    /// The agent serves the apps whose bundle entry has a `tls` object over HTTPS, from the
+    /// certificates in `dir`. Without it the object is ignored and the app is served as its bundle
+    /// says.
+    pub fn with_key_dir(self, dir: KeyDir) -> Agent {
+        self.lock().tls = Some(Keys::new(dir));
         self
     }
 
@@ -130,6 +135,62 @@ impl Agent {
     /// Later bundles are refused.
     pub fn close(&self) {
         self.lock().closed = true;
+    }
+
+    /// Whether the agent has a key directory and this process is the one that writes in it.
+    pub fn holds_keys(&self) -> bool {
+        self.lock().tls.as_ref().is_some_and(Keys::holds_lock)
+    }
+
+    /// Whether the agent has a key directory, which it may be waiting for the lock of.
+    pub fn waits_for_keys(&self) -> bool {
+        self.lock().tls.as_ref().is_some_and(|k| !k.holds_lock())
+    }
+
+    /// Takes the key directory lock if the process that held it let go, and then does what could
+    /// not be done without it. Returns whether there is nothing left to wait for: this process
+    /// holds the lock, or it has no key directory, or it is closing and leaves the lock to the
+    /// process that replaces it. Blocking: it may write.
+    pub fn take_over_keys(&self) -> bool {
+        let mut st = self.lock();
+        let closed = st.closed;
+        match st.tls.as_mut() {
+            Some(keys) if !closed => keys.take_over(),
+            _ => true,
+        }
+    }
+
+    /// Lets go of the key directory lock for the process that takes over. Call it after `close`:
+    /// from then on this process applies nothing and so writes nothing.
+    pub fn release_keys(&self) {
+        if let Some(keys) = self.lock().tls.as_mut() {
+            keys.release();
+        }
+    }
+
+    /// The apply lock. While it is held no bundle is applied, no certificate is switched and
+    /// nothing is written in the key directory by any other part of the process, so what its
+    /// holder read from the bundle in force is still true when it commits a change that depends on
+    /// it.
+    pub fn apply_lock(&self) -> ApplyLock<'_> {
+        ApplyLock { st: self.lock() }
+    }
+
+    /// The apps of the bundle in force that have a `tls` object, by app id: their checked
+    /// settings and the file each is served from.
+    pub fn tls_apps(&self) -> Vec<(String, Settings, Option<String>)> {
+        let st = self.lock();
+        let mut apps: Vec<_> = st.tls.as_ref().map_or_else(Vec::new, |keys| {
+            keys.applied()
+                .iter()
+                .map(|(id, a)| {
+                    let file = a.served.as_ref().map(|s| s.file.clone());
+                    (id.clone(), a.settings.clone(), file)
+                })
+                .collect()
+        });
+        apps.sort_by(|a, b| a.0.cmp(&b.0));
+        apps
     }
 
     /// Every store in use: the shared (startup) ones and each app's.
@@ -204,6 +265,19 @@ impl Agent {
             executor_for_rules(&self.base, rules, &b.project_id, Some(&self.base_stores))
                 .map_err(BundleError::Apply)?;
         let shared = Arc::new(shared);
+        // The `tls` objects are checked and their certificates read before the first app is built;
+        // an object that fails a check refuses the whole bundle, as an invalid route does.
+        let tls = match &st.tls {
+            Some(keys) => keys.prepare(&b.apps).map_err(|rejected| {
+                tracing::warn!(
+                    "[waf-bundle] app {:?}: invalid TLS entry, {}",
+                    rejected.app_id.chars().take(64).collect::<String>(),
+                    rejected.refusal
+                );
+                apply_error("invalid TLS site settings")
+            })?,
+            None => HashMap::new(),
+        };
         let mut executors: HashMap<String, (Arc<AppAnalysisSetup>, Stores)> = HashMap::new();
         let mut specs: Vec<AppSpec> = Vec::new();
         let mut addresses: HashSet<String> = HashSet::new();
@@ -238,7 +312,12 @@ impl Agent {
             exec.analyze.custom_tuning_rules = tuning;
             let exec = Arc::new(exec);
             executors.insert(app.app_id.clone(), (exec.clone(), stores));
-            let spec = app_spec(app, exec, self.tls_sites.get(&app.app_id).cloned());
+            let spec = app_spec(
+                app,
+                exec,
+                tls.get(&app.app_id)
+                    .map(|applied| tls_site(&app.app_id, applied)),
+            );
             // The route is built here, so a bad route fails before later apps are built.
             if let Err(e) = wafio_proxy::config::build_route(&spec) {
                 tracing::info!("[waf-bundle] {e}");
@@ -266,12 +345,21 @@ impl Agent {
             // Binding refuses the port when the sockets are reserved.
             return Err(apply_error("failed to bind WAF route listener"));
         }
-        self.routes.apply(specs).map_err(BundleError::Apply)?;
+        self.routes.apply(specs).map_err(|e| {
+            if e == wafio_proxy::listeners::BIND_ERROR {
+                BundleError::Bind(e)
+            } else {
+                BundleError::Apply(e)
+            }
+        })?;
         crate::script_rules::set_apps_with_script_rules(with_scripts);
         st.shared = Some(shared);
         st.per_app = executors;
         st.generation = b.generation;
         st.agent_id = b.agent_id.clone();
+        if let Some(keys) = st.tls.as_mut() {
+            keys.commit(tls);
+        }
         drop(st);
         if !b.good_bot_cidrs.is_empty()
             && let Some(msg) = self.good_bots.load_ranges_from_cidrs(&b.good_bot_cidrs)
@@ -281,6 +369,36 @@ impl Agent {
         self.release_unblocked_entries(&b.unblock_entries);
         self.ready.signal();
         Ok(())
+    }
+}
+
+/// The apply lock of an agent (`Agent::apply_lock`).
+pub struct ApplyLock<'a> {
+    st: std::sync::MutexGuard<'a, State>,
+}
+
+impl ApplyLock<'_> {
+    /// The checked `tls` settings of `app_id` in the bundle in force; `None` for an app that is not
+    /// served over HTTPS by the agent, or that is not in the bundle.
+    pub fn settings(&self, app_id: &str) -> Option<&Settings> {
+        Some(&self.st.tls.as_ref()?.applied().get(app_id)?.settings)
+    }
+}
+
+/// The proxy's view of an app's `tls` object: where it listens and which certificate it brings.
+fn tls_site(app_id: &str, applied: &Applied) -> TlsSite {
+    let certificate = match (&applied.served, applied.settings.wanted_file(app_id)) {
+        (Some(served), _) => BookChange::Set(book_entry(served)),
+        // The bundle names a file that cannot be served yet: what the book holds stays.
+        (None, Some(_)) => BookChange::Keep,
+        // The bundle names none: whatever the book holds is not served on.
+        (None, None) => BookChange::Clear,
+    };
+    TlsSite {
+        listen: applied.settings.listen.clone(),
+        hosts: applied.settings.hosts.clone(),
+        certificate,
+        redirect_listen: applied.settings.redirect_listen.clone(),
     }
 }
 

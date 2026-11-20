@@ -419,5 +419,60 @@
     "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"rules_json\":{\"semantic_policies\":{\"disable_semantic\":true,\"disable_rule_based\":true,\"skip_coraza_when_clean\":true}},\"apps\":[{\"app_id\":\"inherits\",\"listen_host\":\"127.0.0.1\",\"upstream\":\"http://127.0.0.1:9001\",\"rules_json\":{}}]}"
    }
   ]
+ },
+ {
+  "name": "tls_objects",
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41872\",\"hosts\":[\"shop.example.com\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\",\"redirect_listen\":\"127.0.0.1:41873\"}}]}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41872\",\"hosts\":[\"*.example.com\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\",\"redirect_listen\":\"127.0.0.1:41873\"}}]}"
+   },
+   {
+    "generation": 3,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41874\",\"hosts\":[\"Shop.Example.com\",\"www.example.com\"],\"source\":\"acme\",\"acme_request_id\":\"r-1\"}}]}"
+   },
+   {
+    "generation": 4,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41874\",\"hosts\":[\"shop.example.com\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\",\"redirect_listen\":\"127.0.0.1:41873\"}},{\"app_id\":\"6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41875,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41874\",\"hosts\":[\"blog.example.com\"],\"source\":\"\"}}]}"
+   },
+   {
+    "generation": 5,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41874\",\"hosts\":[\"shop.example.com\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\"}},{\"app_id\":\"6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41875,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41874\",\"hosts\":[\"shop.example.com\"],\"source\":\"acme\"}}]}"
+   },
+   {
+    "generation": 6,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41872\",\"hosts\":[\"shop.example.com\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\"}},{\"app_id\":\"6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41872,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\"}]}"
+   },
+   {
+    "generation": 7,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"shop\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41872\",\"hosts\":[\"shop.example.com\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\"}}]}"
+   },
+   {
+    "generation": 8,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41872\",\"hosts\":[\"shop.example.com\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\",\"redirect_listen\":\"127.0.0.1:41872\"}}]}"
+   },
+   {
+    "generation": 9,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\"},{\"app_id\":\"6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41875,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\"}]}"
+   }
+  ]
+ },
+ {
+  "name": "tls_objects_without_a_key_directory",
+  "key_dir": false,
+  "steps": [
+   {
+    "generation": 1,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"127.0.0.1:41872\",\"hosts\":[\"shop.example.com\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\",\"redirect_listen\":\"127.0.0.1:41873\"}}]}"
+   },
+   {
+    "generation": 2,
+    "bundle": "{\"agent_id\":\"a\",\"project_id\":\"p\",\"apps\":[{\"app_id\":\"0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11\",\"listen_host\":\"127.0.0.1\",\"listen_port\":41871,\"upstream\":\"http://127.0.0.1:9871\",\"mode\":\"block\",\"tls\":{\"listen\":\"nonsense\",\"hosts\":[\"*\"],\"source\":\"uploaded\",\"certificate_id\":\"5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77\",\"leaf_sha256\":\"abababababababababababababababababababababababababababababababab\"}}]}"
+   }
+  ]
  }
 ]

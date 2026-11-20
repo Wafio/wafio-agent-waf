@@ -17,7 +17,7 @@ use pingora::tls::{ClientHello, ResolvesServerCert};
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
-use crate::cert_store::{ACME_TLS_ALPN, BookEntry, CertBook, server_config};
+use crate::cert_store::{ACME_TLS_ALPN, BookChange, CertBook, server_config};
 use crate::client_hello;
 use crate::config::{Route, TlsSite};
 use crate::head_parser::UriParts;
@@ -240,13 +240,12 @@ impl TlsListener {
     }
 }
 
-/// The book entries for the apps of the TLS listeners of an apply, read from their files and put
-/// into `entries`. A host name may belong to one app only. Nothing is switched: the book follows
-/// once every listener of the apply is ready.
+/// The book changes for the apps of the TLS listeners of an apply, put into `entries`, as each
+/// site says. A host name may belong to one app only. Nothing is switched: the book follows once
+/// every listener of the apply is ready.
 pub(crate) fn prepare_certificates(
-    book: &CertBook,
     sites: &[(Arc<Route>, TlsSite)],
-    entries: &mut HashMap<String, Option<BookEntry>>,
+    entries: &mut HashMap<String, BookChange>,
 ) -> Result<(), String> {
     let mut seen = HashSet::new();
     for (_, site) in sites {
@@ -257,12 +256,7 @@ pub(crate) fn prepare_certificates(
         }
     }
     for (route, site) in sites {
-        let key = book.load(&site.cert)?;
-        let entry = BookEntry {
-            key,
-            placeholder: false,
-        };
-        entries.insert(route.app_id().to_owned(), Some(entry));
+        entries.insert(route.app_id().to_owned(), site.certificate.clone());
     }
     Ok(())
 }
@@ -460,7 +454,8 @@ impl RedirectTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cert_store::{CertFiles, load_certified_key, tests::Scratch};
+    use crate::cert_store::BookEntry;
+    use crate::cert_store::tests::{CertFiles, Scratch, load_certified_key};
     use crate::head_parser::{parse_head, uri_parts};
 
     fn parts(host: &str, uri: &str) -> UriParts {
@@ -476,8 +471,8 @@ mod tests {
         Arc::new(load_certified_key(&files).unwrap())
     }
 
-    fn a_real_entry(dir: &Scratch, name: &str) -> Option<BookEntry> {
-        Some(BookEntry {
+    fn a_real_entry(dir: &Scratch, name: &str) -> BookChange {
+        BookChange::Set(BookEntry {
             key: a_key(dir, name),
             placeholder: false,
         })
@@ -554,7 +549,7 @@ mod tests {
         let ask = |host: &str| table.answer(b"GET", &parts(host, "/cart"));
 
         // Nothing in the book, then the placeholder: the host is known but cannot be served.
-        book.follow(HashMap::from([("shop".to_owned(), None)]));
+        book.follow(HashMap::from([("shop".to_owned(), BookChange::Keep)]));
         for held in [None, Some(a_key(&dir, "placeholder"))] {
             if let Some(key) = held {
                 assert!(book.set("shop", key, true));

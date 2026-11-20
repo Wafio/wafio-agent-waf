@@ -28,7 +28,7 @@ mod setup_ja4;
 mod setup_malware;
 pub mod siem;
 pub mod stderr_log;
-pub mod tls_sites;
+pub mod tls;
 
 use std::process::ExitCode;
 
@@ -79,6 +79,10 @@ pub fn main_entry() -> ExitCode {
 /// Startup up to exporting the engine environment, single-threaded; then the Tokio runtime.
 fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     stderr_log::init();
+    // Keeps the keys of the served certificates out of core dumps and away from ptrace.
+    if let Err(e) = nix::sys::prctl::set_dumpable(false) {
+        tracing::info!("[tls] WARNING: cannot keep key material out of core dumps: {e}");
+    }
     for l in f.fill_from_env(&flags::OsEnv) {
         tracing::info!("{l}");
     }
@@ -93,6 +97,15 @@ fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     if let Some(w) = f.legacy_data_dir_warning() {
         tracing::info!("{w}");
     }
+    let keys = match tls::dir::KeyDir::open_default() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            tracing::info!(
+                "[tls] WARNING: this agent does not serve apps over HTTPS: key directory {e}"
+            );
+            None
+        }
+    };
     engine_lib::load_at_start(&f.engine_lib)?;
     for (k, v) in f.engine_env() {
         // SAFETY: no other thread exists yet (the runtime is built below); the engine crates
@@ -105,5 +118,5 @@ fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     let rt = wafio_proxy::runtime_builder()
         .build()
         .map_err(|e| e.to_string())?;
-    rt.block_on(run::run_waf_agent(f, metrics_addr))
+    rt.block_on(run::run_waf_agent(f, metrics_addr, keys))
 }

@@ -1,13 +1,15 @@
-//! The real binary started with `--tls-sites-file`: an app served over HTTPS, which opens no
-//! plain listener of its own, the redirect listener, a reload while connections are open, a
-//! settings file that stops the start, and an agent without the flag. The control plane is
-//! unreachable and the app comes from the bundle cache, as in `operations.rs`. Keys are made by
-//! `openssl` at test time into a scratch directory that is removed when the test ends.
+//! The real binary with a key directory (`WAFIO_TEST_TLS_DIR`): an app whose bundle entry has a
+//! `tls` object is served over HTTPS from a certificate file, with no plain listener of its own,
+//! from a cached bundle with no control plane and from live bundles of a fake one. A reload hands
+//! the sockets and the directory lock over while connections go on, a process that finds the lock
+//! taken writes nothing in the directory until it is free, and an entry that fails a check refuses
+//! the whole bundle. Keys are made by `openssl` at test time into a scratch directory that is
+//! removed when the test ends.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::net::TcpListener;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -15,14 +17,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use nix::fcntl::{Flock, FlockArg};
 use pingora::tls::{
     CertificateDer, ClientConfig, ClientTlsStream, RootCertStore, ServerName, TlsConnector,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::{Request, Response, Status, Streaming};
+use wafio_proto::v1::agent_control_server::{AgentControl, AgentControlServer};
+use wafio_proto::v1::agent_message::Kind as Out;
+use wafio_proto::v1::server_message::Kind as In;
+use wafio_proto::v1::{
+    AgentMessage, BundleUpdate, MalwareDatabaseChunk, MalwareDatabaseRequest, ServerMessage,
+    Welcome,
+};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../control/tests/fixtures");
 const HOST: &str = "shop.test";
+const SHOP: &str = "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11";
+const BLOG: &str = "6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90";
+const CERT: &str = "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77";
+const ORPHAN: &str = "7e1f3a90-2c1d-4b8e-9a55-1d3c4f6a8b02";
 
 /// `N` free ports, all held until every one is chosen so that two of them cannot be the same.
 fn free_ports<const N: usize>() -> [u16; N] {
@@ -322,38 +342,6 @@ async fn plain(port: u16, host: &str, path: &str) -> io::Result<Reply> {
     .map_err(|_| timed_out())?
 }
 
-/// The TCP ports `pid` listens on: its socket inodes looked up in the kernel's tables.
-fn listening_ports(pid: u32) -> BTreeSet<u16> {
-    let inodes: BTreeSet<String> = fs::read_dir(format!("/proc/{pid}/fd"))
-        .unwrap()
-        .flatten()
-        .filter_map(|fd| {
-            let target = fs::read_link(fd.path()).ok()?;
-            let inode = target
-                .to_str()?
-                .strip_prefix("socket:[")?
-                .strip_suffix(']')?;
-            Some(inode.to_owned())
-        })
-        .collect();
-    let mut ports = BTreeSet::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        for line in fs::read_to_string(table)
-            .unwrap_or_default()
-            .lines()
-            .skip(1)
-        {
-            let columns: Vec<&str> = line.split_whitespace().collect();
-            // Column 3 is the state (0A is LISTEN), column 9 the socket inode.
-            if columns.len() > 9 && columns[3] == "0A" && inodes.contains(columns[9]) {
-                let (_, port) = columns[1].rsplit_once(':').unwrap();
-                ports.insert(u16::from_str_radix(port, 16).unwrap());
-            }
-        }
-    }
-    ports
-}
-
 fn signal(pid: u32, sig: &str) {
     let status = Command::new("kill")
         .args([sig, &pid.to_string()])
@@ -397,15 +385,32 @@ async fn exit_of(child: &mut Child, timeout: Duration) -> ExitStatus {
     }
 }
 
-/// A scratch directory with an app, its upstream, the certificate for its host and the bundle
-/// cache the agent starts from. Removed when dropped, and the agent log is printed first when the
-/// test is failing.
+/// The names in a directory, sorted.
+fn files(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A scratch directory with an app, its upstream, the certificate for its host as a key file in
+/// the key directory, and the bundle cache the agent can start from. Removed when dropped, and the
+/// agent log is printed first when the test is failing.
 struct Setup {
     dir: PathBuf,
+    /// The key directory the test puts files in.
+    keys: PathBuf,
+    /// The key directory the agent is told to use.
+    keys_env: PathBuf,
     upstream: Upstream,
     client: Arc<ClientConfig>,
-    certificate: PathBuf,
-    key: PathBuf,
+    /// The key and the certificate, as one key file holds them.
+    pem: String,
+    /// A line of the key's own body: if any output holds this, it holds the key.
+    key_body: String,
+    leaf: String,
     plain: u16,
     https: u16,
     redirect: u16,
@@ -414,65 +419,105 @@ struct Setup {
 impl Setup {
     fn new(tag: &str) -> Setup {
         let dir =
-            std::env::temp_dir().join(format!("wafio-tls-sites-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("wafio-tls-bundle-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("state")).unwrap();
         fs::write(dir.join("data.txt"), "x\n").unwrap();
+        let keys = dir.join("keys");
+        fs::DirBuilder::new().mode(0o700).create(&keys).unwrap();
         let (certificate, key, authority) = make_pki(&dir);
-        let upstream = Upstream::start();
+        let key_text = fs::read_to_string(key).unwrap();
+        let der = Command::new("openssl")
+            .args(["x509", "-outform", "DER", "-in"])
+            .arg(&certificate)
+            .output()
+            .expect("openssl is installed")
+            .stdout;
         let [plain, https, redirect] = free_ports();
-        let bundle = format!(
-            r#"{{"agent_id":"tls","project_id":"p","apps":[{{"app_id":"shop","listen_host":"127.0.0.1","listen_port":{plain},"upstream":"http://127.0.0.1:{}","mode":"block"}}]}}"#,
-            upstream.port
-        );
-        wafio_control::save_bundle_cache(
-            &dir.join("state"),
-            bundle.as_bytes(),
-            7,
-            SystemTime::now(),
-        )
-        .unwrap();
         let setup = Setup {
-            dir,
-            upstream,
+            keys_env: keys.clone(),
+            keys,
+            upstream: Upstream::start(),
             client: client_config(authority),
-            certificate,
-            key,
+            key_body: key_text.lines().nth(1).unwrap().to_owned(),
+            pem: key_text + &fs::read_to_string(certificate).unwrap(),
+            leaf: Sha256::digest(der)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            dir,
             plain,
             https,
             redirect,
         };
-        fs::write(setup.sites_file(), setup.sites().to_string()).unwrap();
+        setup.install_key();
         setup
     }
 
-    fn sites_file(&self) -> PathBuf {
-        self.dir.join("tls-sites.json")
+    /// The certificate where the bundle says it is.
+    fn install_key(&self) {
+        let path = self.keys.join(format!("{CERT}.pem"));
+        fs::write(&path, &self.pem).unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     }
 
     fn log(&self) -> PathBuf {
         self.dir.join("agent.log")
     }
 
-    /// The settings of the file: the app of the bundle also served over HTTPS and redirected from
-    /// its own plain address.
-    fn sites(&self) -> serde_json::Value {
-        serde_json::json!({"apps": {"shop": {
-            "tls": true,
-            "listen": format!("127.0.0.1:{}", self.https),
-            "hosts": [HOST],
-            "certificate": self.certificate,
-            "key": self.key,
-            "redirect_listen": format!("127.0.0.1:{}", self.redirect),
-        }}})
+    /// The `tls` object of the shop: HTTPS and redirect listeners of its own.
+    fn tls_object(&self) -> String {
+        format!(
+            r#"{{"listen":"127.0.0.1:{}","hosts":["{HOST}"],"redirect_listen":"127.0.0.1:{}","source":"uploaded","certificate_id":"{CERT}","leaf_sha256":"{}"}}"#,
+            self.https, self.redirect, self.leaf
+        )
     }
 
-    /// The agent with every flag but the sites file, no engine and no good-bot lookups.
-    fn command(&self) -> Command {
+    fn shop(&self, tls: &str) -> String {
+        format!(
+            r#"{{"app_id":"{SHOP}","listen_host":"127.0.0.1","listen_port":{},"upstream":"http://127.0.0.1:{}","mode":"block","tls":{tls}}}"#,
+            self.plain, self.upstream.port
+        )
+    }
+
+    fn bundle(&self, apps: &[String]) -> String {
+        format!(
+            r#"{{"agent_id":"tls","project_id":"p","apps":[{}]}}"#,
+            apps.join(",")
+        )
+    }
+
+    /// The bundle the agent starts from when no control plane answers.
+    fn cache(&self, bundle: &str) {
+        wafio_control::save_bundle_cache(
+            &self.dir.join("state"),
+            bundle.as_bytes(),
+            7,
+            SystemTime::now(),
+        )
+        .unwrap();
+    }
+
+    fn log_text(&self) -> String {
+        fs::read_to_string(self.log()).unwrap_or_default()
+    }
+
+    /// No byte of the key reached the log.
+    fn assert_log_has_no_key(&self) {
+        let log = self.log_text();
+        assert!(
+            !log.contains(&self.key_body) && !log.contains("PRIVATE KEY"),
+            "key material in the log: {log}"
+        );
+    }
+
+    /// The agent with every flag, no engine and no good-bot lookups, a key directory of its own and
+    /// the control plane at `grpc`.
+    fn command(&self, grpc: &str) -> Command {
         let data = self.dir.join("data.txt");
         let d = data.to_str().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_wafio-waf-agent-open"));
-        cmd.args(["--grpc-server", "127.0.0.1:1", "--agent-name", "tls-sites"])
+        cmd.args(["--grpc-server", grpc, "--agent-name", "tls-bundle"])
             .args([
                 "--client-cert",
                 &format!("{FIXTURES}/client.crt"),
@@ -497,6 +542,7 @@ impl Setup {
             .args(["--jail-threshold", "0"])
             .args(["--state-dir", self.dir.join("state").to_str().unwrap()])
             .env("RUNTIME_DIRECTORY", &self.dir)
+            .env("WAFIO_TEST_TLS_DIR", &self.keys_env)
             // A library installed on this host must not give the agent an engine.
             .env("WAFIO_ENGINE_LIB", self.dir.join("no-engine.so"))
             .env("WAFIO_TEST_GOODBOT_SOURCES", "")
@@ -505,32 +551,6 @@ impl Setup {
             .env_remove("NOTIFY_SOCKET")
             .stdout(Stdio::null());
         cmd
-    }
-
-    /// Runs the agent with `file` as its sites file until it exits: the exit code and what it
-    /// wrote to stderr. An agent that keeps running fails the test.
-    fn exit_with(&self, file: &Path) -> (Option<i32>, String) {
-        let log = self.dir.join("exit.log");
-        let mut child = self
-            .command()
-            .arg("--tls-sites-file")
-            .arg(file)
-            .stderr(Stdio::from(fs::File::create(&log).unwrap()))
-            .spawn()
-            .unwrap();
-        let end = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                return (status.code(), fs::read_to_string(&log).unwrap_or_default());
-            }
-            if Instant::now() > end {
-                let _ = child.kill();
-                let _ = child.wait();
-                let text = fs::read_to_string(&log).unwrap_or_default();
-                panic!("the agent kept running with a sites file it cannot use:\n{text}");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 }
 
@@ -555,28 +575,38 @@ struct Agent {
 }
 
 impl Agent {
-    /// Starts the agent, with the sites file when `flag` is set, and waits for READY.
-    fn start(setup: &Setup, flag: bool) -> Agent {
+    /// Starts the agent against the control plane at `grpc`; it has not said READY yet.
+    fn spawn(setup: &Setup, grpc: &str, tweak: impl FnOnce(&mut Command)) -> Agent {
         let notify_path = setup.dir.join("notify.sock");
         let notify = UnixDatagram::bind(&notify_path).unwrap();
-        let mut cmd = setup.command();
-        if flag {
-            cmd.arg("--tls-sites-file").arg(setup.sites_file());
-        }
+        let mut cmd = setup.command(grpc);
+        tweak(&mut cmd);
         let child = cmd
             .env("NOTIFY_SOCKET", &notify_path)
             .stderr(Stdio::from(fs::File::create(setup.log()).unwrap()))
             .spawn()
             .unwrap();
-        let first = child.id();
-        let agent = Agent {
-            first,
+        Agent {
+            first: child.id(),
             dir: setup.dir.clone(),
             child: Some(child),
             notify,
-        };
-        let message = ready_message(&agent.notify, Duration::from_secs(60));
-        assert_eq!(message, format!("READY=1\nMAINPID={first}\n"));
+        }
+    }
+
+    async fn ready(&self) {
+        let notify = self.notify.try_clone().unwrap();
+        let message =
+            tokio::task::spawn_blocking(move || ready_message(&notify, Duration::from_secs(60)))
+                .await
+                .unwrap();
+        assert_eq!(message, format!("READY=1\nMAINPID={}\n", self.first));
+    }
+
+    /// Starts the agent from its bundle cache, with no control plane, and waits for READY.
+    async fn start(setup: &Setup) -> Agent {
+        let agent = Agent::spawn(setup, "127.0.0.1:1", |_| {});
+        agent.ready().await;
         agent
     }
 }
@@ -596,15 +626,16 @@ impl Drop for Agent {
 }
 
 #[tokio::test]
-async fn an_app_named_in_the_sites_file_is_served_over_https_and_opens_no_plain_listener() {
-    let s = Setup::new("https");
-    let agent = Agent::start(&s, true);
-    assert_eq!(
-        listening_ports(agent.first),
-        BTreeSet::from([s.https, s.redirect])
-    );
-    assert!(TcpStream::connect(("127.0.0.1", s.plain)).await.is_err());
+async fn an_app_with_a_tls_object_is_served_over_https_from_a_cached_bundle_and_a_key_file() {
+    let s = Setup::new("start");
+    s.cache(&s.bundle(&[s.shop(&s.tls_object())]));
+    let agent = Agent::spawn(&s, "127.0.0.1:1", |cmd| {
+        cmd.env("WAFIO_TLS_SITES_FILE", "/etc/wafio/tls-sites.json");
+    });
+    agent.ready().await;
 
+    // The app opens no plain listener of its own; its HTTPS and redirect listeners are up.
+    assert!(TcpStream::connect(("127.0.0.1", s.plain)).await.is_err());
     let mut client = Https::connect(s.https, &s.client, HOST).await.unwrap();
     assert_eq!(client.alpn().as_deref(), Some(&b"http/1.1"[..]));
     for _ in 0..2 {
@@ -614,24 +645,12 @@ async fn an_app_named_in_the_sites_file_is_served_over_https_and_opens_no_plain_
     let heads = s.upstream.heads();
     assert_eq!(heads.len(), 2, "{heads:?}");
     assert!(
-        heads[0].starts_with("GET /cart?a=1 HTTP/1.1"),
-        "{}",
-        heads[0]
-    );
-    assert!(
         heads[0]
             .to_ascii_lowercase()
             .contains("x-forwarded-proto: https"),
         "the upstream is told the request came over HTTPS: {}",
         heads[0]
     );
-}
-
-#[tokio::test]
-async fn the_redirect_listener_answers_308_to_the_https_address_and_proxies_nothing() {
-    let s = Setup::new("redirect");
-    let _agent = Agent::start(&s, true);
-
     let host = format!("{HOST}:{}", s.redirect);
     let r = plain(s.redirect, &host, "/cart?a=1").await.unwrap();
     assert_eq!(r.status, 308);
@@ -639,9 +658,52 @@ async fn the_redirect_listener_answers_308_to_the_https_address_and_proxies_noth
         r.header("location"),
         Some(format!("https://{HOST}:{}/cart?a=1", s.https).as_str())
     );
-    let r = plain(s.redirect, "other.test", "/").await.unwrap();
-    assert_eq!(r.status, 404);
-    assert!(s.upstream.heads().is_empty());
+
+    // The directory holds the certificate, what the agent remembers about it, and the lock.
+    assert_eq!(
+        files(&s.keys),
+        [
+            format!("{CERT}.pem"),
+            "state.json".into(),
+            "tls.lock".into()
+        ]
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(s.keys.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["apps"][SHOP]["served"], format!("{CERT}.pem"));
+    assert!(
+        !String::from_utf8_lossy(&fs::read(s.keys.join("state.json")).unwrap())
+            .contains(&s.key_body)
+    );
+    // The old settings file is no longer read, and says so.
+    let log = s.log_text();
+    assert_eq!(
+        log.matches("WAFIO_TLS_SITES_FILE is no longer read")
+            .count(),
+        1,
+        "{log}"
+    );
+    s.assert_log_has_no_key();
+}
+
+#[tokio::test]
+async fn an_agent_without_a_usable_key_directory_serves_the_app_as_its_bundle_says() {
+    let mut s = Setup::new("no-dir");
+    // The parent of the directory is not there, and the agent does not make it.
+    s.keys_env = s.dir.join("missing/tls");
+    s.cache(&s.bundle(&[s.shop(&s.tls_object())]));
+    let _agent = Agent::start(&s).await;
+
+    let r = plain(s.plain, HOST, "/").await.unwrap();
+    assert_eq!((r.status, r.body.as_str()), (200, "ok"));
+    for port in [s.https, s.redirect] {
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    }
+    let log = s.log_text();
+    assert!(
+        log.contains("does not serve apps over HTTPS") && log.contains("missing/tls"),
+        "{log}"
+    );
 }
 
 /// Connects, asks for `/probe` and closes, over and over, and reports how many tries were made and
@@ -672,11 +734,15 @@ async fn probe_until(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-async fn a_reload_hands_over_the_https_listeners_without_a_refused_connection_and_finishes_the_request_in_flight()
- {
+async fn a_reload_hands_over_the_sockets_and_the_key_directory_while_connections_go_on() {
     let s = Setup::new("reload");
-    let mut agent = Agent::start(&s, true);
+    s.cache(&s.bundle(&[s.shop(&s.tls_object())]));
+    let mut agent = Agent::start(&s).await;
     let first = agent.first;
+    // A file no app of the bundle names, put there after the first process applied it: only the
+    // process that holds the lock removes it.
+    let orphan = s.keys.join(format!("{ORPHAN}.pem"));
+    fs::write(&orphan, "not a certificate anyone wants").unwrap();
 
     let mut idle = Https::connect(s.https, &s.client, HOST).await.unwrap();
     assert_eq!(idle.send(&get("/idle")).await.unwrap().status, 200);
@@ -705,8 +771,7 @@ async fn a_reload_hands_over_the_https_listeners_without_a_refused_connection_an
     assert_ne!(second, first);
     // The predecessor learns of the successor a moment after the successor reports ready.
     until("the predecessor to start draining", || {
-        let log = fs::read_to_string(s.log()).unwrap_or_default();
-        log.contains("took over; draining")
+        s.log_text().contains("took over; draining")
     })
     .await;
     assert!(alive(first), "the predecessor drains the request in flight");
@@ -726,12 +791,31 @@ async fn a_reload_hands_over_the_https_listeners_without_a_refused_connection_an
     let mut fresh = Https::connect(s.https, &s.client, HOST).await.unwrap();
     let r = fresh.send(&get("/fresh")).await.unwrap();
     assert_eq!((r.status, r.body.as_str()), (200, "ok"));
-    let r = plain(s.redirect, HOST, "/").await.unwrap();
-    assert_eq!(r.status, 308);
+    assert_eq!(plain(s.redirect, HOST, "/").await.unwrap().status, 308);
+    assert!(TcpStream::connect(("127.0.0.1", s.plain)).await.is_err());
+
+    // The successor served from the files it read while the predecessor held the lock, left the
+    // orphan alone until the lock was handed over, and then removed it.
+    until("the successor to remove the orphan", || !orphan.exists()).await;
+    let log = s.log_text();
+    let at = |line: &str| {
+        log.find(line)
+            .unwrap_or_else(|| panic!("{line:?} not in the log:\n{log}"))
+    };
+    let waits = at("[tls] another process holds the key directory lock");
+    let handed = at("[tls] key directory lock handed over");
+    let took = at("[tls] this process writes in the key directory now");
+    assert!(
+        waits < handed && handed < took,
+        "{waits} {handed} {took}\n{log}"
+    );
     assert_eq!(
-        listening_ports(second),
-        BTreeSet::from([s.https, s.redirect]),
-        "the successor holds both sockets"
+        files(&s.keys),
+        [
+            format!("{CERT}.pem"),
+            "state.json".into(),
+            "tls.lock".into()
+        ]
     );
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -746,80 +830,208 @@ async fn a_reload_hands_over_the_https_listeners_without_a_refused_connection_an
         "{} of {tries} tries failed: {failures:?}",
         failures.len()
     );
-}
-
-#[test]
-fn a_sites_file_that_cannot_be_used_stops_the_start_and_says_why_without_key_material() {
-    let s = Setup::new("bad-file");
-    let key_text = fs::read_to_string(&s.key).unwrap();
-    // A line of the key's own body: if the message holds this, it holds the key.
-    let key_body = key_text.lines().nth(1).unwrap().to_owned();
-    let file = s.dir.join("bad-sites.json");
-    let with = |change: &dyn Fn(&mut serde_json::Value)| {
-        let mut sites = s.sites();
-        change(&mut sites["apps"]["shop"]);
-        sites.to_string()
-    };
-    let missing = s.dir.join("missing.crt");
-    let cases = [
-        (
-            "not JSON",
-            r#"{"apps": {"#.to_owned(),
-            vec!["EOF while parsing".to_owned()],
-        ),
-        (
-            "a wildcard host",
-            with(&|app| app["hosts"] = serde_json::json!(["*.shop.test"])),
-            vec!["app shop".to_owned(), "wildcard".to_owned()],
-        ),
-        (
-            "a certificate file that is not there",
-            with(&|app| app["certificate"] = missing.to_str().unwrap().into()),
-            vec![
-                "app shop".to_owned(),
-                missing.to_str().unwrap().to_owned(),
-                "cannot read".to_owned(),
-            ],
-        ),
-        (
-            "the key written into the file in place of its name",
-            with(&|app| app["key"] = key_text.clone().into()),
-            vec![
-                "app shop".to_owned(),
-                "key must be the name of a file".to_owned(),
-            ],
-        ),
-    ];
-    for (what, content, expected) in cases {
-        fs::write(&file, content).unwrap();
-        let (code, stderr) = s.exit_with(&file);
-        assert_eq!(code, Some(1), "{what}: {stderr}");
-        let line = stderr
-            .lines()
-            .find(|l| l.starts_with("wafio-waf-agent: "))
-            .unwrap_or_else(|| panic!("{what}: no message from the agent: {stderr}"));
-        assert!(
-            line.contains(&format!("--tls-sites-file {}", file.display())),
-            "{what}: {line}"
-        );
-        for part in expected {
-            assert!(line.contains(&part), "{what}: {part:?} not in {line}");
-        }
-        assert!(
-            !stderr.contains(&key_body) && !stderr.contains("PRIVATE KEY"),
-            "{what}: key material in the output: {stderr}"
-        );
-    }
+    s.assert_log_has_no_key();
+    signal(second, "-TERM");
 }
 
 #[tokio::test]
-async fn an_agent_started_without_the_flag_opens_only_the_listener_its_bundle_names() {
-    let s = Setup::new("no-flag");
-    let agent = Agent::start(&s, false);
-    assert_eq!(listening_ports(agent.first), BTreeSet::from([s.plain]));
-    for port in [s.https, s.redirect] {
-        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+async fn a_process_that_finds_the_key_directory_locked_serves_what_it_reads_and_writes_nothing() {
+    let s = Setup::new("locked");
+    s.cache(&s.bundle(&[s.shop(&s.tls_object())]));
+    let orphan = s.keys.join(format!("{ORPHAN}.pem"));
+    fs::write(&orphan, "not a certificate anyone wants").unwrap();
+    // The process this one replaces holds the lock.
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(s.keys.join("tls.lock"))
+        .unwrap();
+    let lock = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock).unwrap();
+    let before = files(&s.keys);
+
+    let _agent = Agent::start(&s).await;
+    let mut client = Https::connect(s.https, &s.client, HOST).await.unwrap();
+    let r = client.send(&get("/")).await.unwrap();
+    assert_eq!(
+        (r.status, r.body.as_str()),
+        (200, "ok"),
+        "it serves the file it read"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(files(&s.keys), before, "it made, removed and wrote nothing");
+    assert!(orphan.exists());
+
+    drop(lock);
+    until("the agent to take the lock and clean up", || {
+        !orphan.exists()
+    })
+    .await;
+    assert_eq!(
+        files(&s.keys),
+        [
+            format!("{CERT}.pem"),
+            "state.json".into(),
+            "tls.lock".into()
+        ]
+    );
+    assert!(
+        s.log_text()
+            .contains("[tls] this process writes in the key directory now")
+    );
+    let r = client.send(&get("/again")).await.unwrap();
+    assert_eq!(r.status, 200, "the connection that was open goes on");
+    s.assert_log_has_no_key();
+}
+
+/// A control plane that hands every connection of the agent to the test.
+struct Conn {
+    inbound: Streaming<AgentMessage>,
+    out: mpsc::Sender<Result<ServerMessage, Status>>,
+}
+
+impl Conn {
+    async fn next(&mut self) -> AgentMessage {
+        tokio::time::timeout(Duration::from_secs(30), self.inbound.message())
+            .await
+            .expect("agent message")
+            .unwrap()
+            .expect("stream open")
     }
-    let r = plain(s.plain, HOST, "/").await.unwrap();
-    assert_eq!((r.status, r.body.as_str()), (200, "ok"));
+
+    /// Sends `bundle` and returns the ack the agent answers it with.
+    async fn bundle(&mut self, id: &str, generation: i64, bundle: String) -> (bool, String) {
+        let bu = BundleUpdate {
+            command_id: id.into(),
+            generation,
+            bundle_json: bundle.into_bytes(),
+        };
+        self.out
+            .send(Ok(ServerMessage {
+                kind: Some(In::Bundle(bu)),
+            }))
+            .await
+            .unwrap();
+        loop {
+            if let Some(Out::Ack(a)) = self.next().await.kind
+                && a.command_id == id
+            {
+                return (a.ok, a.error);
+            }
+        }
+    }
+}
+
+struct Fake {
+    conns: mpsc::UnboundedSender<Conn>,
+}
+
+#[tonic::codegen::async_trait]
+impl AgentControl for Fake {
+    type StreamStream = ReceiverStream<Result<ServerMessage, Status>>;
+    async fn stream(
+        &self,
+        req: Request<Streaming<AgentMessage>>,
+    ) -> Result<Response<Self::StreamStream>, Status> {
+        let (tx, rx) = mpsc::channel(16);
+        let w = Welcome {
+            agent_id: "agent-uuid".into(),
+            server_time_unix: 1,
+            heartbeat_seconds: 30,
+        };
+        tx.send(Ok(ServerMessage {
+            kind: Some(In::Welcome(w)),
+        }))
+        .await
+        .unwrap();
+        let _ = self.conns.send(Conn {
+            inbound: req.into_inner(),
+            out: tx,
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type DownloadMalwareDatabaseStream = tonic::codegen::tokio_stream::Iter<
+        std::vec::IntoIter<Result<MalwareDatabaseChunk, Status>>,
+    >;
+    async fn download_malware_database(
+        &self,
+        _: Request<MalwareDatabaseRequest>,
+    ) -> Result<Response<Self::DownloadMalwareDatabaseStream>, Status> {
+        Err(Status::unimplemented("not part of this test"))
+    }
+}
+
+fn fx(name: &str) -> Vec<u8> {
+    fs::read(Path::new(FIXTURES).join(name)).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_one_serves_on() {
+    let s = Setup::new("refused");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cp = listener.local_addr().unwrap().to_string();
+    let (tx, mut conns) = mpsc::unbounded_channel();
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(fx("server.crt"), fx("server.key")))
+        .client_ca_root(Certificate::from_pem(fx("ca.crt")));
+    tokio::spawn(
+        Server::builder()
+            .tls_config(tls)
+            .unwrap()
+            .add_service(AgentControlServer::new(Fake { conns: tx }))
+            .serve_with_incoming(TcpIncoming::from(listener)),
+    );
+    let agent = Agent::spawn(&s, &cp, |_| {});
+
+    // The start probe, then the stream.
+    let mut probe = tokio::time::timeout(Duration::from_secs(30), conns.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(Out::Hello(_)) = probe.next().await.kind else {
+        panic!("probe: no Hello")
+    };
+    let mut c = tokio::time::timeout(Duration::from_secs(30), conns.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(Out::Hello(_)) = c.next().await.kind else {
+        panic!("stream: no Hello")
+    };
+
+    let shop = s.shop(&s.tls_object());
+    let (ok, error) = c
+        .bundle("b1", 1, s.bundle(std::slice::from_ref(&shop)))
+        .await;
+    assert!(ok, "the first bundle was refused: {error}");
+    agent.ready().await;
+    let mut client = Https::connect(s.https, &s.client, HOST).await.unwrap();
+    assert_eq!(client.send(&get("/one")).await.unwrap().status, 200);
+
+    // A second app whose entry names a wildcard: the whole bundle is refused.
+    let bad = format!(
+        r#"{{"app_id":"{BLOG}","listen_host":"127.0.0.1","listen_port":1,"upstream":"http://127.0.0.1:1","mode":"block","tls":{{"listen":"0.0.0.0:443","hosts":["*.shop.test"],"source":"acme"}}}}"#
+    );
+    let (ok, error) = c.bundle("b2", 2, s.bundle(&[shop.clone(), bad])).await;
+    assert_eq!((ok, error.as_str()), (false, "invalid TLS site settings"));
+    let log = s.log_text();
+    assert!(log.contains(BLOG) && log.contains("wildcard"), "{log}");
+    // The first bundle serves on: the open connection and a new one.
+    assert_eq!(client.send(&get("/two")).await.unwrap().status, 200);
+    let mut fresh = Https::connect(s.https, &s.client, HOST).await.unwrap();
+    assert_eq!(fresh.send(&get("/three")).await.unwrap().status, 200);
+    let cache = fs::read_to_string(s.dir.join("state/last-bundle.json")).unwrap();
+    assert!(
+        cache.contains("\"generation\":1,"),
+        "the cache still has the first bundle: {cache}"
+    );
+    assert!(!cache.contains(BLOG));
+
+    // A bundle without the bad entry applies.
+    let (ok, error) = c.bundle("b3", 3, s.bundle(&[shop])).await;
+    assert!(ok, "{error}");
+    assert_eq!(fresh.send(&get("/four")).await.unwrap().status, 200);
+    s.assert_log_has_no_key();
 }

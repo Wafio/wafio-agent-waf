@@ -28,10 +28,17 @@ use pingora::tls::{
 use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
-use wafio_proxy::cert_store::{BookEntry, CertFiles, load_certified_key};
+use wafio_proxy::cert_store::{BookChange, BookEntry, certified_key_from_pem};
 use wafio_proxy::{AppSpec, Proxy, ProxyOptions, TlsSite};
 
 use common::*;
+
+/// A certificate chain (leaf first) and its private key, both PEM files.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CertFiles {
+    certificate: PathBuf,
+    key: PathBuf,
+}
 
 /// A certificate authority in a scratch directory, removed on drop, and the certificates it signs.
 struct Pki(PathBuf);
@@ -301,7 +308,10 @@ fn with_tls(mut a: AppSpec, port: u16, hosts: &[&str], files: &CertFiles) -> App
     a.tls = Some(TlsSite {
         listen: format!("127.0.0.1:{port}"),
         hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
-        cert: files.clone(),
+        certificate: BookChange::Set(BookEntry {
+            key: key_of(files),
+            placeholder: false,
+        }),
         redirect_listen: None,
     });
     a
@@ -510,7 +520,12 @@ async fn the_plain_listener_redirects_every_method_to_https_and_keeps_host_path_
 
 /// The key of a pair of files, as the book holds it.
 fn key_of(files: &CertFiles) -> Arc<CertifiedKey> {
-    Arc::new(load_certified_key(files).unwrap())
+    let pem = [
+        fs::read(&files.key).unwrap(),
+        fs::read(&files.certificate).unwrap(),
+    ]
+    .concat();
+    Arc::new(certified_key_from_pem(&pem).unwrap())
 }
 
 /// The DER of the leaf of a pair of files.
@@ -519,17 +534,15 @@ fn leaf_of(files: &CertFiles) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn a_replaced_certificate_file_is_served_after_the_next_apply_and_open_connections_go_on() {
+async fn an_apply_that_names_a_certificate_switches_it_and_one_that_names_none_leaves_it() {
     let up = http_upstream().await;
     let pki = Pki::new();
     let files = pki.leaf("shop", &["shop.test"]);
     let port = free_port();
     let h = Harness::new();
-    let apply = || {
-        h.proxy
-            .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
-    };
-    apply().unwrap();
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
     let mut open = Https::connect(port, &pki, "shop.test").await.unwrap();
     let before = open.certificate();
     assert_eq!(
@@ -537,19 +550,20 @@ async fn a_replaced_certificate_file_is_served_after_the_next_apply_and_open_con
         200
     );
 
-    // The way a renewal tool does it: write the new pair aside, then move it over the old one.
-    let renewed = pki.leaf("renewed", &["shop.test"]);
-    fs::rename(&renewed.key, &files.key).unwrap();
-    fs::rename(&renewed.certificate, &files.certificate).unwrap();
-    // Nothing looks at the files between applies.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // An app that brings no certificate keeps the one the book holds.
+    let mut keeps = tls_app("shop", &up, port, &["shop.test"], &files);
+    keeps.tls.as_mut().unwrap().certificate = BookChange::Keep;
+    h.proxy.apply(vec![keeps]).unwrap();
     let unchanged = Https::connect(port, &pki, "shop.test").await.unwrap();
     assert_eq!(unchanged.certificate(), before);
 
-    apply().unwrap();
+    let renewed = pki.leaf("renewed", &["shop.test"]);
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &renewed)])
+        .unwrap();
     let mut fresh = Https::connect(port, &pki, "shop.test").await.unwrap();
     assert_ne!(fresh.certificate(), before);
-    assert_eq!(fresh.certificate(), leaf_of(&files));
+    assert_eq!(fresh.certificate(), leaf_of(&renewed));
     assert_eq!(
         fresh
             .send(&get_host("shop.test", "/"))
@@ -570,30 +584,30 @@ async fn a_replaced_certificate_file_is_served_after_the_next_apply_and_open_con
 }
 
 #[tokio::test]
-async fn a_pair_that_cannot_be_read_fails_the_apply_and_keeps_the_old_certificate() {
+async fn an_apply_that_clears_the_certificate_stops_serving_it_until_one_is_named_again() {
     let up = http_upstream().await;
     let pki = Pki::new();
     let files = pki.leaf("shop", &["shop.test"]);
     let port = free_port();
     let h = Harness::new();
-    let apply = || {
-        h.proxy
-            .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
-    };
-    apply().unwrap();
-    let before = Https::connect(port, &pki, "shop.test")
-        .await
-        .unwrap()
-        .certificate();
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    assert!(Https::connect(port, &pki, "shop.test").await.is_ok());
 
-    fs::write(&files.certificate, b"half a copy").unwrap();
-    assert_eq!(apply(), Err("invalid TLS site settings".into()));
-    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
-    assert_eq!(c.certificate(), before);
-    assert_eq!(
-        c.send(&get_host("shop.test", "/")).await.unwrap().status,
-        200
+    let mut cleared = tls_app("shop", &up, port, &["shop.test"], &files);
+    cleared.tls.as_mut().unwrap().certificate = BookChange::Clear;
+    h.proxy.apply(vec![cleared]).unwrap();
+    assert!(h.proxy.certificates().get("shop").is_none());
+    assert!(
+        Https::connect(port, &pki, "shop.test").await.is_err(),
+        "the certificate the bundle no longer names is not served"
     );
+
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    assert!(Https::connect(port, &pki, "shop.test").await.is_ok());
 }
 
 #[tokio::test]
@@ -673,29 +687,6 @@ async fn a_reload_keeps_the_https_listener_and_changes_what_it_serves() {
         "the open connection follows the new route"
     );
     let mut b = Https::connect(port, &pki, "b.test").await.unwrap();
-    assert_eq!(
-        b.send(&get_host("b.test", "/"))
-            .await
-            .unwrap()
-            .header("x-tag"),
-        Some("b")
-    );
-
-    // An apply that cannot load a certificate changes nothing.
-    let mut missing = fb.clone();
-    missing.key = "/nonexistent/b.key".into();
-    assert_eq!(
-        h.proxy
-            .apply(vec![tls_app("a", &u1, port, &["a.test"], &missing)]),
-        Err("invalid TLS site settings".into())
-    );
-    assert_eq!(
-        open.send(&get_host("a.test", "/"))
-            .await
-            .unwrap()
-            .header("x-tag"),
-        Some("u2")
-    );
     assert_eq!(
         b.send(&get_host("b.test", "/"))
             .await
@@ -1733,7 +1724,7 @@ async fn the_redirect_listener_answers_503_until_the_app_has_a_real_certificate_
     // A real certificate: the redirect, as before.
     book.follow(HashMap::from([(
         "shop".to_owned(),
-        Some(BookEntry {
+        BookChange::Set(BookEntry {
             key: key_of(&files),
             placeholder: false,
         }),

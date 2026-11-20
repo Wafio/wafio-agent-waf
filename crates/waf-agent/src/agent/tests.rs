@@ -6,13 +6,15 @@ use wafio_application::blocklist::BlockStore;
 use super::*;
 use crate::executor::startup_executor;
 use crate::ready::ReadyActions;
+use crate::tls::dir::tests::{Scratch, my_uid};
+use crate::tls::tests::make_pem;
 
 /// Records what the proxy would get; fails when told to.
 #[derive(Default)]
 struct FakeProxy {
     applied: Mutex<Vec<Vec<(String, u16, String)>>>,
-    /// The HTTPS address of each app of each apply.
-    tls: Mutex<Vec<Vec<Option<String>>>>,
+    /// The HTTPS site of each app of each apply.
+    tls: Mutex<Vec<Vec<Option<wafio_proxy::TlsSite>>>>,
     fail: Mutex<Option<String>>,
 }
 
@@ -26,11 +28,10 @@ impl RouteSink for FakeProxy {
                 .map(|a| (a.app_id.clone(), a.listen_port, a.mode.clone()))
                 .collect(),
         );
-        self.tls.lock().unwrap().push(
-            apps.iter()
-                .map(|a| a.tls.as_ref().map(|t| t.listen.clone()))
-                .collect(),
-        );
+        self.tls
+            .lock()
+            .unwrap()
+            .push(apps.iter().map(|a| a.tls.clone()).collect());
         Ok(())
     }
 }
@@ -79,20 +80,38 @@ fn first_bundle_applies_and_signals_ready() {
     assert!(a.shared_executor().is_some());
 }
 
-/// An agent whose apps `sites` names are served over HTTPS.
-fn agent_serving(sites: Vec<(&str, &str)>) -> (Agent, Arc<FakeProxy>) {
+const SHOP: &str = "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11";
+const BLOG: &str = "6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90";
+const CERT: &str = "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77";
+
+/// An app entry of a bundle, with a `tls` object when `tls` is given.
+fn app_json(id: &str, port: u32, tls: Option<&str>) -> String {
+    let tls = tls.map_or(String::new(), |t| format!(r#","tls":{t}"#));
+    format!(
+        r#"{{"app_id":"{id}","listen_host":"127.0.0.1","listen_port":{port},"upstream":"http://127.0.0.1:9000","mode":"monitor"{tls}}}"#
+    )
+}
+
+fn bundle_of(apps: &[String]) -> String {
+    format!(
+        r#"{{"agent_id":"x","project_id":"p1","apps":[{}]}}"#,
+        apps.join(",")
+    )
+}
+
+fn tls_object(host: &str, cert: &str, leaf: &str) -> String {
+    format!(
+        r#"{{"listen":"0.0.0.0:443","hosts":["{host}"],"source":"uploaded","certificate_id":"{cert}","leaf_sha256":"{leaf}"}}"#
+    )
+}
+
+/// An agent with a key directory in a scratch directory.
+fn agent_with_keys() -> (Arc<Agent>, Arc<FakeProxy>, Scratch) {
+    let scratch = Scratch::new();
     let stores = Stores::new();
     let base = startup_executor(&stores, "", None).unwrap();
     let proxy = Arc::new(FakeProxy::default());
-    let site = |host: &str| wafio_proxy::TlsSite {
-        listen: "0.0.0.0:443".into(),
-        hosts: vec![host.into()],
-        cert: wafio_proxy::cert_store::CertFiles {
-            certificate: "/etc/wafio/tls/shop.crt".into(),
-            key: "/etc/wafio/tls/shop.key".into(),
-        },
-        redirect_listen: None,
-    };
+    let dir = KeyDir::open(&scratch.dir(), my_uid()).unwrap();
     let a = Agent::new(
         base,
         stores,
@@ -100,67 +119,257 @@ fn agent_serving(sites: Vec<(&str, &str)>) -> (Agent, Arc<FakeProxy>) {
         Arc::new(VerifiedBotChecker::new()),
         Arc::new(Ready::new(ReadyActions::default())),
     )
-    .with_tls_sites(
-        sites
-            .into_iter()
-            .map(|(app, host)| (app.to_string(), site(host)))
-            .collect(),
-    );
-    (a, proxy)
+    .with_key_dir(dir);
+    (Arc::new(a), proxy, scratch)
 }
 
 #[test]
-fn only_an_app_named_in_the_tls_sites_is_served_over_https() {
-    let (a, proxy) = agent_serving(vec![("a1", "shop.example.com")]);
-    let other = APP.replace("a1", "a2").replace("18080", "18081");
-    apply(
-        &a,
-        &format!(r#"{{"agent_id":"x","project_id":"p1","apps":[{APP},{other}]}}"#),
-        1,
-    )
-    .unwrap();
-    assert_eq!(
-        proxy.tls.lock().unwrap()[0],
-        vec![Some("0.0.0.0:443".to_string()), None]
+fn only_an_app_with_a_tls_object_is_served_over_https() {
+    let (a, proxy, _dir) = agent_with_keys();
+    let other = app_json(BLOG, 18081, None);
+    let shop = app_json(
+        SHOP,
+        18080,
+        Some(&tls_object("shop.example.com", CERT, &"ab".repeat(32))),
     );
+    apply(&a, &bundle_of(&[shop, other]), 1).unwrap();
+    let sites = &proxy.tls.lock().unwrap()[0];
+    let site = sites[0].as_ref().unwrap();
+    assert_eq!(site.listen, "0.0.0.0:443");
+    assert_eq!(site.hosts, ["shop.example.com"]);
+    assert!(
+        matches!(site.certificate, BookChange::Keep),
+        "its file is not in the directory, so the book keeps what it holds"
+    );
+    assert!(sites[1].is_none());
+    let apps = a.tls_apps();
+    assert_eq!(apps.len(), 1);
+    assert_eq!((apps[0].0.as_str(), &apps[0].2), (SHOP, &None));
+}
+
+#[test]
+fn the_certificate_in_the_key_directory_goes_to_the_proxy_with_its_app() {
+    let (a, proxy, dir) = agent_with_keys();
+    let (pem, leaf) = make_pem(&dir.0, "shop");
+    std::fs::write(dir.dir().join(format!("{CERT}.pem")), &pem).unwrap();
+    let shop = app_json(
+        SHOP,
+        18080,
+        Some(&tls_object("shop.example.com", CERT, &leaf)),
+    );
+    apply(&a, &bundle_of(std::slice::from_ref(&shop)), 1).unwrap();
+    let site = proxy.tls.lock().unwrap()[0][0].clone().unwrap();
+    let BookChange::Set(entry) = site.certificate else {
+        panic!("the proxy gets the certificate");
+    };
+    assert!(!entry.placeholder);
+    assert_eq!(
+        a.tls_apps()[0].2.as_deref(),
+        Some(format!("{CERT}.pem").as_str())
+    );
+
+    // The same bundle again reads nothing and hands over the same key.
+    std::fs::remove_file(dir.dir().join(format!("{CERT}.pem"))).unwrap();
+    apply(&a, &bundle_of(&[shop]), 2).unwrap();
+    let again = proxy.tls.lock().unwrap()[1][0].clone().unwrap();
+    let BookChange::Set(again) = again.certificate else {
+        panic!("the proxy gets the certificate again");
+    };
+    assert!(Arc::ptr_eq(&entry.key, &again.key));
+}
+
+#[test]
+fn an_app_whose_bundle_names_no_certificate_any_more_has_the_one_it_had_cleared_in_the_proxy() {
+    let (a, proxy, dir) = agent_with_keys();
+    let (pem, leaf) = make_pem(&dir.0, "shop");
+    let file = dir.dir().join(format!("{CERT}.pem"));
+    std::fs::write(&file, &pem).unwrap();
+    let with = |tls: String| bundle_of(&[app_json(SHOP, 18080, Some(&tls))]);
+    apply(&a, &with(tls_object("shop.example.com", CERT, &leaf)), 1).unwrap();
+    assert_eq!(
+        a.tls_apps()[0].2.as_deref(),
+        Some(format!("{CERT}.pem").as_str())
+    );
+
+    // Uploaded with no certificate named, source empty, a source this agent does not know.
+    let none = [
+        r#"{"hosts":["shop.example.com"],"source":"uploaded"}"#,
+        r#"{"hosts":["shop.example.com"],"source":""}"#,
+        r#"{"hosts":["shop.example.com"],"source":"mystery"}"#,
+    ];
+    for (n, tls) in none.iter().enumerate() {
+        let generation = 2 + n as i64;
+        std::fs::write(&file, &pem).unwrap();
+        apply(
+            &a,
+            &with(tls_object("shop.example.com", CERT, &leaf)),
+            generation * 10,
+        )
+        .unwrap();
+        apply(&a, &with((*tls).to_owned()), generation * 10 + 1).unwrap();
+        let sent = proxy.tls.lock().unwrap();
+        let site = sent.last().unwrap()[0].as_ref().unwrap();
+        assert!(matches!(site.certificate, BookChange::Clear), "{tls}");
+        assert_eq!(a.tls_apps()[0].2, None, "{tls}");
+        assert!(!file.exists(), "its file goes with it: {tls}");
+    }
 }
 
 #[test]
 fn the_bundle_address_of_an_app_served_over_https_is_not_checked() {
-    let (a, proxy) = agent_serving(vec![("a1", "shop.example.com"), ("a3", "big.example.com")]);
-    // a2 plain on the address a1's bundle entry names; a3 names a port that cannot be bound.
-    let same_address = APP.replace("a1", "a2");
-    let big_port = APP.replace("a1", "a3").replace("18080", "70000");
-    apply(
-        &a,
-        &format!(
-            r#"{{"agent_id":"x","project_id":"p1","apps":[{APP},{same_address},{big_port}]}}"#
-        ),
-        1,
-    )
-    .unwrap();
+    let (a, proxy, _dir) = agent_with_keys();
+    // blog is plain on the address shop's bundle entry names; big names a port that cannot be bound.
+    let tls = tls_object("shop.example.com", CERT, &"ab".repeat(32));
+    let shop = app_json(SHOP, 18080, Some(&tls));
+    let blog = app_json(BLOG, 18080, None);
+    let big = app_json(
+        "1a2b3c4d-0000-4000-8000-000000000001",
+        70000,
+        Some(&tls.replace("shop", "big")),
+    );
+    apply(&a, &bundle_of(&[shop.clone(), blog.clone(), big]), 1).unwrap();
     assert_eq!(proxy.applied.lock().unwrap()[0].len(), 3);
 
-    // The same two entries without an HTTPS site are still refused.
-    let (plain, _) = agent_serving(Vec::new());
+    // The same entries without a tls object are still refused.
+    let (plain, _, _) = agent();
+    let plain_shop = app_json(SHOP, 18080, None);
     assert_eq!(
-        apply(
-            &plain,
-            &format!(r#"{{"agent_id":"x","apps":[{APP},{same_address}]}}"#),
-            1
-        ),
+        apply(&plain, &bundle_of(&[plain_shop, blog]), 1),
         Err(BundleError::Apply(
             "duplicate listener in WAF bundle".into()
         ))
     );
     assert_eq!(
-        apply(
-            &plain,
-            &format!(r#"{{"agent_id":"x","apps":[{big_port}]}}"#),
-            1
-        ),
+        apply(&plain, &bundle_of(&[app_json(SHOP, 70000, None)]), 1),
         Err(BundleError::Apply(
             "failed to bind WAF route listener".into()
+        ))
+    );
+}
+
+#[test]
+fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_one_serves_on() {
+    let (a, proxy, _dir) = agent_with_keys();
+    let good = tls_object("shop.example.com", CERT, &"ab".repeat(32));
+    let shop = app_json(SHOP, 18080, Some(&good));
+    apply(&a, &bundle_of(std::slice::from_ref(&shop)), 1).unwrap();
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let bad = app_json(
+        BLOG,
+        18081,
+        Some(&good.replace("shop.example.com", "*.example.com")),
+    );
+    let refused = tracing::subscriber::with_default(Collect(lines.clone()), || {
+        apply(&a, &bundle_of(&[shop.clone(), bad]), 2)
+    });
+    assert_eq!(
+        refused,
+        Err(BundleError::Apply("invalid TLS site settings".into()))
+    );
+    assert_eq!(
+        proxy.applied.lock().unwrap().len(),
+        1,
+        "the proxy was not asked"
+    );
+    assert_eq!(a.generation().0, 1);
+    assert_eq!(a.app_ids(), [SHOP]);
+    let lines = lines.lock().unwrap().join("\n");
+    assert!(lines.contains(BLOG) && lines.contains("hosts"), "{lines}");
+
+    // An app id that is no UUID cannot name files either.
+    let named = app_json("shop", 18082, Some(&good));
+    assert_eq!(
+        apply(&a, &bundle_of(&[shop, named]), 3),
+        Err(BundleError::Apply("invalid TLS site settings".into()))
+    );
+}
+
+#[test]
+fn without_a_key_directory_the_tls_object_is_not_read() {
+    let (a, proxy, _) = agent();
+    let broken = app_json(SHOP, 18080, Some(r#"{"hosts":["*"],"listen":"x"}"#));
+    apply(&a, &bundle_of(&[broken]), 1).unwrap();
+    assert!(
+        proxy.tls.lock().unwrap()[0][0].is_none(),
+        "served as its bundle says"
+    );
+    assert!(a.tls_apps().is_empty());
+}
+
+#[test]
+fn the_apply_lock_keeps_a_bundle_out_between_a_check_and_its_commit() {
+    let (a, _proxy, _dir) = agent_with_keys();
+    let tls = tls_object("shop.example.com", CERT, &"ab".repeat(32));
+    apply(&a, &bundle_of(&[app_json(SHOP, 18080, Some(&tls))]), 1).unwrap();
+
+    let lock = a.apply_lock();
+    // The check of an install: the app and its settings in the bundle in force.
+    let checked = lock
+        .settings(SHOP)
+        .cloned()
+        .expect("the bundle names the app");
+    assert!(lock.settings(BLOG).is_none());
+
+    // A bundle that takes the app out waits for the lock.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let applier = {
+        let a = a.clone();
+        std::thread::spawn(move || {
+            let r = apply(&a, &bundle_of(&[app_json(BLOG, 18081, None)]), 2);
+            done_tx.send(()).unwrap();
+            r
+        })
+    };
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "the bundle applied while a check was waiting for its commit"
+    );
+    // The commit: what the check saw is still what the bundle in force says.
+    let committed = lock.settings(SHOP).cloned();
+    assert_eq!(committed, Some(checked));
+    drop(lock);
+
+    applier.join().unwrap().unwrap();
+    assert!(
+        a.apply_lock().settings(SHOP).is_none(),
+        "the app left with the bundle"
+    );
+    assert_eq!(a.generation().0, 2);
+}
+
+#[test]
+fn a_process_that_is_closing_does_not_take_the_key_directory_lock() {
+    let (a, _proxy, dir) = agent_with_keys();
+    assert!(a.holds_keys() && !a.waits_for_keys());
+    // Another process holds the lock, as the one this replaces does.
+    a.release_keys();
+    let mut other = KeyDir::open(&dir.dir(), my_uid()).unwrap();
+    assert!(other.holds_lock());
+    assert!(a.waits_for_keys() && !a.take_over_keys());
+
+    other.release_lock();
+    a.close();
+    assert!(a.take_over_keys(), "nothing is left to wait for");
+    assert!(!a.holds_keys(), "but the lock stays free for the successor");
+    assert!(other.try_lock());
+}
+
+#[test]
+fn a_refusal_for_an_address_that_cannot_be_bound_is_told_apart() {
+    let (a, proxy, _dir) = agent_with_keys();
+    *proxy.fail.lock().unwrap() = Some(wafio_proxy::listeners::BIND_ERROR.into());
+    assert_eq!(
+        apply(&a, &bundle_of(&[app_json(SHOP, 18080, None)]), 1),
+        Err(BundleError::Bind(wafio_proxy::listeners::BIND_ERROR.into()))
+    );
+    *proxy.fail.lock().unwrap() = Some("duplicate listener in WAF bundle".into());
+    assert_eq!(
+        apply(&a, &bundle_of(&[app_json(SHOP, 18080, None)]), 1),
+        Err(BundleError::Apply(
+            "duplicate listener in WAF bundle".into()
         ))
     );
 }
@@ -300,12 +509,10 @@ fn stale_generation_only_within_one_agent_identity() {
 #[test]
 fn proxy_refusal_publishes_nothing() {
     let (a, proxy, ready) = agent();
-    *proxy.fail.lock().unwrap() = Some("failed to bind WAF route listener".into());
+    *proxy.fail.lock().unwrap() = Some("invalid app route in WAF bundle".into());
     assert_eq!(
         apply(&a, &format!(r#"{{"apps":[{APP}]}}"#), 2),
-        Err(BundleError::Apply(
-            "failed to bind WAF route listener".into()
-        ))
+        Err(BundleError::Apply("invalid app route in WAF bundle".into()))
     );
     assert!(a.app_executor("a1").is_none());
     assert_eq!(a.generation().0, 0);
