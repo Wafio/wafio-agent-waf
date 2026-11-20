@@ -8,8 +8,9 @@
 //! WebSocket frames, own SIGUSR2 handover (`upgrade`).
 //!
 //! Entry points for the binary: [`Proxy::new`], [`Proxy::apply`] (a bundle's apps, atomically),
-//! [`Proxy::shutdown`], [`Proxy::handover_fds`], [`runtime_builder`], the decision sink in
-//! [`ProxyOptions`] and the counters in [`metrics`].
+//! [`Proxy::certificates`] (what the TLS listeners serve), [`Proxy::shutdown`],
+//! [`Proxy::handover_fds`], [`runtime_builder`], the decision sink in [`ProxyOptions`] and the
+//! counters in [`metrics`].
 
 // One audited `unsafe` site in this crate carries `#[allow(unsafe_code)]`; anything new needs the same, with its reason.
 #![deny(unsafe_code)]
