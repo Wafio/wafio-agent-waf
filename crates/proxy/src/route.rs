@@ -599,7 +599,9 @@ pub(crate) async fn serve_connection<S: Site>(site: S, stream: Stream, mut stop:
                     return reject(stream, r, limits.write_ms).await;
                 };
                 if !site.head_fits(&app, head.len) {
-                    return reject(stream, too_big_request(), limits.write_ms).await;
+                    // The app is chosen: its own write timeout holds, not the listener's.
+                    let write_ms = app.route().proxy_config.timeouts.write_ms;
+                    return reject(stream, too_big_request(), write_ms).await;
                 }
                 let deadline = site.body_deadline(&app, started, deadline);
                 match app

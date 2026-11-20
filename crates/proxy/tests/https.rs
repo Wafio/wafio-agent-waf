@@ -28,7 +28,7 @@ use pingora::tls::{
 use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
-use wafio_proxy::cert_store::{CertFiles, load_certified_key};
+use wafio_proxy::cert_store::{BookEntry, CertFiles, load_certified_key};
 use wafio_proxy::{AppSpec, Proxy, ProxyOptions, TlsSite};
 
 use common::*;
@@ -616,7 +616,7 @@ async fn the_book_switches_one_apps_certificate_and_an_apply_follows_the_bundle(
 
     let mut open = Https::connect(port, &pki, "shop.test").await.unwrap();
     let before = open.certificate();
-    book.set("shop", key_of(&installed), false);
+    assert!(book.set("shop", key_of(&installed), false));
     let fresh = Https::connect(port, &pki, "shop.test").await.unwrap();
     assert_eq!(fresh.certificate(), leaf_of(&installed));
     assert_eq!(open.certificate(), before);
@@ -625,8 +625,11 @@ async fn the_book_switches_one_apps_certificate_and_an_apply_follows_the_bundle(
         200
     );
 
-    // The book holds the apps of the bundle and no others.
+    // The book holds the apps of the bundle and no others, and takes nothing for an app that left:
+    // a certificate that finishes after its app was dropped is refused.
     h.proxy.apply(vec![]).unwrap();
+    assert!(book.get("shop").is_none());
+    assert!(!book.set("shop", key_of(&installed), false));
     assert!(book.get("shop").is_none());
 }
 
@@ -1368,7 +1371,7 @@ async fn a_connection_made_for_the_placeholder_is_answered_validations_and_503_o
     let _pending = book.offer_http01("shop.test", "tok-1", "tok-1.thumb");
 
     // The app has only its placeholder: the handshake succeeds, the app is not reached.
-    book.set("shop", key_of(&stand_in), true);
+    assert!(book.set("shop", key_of(&stand_in), true));
     let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
     assert_eq!(c.certificate(), leaf_of(&stand_in));
     let r = c.send(&get_host("shop.test", "/cart")).await.unwrap();
@@ -1384,7 +1387,7 @@ async fn a_connection_made_for_the_placeholder_is_answered_validations_and_503_o
     assert_eq!(up.count(), 0);
 
     // The real certificate arrives: new connections reach the app.
-    book.set("shop", key_of(&files), false);
+    assert!(book.set("shop", key_of(&files), false));
     let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
     assert_eq!(c.certificate(), leaf_of(&files));
     assert_eq!(
@@ -1424,7 +1427,7 @@ async fn status_of_a_connection_that_sees_the_book_change(
         }
     };
     let (key, flag) = hold(placeholder_before);
-    book.set("shop", key, flag);
+    assert!(book.set("shop", key, flag));
 
     let connecting = tokio::spawn(Https::connect_as(
         port,
@@ -1434,7 +1437,7 @@ async fn status_of_a_connection_that_sees_the_book_change(
     ));
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (key, flag) = hold(placeholder_after);
-    book.set("shop", key, flag);
+    assert!(book.set("shop", key, flag));
     let mut c = connecting.await.unwrap().unwrap();
     let status = c
         .send(&get_host("shop.test", "/cart"))
@@ -1722,13 +1725,19 @@ async fn the_redirect_listener_answers_503_until_the_app_has_a_real_certificate_
 
     assert_eq!(ask("shop.test").await.status, 308);
     // Only the placeholder, then nothing at all: the app's hosts wait, others are still unknown.
-    book.set("shop", key_of(&stand_in), true);
+    assert!(book.set("shop", key_of(&stand_in), true));
     waiting(&ask("shop.test").await);
     assert_eq!(ask("other.test").await.status, 404);
     book.follow(HashMap::new());
     waiting(&ask("shop.test").await);
     // A real certificate: the redirect, as before.
-    book.set("shop", key_of(&files), false);
+    book.follow(HashMap::from([(
+        "shop".to_owned(),
+        Some(BookEntry {
+            key: key_of(&files),
+            placeholder: false,
+        }),
+    )]));
     let r = ask("shop.test").await;
     assert_eq!(r.status, 308);
     assert_eq!(

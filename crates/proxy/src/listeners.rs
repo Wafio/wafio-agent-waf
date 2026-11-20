@@ -161,11 +161,11 @@ impl RouteManager {
     }
 
     /// Makes the live listeners exactly `specs`. Every certificate is read and every new socket
-    /// bound first; a failure changes nothing. Kept listeners get the new config in place (no
-    /// reconnect), removed ones stop accepting at once and drain in the background. A listener
-    /// whose address now serves another kind keeps its socket: the old accept loop stops and
-    /// drains, a new one starts on the same socket. Must run inside the tokio runtime. The cause
-    /// of an error is logged.
+    /// bound and made ready for its accept loop first; a failure changes nothing. Kept listeners
+    /// get the new config in place (no reconnect), removed ones stop accepting at once and drain in
+    /// the background. A listener whose address now serves another kind keeps its socket: a new
+    /// accept loop starts on it, then the old one stops and drains. Must run inside the tokio
+    /// runtime. The cause of an error is logged.
     pub fn apply(&self, specs: Vec<RouteSpec>) -> Result<(), String> {
         let mut inner = self.lock();
         if inner.closed {
@@ -211,13 +211,28 @@ impl RouteManager {
                     fresh.insert(spec.address.clone(), s);
                 }
                 Err(e) => {
-                    // Inherited sockets go back; freshly bound ones close.
-                    for (addr, (s, inherited)) in fresh {
-                        if inherited {
-                            inner.inherited.insert(addr, s);
-                        }
-                    }
+                    give_back(&mut inner, fresh);
                     tracing::warn!("failed to bind WAF route listener {}: {e}", spec.address);
+                    return Err("failed to bind WAF route listener".into());
+                }
+            }
+        }
+        // Everything that can still fail happens here, before the first change: a descriptor
+        // that cannot be had must not leave an address closed or the book switched.
+        let mut opened: HashMap<String, Opened> = HashMap::new();
+        for spec in &specs {
+            let sock = match inner.live.get(&spec.address) {
+                Some(live) if live.served.is_kind_of(&spec.serves) => continue,
+                Some(live) => &live.sock,
+                None => &fresh[&spec.address].0,
+            };
+            match open(sock) {
+                Ok(o) => {
+                    opened.insert(spec.address.clone(), o);
+                }
+                Err(e) => {
+                    give_back(&mut inner, fresh);
+                    tracing::warn!("failed to start WAF route listener {}: {e}", spec.address);
                     return Err("failed to bind WAF route listener".into());
                 }
             }
@@ -232,31 +247,20 @@ impl RouteManager {
         // certificate by then.
         self.shared.book.follow(certificates);
         for spec in specs {
-            let same_kind = inner
-                .live
-                .get(&spec.address)
-                .map(|live| live.served.is_kind_of(&spec.serves));
-            let sock = match same_kind {
-                Some(true) => {
-                    let live = &inner.live[&spec.address];
-                    self.update(&live.served, spec.serves);
-                    continue;
-                }
-                Some(false) => {
-                    // The socket stays open so its accept queue is kept: the old loop drains its
-                    // connections, the new kind takes the socket like an inherited one.
-                    let old = inner.live.remove(&spec.address).expect("listed");
-                    let _ = old.stop.send(true);
-                    old.sock
-                }
-                None => fresh.remove(&spec.address).expect("bound above").0,
-            };
+            if let Some(live) = inner.live.get(&spec.address)
+                && live.served.is_kind_of(&spec.serves)
+            {
+                self.update(&live.served, spec.serves);
+                continue;
+            }
+            let opened = opened.remove(&spec.address).expect("opened above");
             let served = self.build(spec.serves);
-            let live = self.start(sock, served).map_err(|e| {
-                tracing::warn!("failed to start WAF route listener {}: {e}", spec.address);
-                "failed to bind WAF route listener".to_string()
-            })?;
-            inner.live.insert(spec.address, live);
+            let live = self.launch(opened, served);
+            // A listener that changes kind keeps its socket, so its accept queue is kept: the new
+            // loop has the socket by now, and the old one drains its connections.
+            if let Some(old) = inner.live.insert(spec.address, live) {
+                let _ = old.stop.send(true);
+            }
         }
         let gone: Vec<String> = inner
             .live
@@ -310,10 +314,8 @@ impl RouteManager {
         }
     }
 
-    fn start(&self, sock: StdListener, served: Served) -> io::Result<Live> {
-        let dup = sock.try_clone()?;
-        sock.set_nonblocking(true)?;
-        let listener = tokio::net::TcpListener::from_std(sock)?;
+    /// Starts the accept loop of a new listener.
+    fn launch(&self, (listener, dup): Opened, served: Served) -> Live {
         let (stop, rx) = watch::channel(false);
         let done = tokio::spawn(accept_loop(
             listener,
@@ -323,12 +325,12 @@ impl RouteManager {
             self.connection_limit,
             self.handshake_timeout,
         ));
-        Ok(Live {
+        Live {
             served,
             stop,
             sock: dup,
             done,
-        })
+        }
     }
 
     /// The listening sockets by address, for `upgrade::spawn_successor`. Valid while `self` lives.
@@ -359,6 +361,27 @@ impl RouteManager {
         }
         for w in waits {
             let _ = w.await;
+        }
+    }
+}
+
+/// What a new accept loop needs from a socket: its tokio listener, and the duplicate that `Live`
+/// keeps for a hand-over and for the next kind change.
+type Opened = (tokio::net::TcpListener, StdListener);
+
+/// Descriptors for a new accept loop on `sock`, which stays open and unchanged.
+fn open(sock: &StdListener) -> io::Result<Opened> {
+    let dup = sock.try_clone()?;
+    let accepting = sock.try_clone()?;
+    accepting.set_nonblocking(true)?;
+    Ok((tokio::net::TcpListener::from_std(accepting)?, dup))
+}
+
+/// Puts the sockets a predecessor handed over back; freshly bound ones close.
+fn give_back(inner: &mut Inner, fresh: HashMap<String, (StdListener, bool)>) {
+    for (addr, (s, inherited)) in fresh {
+        if inherited {
+            inner.inherited.insert(addr, s);
         }
     }
 }

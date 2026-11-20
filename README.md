@@ -448,10 +448,11 @@ that does not parse, or names a certificate or key file that cannot be read, sto
   and its body limit and write timeout hold. An unlimited timeout applies after the routing only, so an idle connection on a
   listener where one app is unlimited still ends at the finite timeout of another. A change of these settings takes effect
   with the next bundle, without a restart. An address that changes from a plain listener to a redirect listener, or from HTTPS
-  to a plain listener, keeps its socket: no connection is refused, the old connections finish, new ones get the new kind.
-- An app named in the file opens no plain listener of its own: the address its bundle names is not served, and the app answers
-  on its HTTPS listener only. An address in the file that another app of the bundle uses fails the apply with
-  `duplicate listener in WAF bundle`.
+  to a plain listener, keeps its socket: no connection is refused and new ones get the new kind. A request in flight on an old
+  connection finishes; an old connection that is idle between requests closes at once.
+- An app named in the file opens no plain listener of its own: the address its bundle names is not served and not checked (another
+  app may use it), and the app answers on its HTTPS listener only. An address in the file that another app of the bundle uses
+  fails the apply with `duplicate listener in WAF bundle`.
 - TLS 1.2 and 1.3. The SNI name picks the app and the certificate the agent holds for it, and the `Host` header picks the app.
   ALPN is `acme-tls/1`, then `http/1.1`: a client that offers `acme-tls/1` is a certificate validation, and gets a handshake only
   for a name with a validation pending, which ends with the handshake; every other client negotiates `http/1.1` or none. A client

@@ -476,6 +476,13 @@ mod tests {
         Arc::new(load_certified_key(&files).unwrap())
     }
 
+    fn a_real_entry(dir: &Scratch, name: &str) -> Option<BookEntry> {
+        Some(BookEntry {
+            key: a_key(dir, name),
+            placeholder: false,
+        })
+    }
+
     #[test]
     fn host_name_drops_port_and_trailing_dot() {
         assert_eq!(host_name(b"shop.example.com"), b"shop.example.com");
@@ -491,8 +498,10 @@ mod tests {
     fn redirect_keeps_host_path_and_query_once_the_certificate_is_real() {
         let dir = Scratch::new();
         let book = Arc::new(CertBook::default());
-        book.set("shop", a_key(&dir, "shop"), false);
-        book.set("alt", a_key(&dir, "alt"), false);
+        book.follow(HashMap::from([
+            ("shop".to_owned(), a_real_entry(&dir, "shop")),
+            ("alt".to_owned(), a_real_entry(&dir, "alt")),
+        ]));
         let target = |port, app: &str| RedirectTarget {
             port,
             app_id: app.to_owned(),
@@ -545,9 +554,10 @@ mod tests {
         let ask = |host: &str| table.answer(b"GET", &parts(host, "/cart"));
 
         // Nothing in the book, then the placeholder: the host is known but cannot be served.
+        book.follow(HashMap::from([("shop".to_owned(), None)]));
         for held in [None, Some(a_key(&dir, "placeholder"))] {
             if let Some(key) = held {
-                book.set("shop", key, true);
+                assert!(book.set("shop", key, true));
             }
             let r = ask("shop.example.com");
             assert_eq!(r.status, 503);
@@ -561,7 +571,7 @@ mod tests {
             // An unknown host is still 404, whatever the certificate.
             assert_eq!(ask("other.example.com").status, 404);
         }
-        book.set("shop", a_key(&dir, "real"), false);
+        assert!(book.set("shop", a_key(&dir, "real"), false));
         assert_eq!(ask("shop.example.com").status, 308);
     }
 

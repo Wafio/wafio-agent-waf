@@ -244,7 +244,9 @@ impl Agent {
                 tracing::info!("[waf-bundle] {e}");
                 return Err(apply_error("invalid app route in WAF bundle"));
             }
-            if app.listen_port > 0 {
+            // An app with an HTTPS site opens no listener at its bundle address, so that address
+            // is neither checked for a duplicate nor for a port that cannot be bound.
+            if app.listen_port > 0 && spec.tls.is_none() {
                 let host = if app.listen_host.is_empty() {
                     "0.0.0.0"
                 } else {

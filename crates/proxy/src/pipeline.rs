@@ -773,3 +773,101 @@ pub(crate) async fn handle(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppSpec, TlsSite, build_route};
+    use crate::request::TlsClient;
+    use wafio_domain::ip_address::parse_ip_address;
+
+    const LISTED: &[u8] = b"t13d0000h2_000000000000_000000000000";
+
+    fn route(edge: bool, proxy_config: &str) -> Route {
+        build_route(&AppSpec {
+            app_id: "a".into(),
+            listen_host: String::new(),
+            listen_port: 0,
+            upstream: "http://127.0.0.1:1".into(),
+            mode: "block".into(),
+            proxy_config: proxy_config.as_bytes().to_vec(),
+            rules_json: Vec::new(),
+            fcgi_doc_root: String::new(),
+            fcgi_index: String::new(),
+            fcgi_keep_conn: false,
+            maintenance: Vec::new(),
+            analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
+            tls: edge.then(|| TlsSite {
+                listen: "0.0.0.0:443".into(),
+                hosts: vec!["shop.test".into()],
+                cert: crate::cert_store::CertFiles {
+                    certificate: "shop.crt".into(),
+                    key: "shop.key".into(),
+                },
+                redirect_listen: None,
+            }),
+        })
+        .unwrap()
+    }
+
+    /// A request that carries `X-JA4` and `X-JA3` headers and the outcome of a TLS handshake whose
+    /// hello gave `ja4`.
+    fn request(ja4: Option<&str>) -> InboundRequest {
+        let mut req = InboundRequest {
+            tls: Some(Arc::new(TlsClient {
+                server_name: "shop.test".into(),
+                ja4: ja4.map(str::to_owned),
+            })),
+            ..InboundRequest::default()
+        };
+        req.headers.insert(b"X-JA4".to_vec(), vec![LISTED.to_vec()]);
+        req.headers
+            .insert(b"X-JA3".to_vec(), vec![b"ja3-from-header".to_vec()]);
+        req
+    }
+
+    fn peer(ip: &str) -> IpAddress {
+        parse_ip_address(ip.as_bytes()).unwrap()
+    }
+
+    /// A client of an app the agent serves over HTTPS writes the fingerprint headers itself, so
+    /// they count only from a peer that `proxy_config` trusts as a proxy. This is reached when the
+    /// handshake gave no JA4 (a hello that spans two TLS records).
+    #[test]
+    fn an_app_served_by_the_agent_reads_fingerprint_headers_only_from_a_trusted_proxy() {
+        let req = request(None);
+        let from_header = (LISTED.to_vec(), b"ja3-from-header".to_vec());
+        let nothing = (Vec::new(), Vec::new());
+        let (client, proxy) = (peer("203.0.113.9"), peer("10.1.2.3"));
+
+        // The agent is the edge and trusts no proxy: nobody may name a fingerprint.
+        let alone = route(true, "");
+        assert_eq!(read_client_fingerprints(&req, &alone, &client), nothing);
+        assert_eq!(read_client_fingerprints(&req, &alone, &proxy), nothing);
+
+        // It trusts proxies on private addresses: a public client still may not, a proxy may.
+        let trusting = route(true, r#"{"trust_forwarded":true}"#);
+        assert_eq!(read_client_fingerprints(&req, &trusting, &client), nothing);
+        assert_eq!(
+            read_client_fingerprints(&req, &trusting, &proxy),
+            from_header
+        );
+
+        // An app the agent is not the edge of reads the headers from any peer, as before.
+        let behind = route(false, "");
+        assert_eq!(
+            read_client_fingerprints(&req, &behind, &client),
+            from_header
+        );
+    }
+
+    #[test]
+    fn the_ja4_of_the_handshake_wins_over_a_header_even_from_a_trusted_proxy() {
+        let trusting = route(true, r#"{"trust_forwarded":true}"#);
+        let req = request(Some("t13d1516h2_8daaf6152771_02713d6af862"));
+        assert_eq!(
+            read_client_fingerprints(&req, &trusting, &peer("10.1.2.3")),
+            (b"t13d1516h2_8daaf6152771_02713d6af862".to_vec(), Vec::new())
+        );
+    }
+}
