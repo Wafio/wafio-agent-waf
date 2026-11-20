@@ -403,12 +403,12 @@ impl ControlLink {
 
     /// Apply the cached bundle, then keep the stream up with backoff. A cached bundle that cannot
     /// bind an address is applied again every minute until it binds or a live bundle arrives.
-    /// Abort the handle to stop.
+    /// Abort the handle to stop: that ends every bundle retry too.
     pub fn start(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let link = self.clone();
         tokio::spawn(async move {
             let l = link.clone();
-            // Dropped with this task, so aborting the handle ends the retry too.
+            // Bundle retries outlive a stream and end with this task.
             let mut retries = JoinSet::new();
             if let Ok(CacheStart::Bind(cached)) =
                 tokio::task::spawn_blocking(move || l.install_cached_bundle()).await
@@ -419,15 +419,15 @@ impl ControlLink {
                     .retry_cached(generation, attempt, &mut retries)
                     .await;
             }
-            link.run_stream_loop().await;
+            link.run_stream_loop(&mut retries).await;
         })
     }
 
-    async fn run_stream_loop(self: Arc<Self>) {
+    async fn run_stream_loop(self: Arc<Self>, retries: &mut JoinSet<()>) {
         let mut backoff = ReconnectBackoff::default();
         loop {
             let started = Instant::now();
-            let res = self.connect_and_serve().await;
+            let res = self.connect_and_serve(retries).await;
             let wait = backoff.delay(started.elapsed());
             if let Err(e) = res {
                 info!(
@@ -439,7 +439,10 @@ impl ControlLink {
         }
     }
 
-    async fn connect_and_serve(self: &Arc<Self>) -> Result<(), LinkError> {
+    async fn connect_and_serve(
+        self: &Arc<Self>,
+        retries: &mut JoinSet<()>,
+    ) -> Result<(), LinkError> {
         let cfg = self.config();
         (self.hooks.on_dial)(&cfg.server_address);
         let client = connect(&cfg).await?;
@@ -466,7 +469,7 @@ impl ControlLink {
             cfg.server_address, cfg.agent_name
         );
 
-        // Everything this stream starts ends with it.
+        // Everything this stream starts ends with it, except a bundle retry.
         let mut tasks = JoinSet::new();
         tasks.spawn(self.clone().heartbeat_loop(send.clone()));
 
@@ -478,6 +481,7 @@ impl ControlLink {
             .into_inner();
         loop {
             while tasks.try_join_next().is_some() {}
+            while retries.try_join_next().is_some() {}
             let msg = match inbound.message().await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Ok(()),
@@ -489,8 +493,11 @@ impl ControlLink {
                     tasks.spawn(self.clone().on_welcome(client.clone(), send.clone()));
                 }
                 Some(In::Bundle(bu)) => {
+                    // The retry outlives this stream: a reconnect does not wait for an address to
+                    // come free, and its ack on the closed stream is dropped (the next hello
+                    // carries the generation).
                     retry
-                        .handle(bu, self.bundle_attempt(), send.clone(), &mut tasks)
+                        .handle(bu, self.bundle_attempt(), send.clone(), retries)
                         .await
                 }
                 Some(In::KeyRotation(kr)) => {
@@ -1044,11 +1051,11 @@ pub(crate) enum Retry {
 /// One apply of a bundle: (what follows a failure, result).
 pub(crate) type Attempt = Arc<dyn Fn(&BundleUpdate) -> (Retry, Result<(), String>) + Send + Sync>;
 
-/// Re-applies the newest failed configuration bundle with backoff until
-/// it applies (then acks it ok under its command id), a newer bundle arrives, the attempts
-/// run out, or the stream ends (the retry runs in the stream's task set). Applies are
+/// Re-applies the newest failed configuration bundle with backoff until it applies (then acks it
+/// ok under its command id), a newer bundle arrives, the attempts run out, or the link stops: the
+/// retry runs in the task set of `start`, so a stream that ends does not end it. Applies are
 /// serialised through `seq`, so a retry never lands after a newer bundle. The cached bundle of
-/// the start is retried the same way, in the task of `start`, and a live bundle ends that retry.
+/// the start is retried the same way, and a live bundle ends that retry.
 pub(crate) struct BundleRetry {
     seq: tokio::sync::Mutex<u64>,
     min_wait: Duration,
@@ -1368,7 +1375,7 @@ mod tests {
         assert!(got[1].ok && got[1].command_id == "init-1");
     }
 
-    // A newer bundle supersedes the retry of an older one; a retry ends with the stream.
+    // A newer bundle supersedes the retry of an older one; a retry ends with its task set.
     #[tokio::test]
     async fn bundle_retry_superseded_and_stream_bound() {
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -1406,7 +1413,7 @@ mod tests {
         ));
         let mut tasks2 = JoinSet::new();
         r2.handle(bu("x", 3, "{}"), failing, s, &mut tasks2).await;
-        drop(tasks2); // stream ended
+        drop(tasks2); // the link stopped
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
