@@ -42,8 +42,9 @@ impl AckCode {
 ///
 /// Called on a blocking thread, and the receive loop waits for it, so an install is handled in
 /// stream order with the bundles around it. The message zeroes `key_pem` when it is dropped, which
-/// the link does once this returns, also after a panic. So the sink must not log the message, take
-/// or replace `key_pem`, or keep a copy of the key it does not need.
+/// the link does once this returns, also after a panic. So the sink must not log the message,
+/// keep a copy of the key it does not need, or take, replace, grow or shrink `key_pem`: a
+/// reallocation frees the old block unzeroed. It parses the key from the slice.
 pub trait CertificateSink: Send + Sync + 'static {
     fn install(&self, install: &mut CertificateInstall) -> Result<(), AckCode>;
 }
