@@ -284,8 +284,9 @@ impl Agent {
     }
 }
 
-/// The `AppSpec` of a bundle app (`listen_port` ≤ 0 = no listener; > 65535 is refused by
-/// `install_bundle` before this is used).
+/// The `AppSpec` of a bundle app (`listen_port` ≤ 0 = no listener). A port above 65535 is
+/// refused by `install_bundle` for an app without an HTTPS site; for an app with one it becomes 0,
+/// since that app opens no listener at its bundle address.
 fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>, tls: Option<TlsSite>) -> AppSpec {
     AppSpec {
         app_id: app.app_id.clone(),
