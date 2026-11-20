@@ -129,11 +129,6 @@ impl RouteManager {
                 }
             }
         }
-        let mut old_pools: Vec<_> = inner
-            .live
-            .values()
-            .filter_map(|l| l.app.route().fcgi().cloned())
-            .collect();
         for spec in specs {
             match inner.live.get(&spec.address) {
                 Some(live) => live.app.set_route(spec.route),
@@ -157,14 +152,6 @@ impl RouteManager {
             let live = inner.live.remove(&addr).expect("listed");
             retire(live);
         }
-        // FastCGI pools of replaced routes: every pooled connection pins a PHP-FPM worker.
-        let live_pools: Vec<_> = inner
-            .live
-            .values()
-            .filter_map(|l| l.app.route().fcgi().cloned())
-            .collect();
-        old_pools.retain(|p| !live_pools.iter().any(|l| Arc::ptr_eq(l, p)));
-        old_pools.iter().for_each(|p| p.close());
         if !inner.first_applied {
             // Handed-over sockets the first configuration does not use close now.
             inner.inherited.clear();

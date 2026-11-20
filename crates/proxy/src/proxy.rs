@@ -86,8 +86,9 @@ impl Proxy {
     /// Makes the live listeners exactly the bundle's apps with a listen port. Every route is
     /// built and every new socket bound first; any error changes nothing. Kept listeners switch
     /// to the new route for their next request, removed ones stop accepting at once and drain;
-    /// FastCGI pools of replaced routes are closed. The binary publishes its executors (stores
-    /// for the next bundle) only after `Ok`. Must run inside the tokio runtime.
+    /// a FastCGI request still running on a replaced route finishes on its own connection. The
+    /// binary publishes its executors (stores for the next bundle) only after `Ok`. Must run
+    /// inside the tokio runtime.
     pub fn apply(&self, apps: Vec<AppSpec>) -> Result<(), String> {
         let mut specs = Vec::new();
         let mut addresses = HashSet::new();

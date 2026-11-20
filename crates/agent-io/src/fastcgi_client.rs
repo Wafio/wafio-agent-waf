@@ -1,23 +1,24 @@
-//! FastCGI client with connection pooling for PHP-FPM over a Unix socket or TCP.
+//! FastCGI client for PHP-FPM over a Unix socket or TCP.
 //!
 //! ```text
 //! fcgi:unix:/run/php/php-fpm.sock?root=/var/www/html&index=index.php
 //! fcgi://127.0.0.1:9000?root=/var/www/html&index=index.php
 //! ```
 //!
-//! Pool semantics (customer OOM incident, 2026-11-02): every open connection keeps
-//! FCGI_KEEP_CONN and so pins one PHP-FPM worker. Idle connections are a LIFO
-//! stack; one past its idle TTL is closed with its slot released (never
-//! re-dialled in its place); a reaper closes idle ones without traffic; a
-//! closed pool closes connections as they come back. Request headers are
-//! `(name, value)` lines, grouped by exact name in first-appearance order.
+//! Every request gets its own connection, and the agent closes it when the reply is read or the request
+//! fails. FCGI_BEGIN_REQUEST carries no FCGI_KEEP_CONN, which is also what nginx does by default. A kept
+//! connection is unsafe (GHSA-qc49-hpvq-g2w6, fixed in PHP 8.2.36, 8.3.37, 8.4.28 and 8.5.13): when the
+//! application opens php://input and does not read it to the end, PHP-FPM parses the unread body as a second
+//! FastCGI request on the same connection. The pool only caps the open connections: a request waits up to
+//! `slot_wait` for a free slot. Request headers are `(name, value)` lines, grouped by exact name in
+//! first-appearance order.
 
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -35,7 +36,7 @@ pub const FCGI_STDERR: u8 = 7;
 
 /// FCGI_RESPONDER role.
 pub const FCGI_RESPONDER: u8 = 1;
-/// Reuse the connection after the request.
+/// Flag that asks PHP-FPM to keep the connection open after the request. The agent never sets it.
 pub const FCGI_KEEP_CONN: u8 = 1;
 pub const FCGI_VERSION: u8 = 1;
 pub const FCGI_HEADER_SIZE: usize = 8;
@@ -54,13 +55,12 @@ type DialFn = Box<dyn Fn() -> DialFuture + Send + Sync>;
 /// Header lines as `(name, value)`.
 pub type HeaderLines = [(Vec<u8>, Vec<u8>)];
 
-/// One connection to PHP-FPM, owned by one request at a time. Dropping it
-/// closes the socket and releases its pool slot.
+/// One connection to PHP-FPM, owned by one request. Dropping it closes the socket and releases its
+/// pool slot.
 pub struct FastCgiConnection {
     /// Unique per dial; tests compare identities with it.
     pub id: u64,
     buffered_stream: BufReader<Box<dyn FcgiStream>>,
-    last_used_at: Instant,
     _slot: OwnedSemaphorePermit,
 }
 
@@ -75,9 +75,7 @@ pub struct FastCgiDeadlines {
     pub dial: Duration,
     /// Waiting for a free slot when connection_limit is reached.
     pub slot_wait: Duration,
-    /// How long a pooled connection may sit idle.
-    pub max_idle_age: Duration,
-    /// No read/write deadlines; dial, pool wait and idle TTL stay bounded.
+    /// No read/write deadlines; dial and the wait for a slot stay bounded.
     pub unlimited: bool,
 }
 
@@ -100,20 +98,10 @@ impl FastCgiDeadlines {
         if self.slot_wait.is_zero() {
             self.slot_wait = Duration::from_secs(5);
         }
-        if self.max_idle_age.is_zero() {
-            self.max_idle_age = Duration::from_secs(60);
-        }
     }
 }
 
-struct PoolState {
-    /// LIFO stack, newest last (so oldest first).
-    idle: Vec<FastCgiConnection>,
-    closed: bool,
-    idle_reaper: Option<tokio::task::JoinHandle<()>>,
-}
-
-/// The connection pool of one FastCGI upstream.
+/// The connections of one FastCGI upstream: a cap on how many are open at once.
 pub struct FastCgiConnectionPool {
     network: String,
     address: String,
@@ -123,7 +111,6 @@ pub struct FastCgiConnectionPool {
     dial: DialFn,
     timeouts: FastCgiDeadlines,
     sem: Arc<Semaphore>,
-    state: Mutex<PoolState>,
     next_connection_id: AtomicU64,
 }
 
@@ -180,11 +167,6 @@ impl FastCgiConnectionPool {
             dial,
             timeouts: to,
             sem: Arc::new(Semaphore::new(max_conns)),
-            state: Mutex::new(PoolState {
-                idle: Vec::new(),
-                closed: false,
-                idle_reaper: None,
-            }),
             next_connection_id: AtomicU64::new(1),
         })
     }
@@ -220,36 +202,8 @@ impl FastCgiConnectionPool {
         self.connection_limit - self.sem.available_permits()
     }
 
-    /// Idle connections waiting in the pool.
-    pub fn idle_count(&self) -> usize {
-        self.lock().idle.len()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The most recently used idle connection, or a new dial.
-    /// Stale idle connections are closed and give their slot back.
+    /// A new connection once a slot is free; it gives the slot back when dropped.
     pub async fn get(self: &Arc<Self>) -> Result<FastCgiConnection, String> {
-        let mut stale = Vec::new();
-        let found = {
-            let mut st = self.lock();
-            let mut found = None;
-            while let Some(top) = st.idle.pop() {
-                if top.last_used_at.elapsed() > self.timeouts.max_idle_age {
-                    stale.push(top);
-                    continue;
-                }
-                found = Some(top);
-                break;
-            }
-            found
-        };
-        drop(stale);
-        if let Some(c) = found {
-            return Ok(c);
-        }
         let slot = match self.sem.clone().try_acquire_owned() {
             Ok(s) => s,
             Err(_) => match tokio::time::timeout(
@@ -273,78 +227,8 @@ impl FastCgiConnectionPool {
         Ok(FastCgiConnection {
             id: self.next_connection_id.fetch_add(1, Ordering::Relaxed),
             buffered_stream: BufReader::with_capacity(16384, conn),
-            last_used_at: Instant::now(),
             _slot: slot,
         })
-    }
-
-    /// Returns a healthy connection to the idle stack (closed when
-    /// the pool is closed or full) and arms the reaper.
-    pub fn put(self: &Arc<Self>, mut c: FastCgiConnection) {
-        c.last_used_at = Instant::now();
-        let mut st = self.lock();
-        if st.closed || st.idle.len() >= self.connection_limit {
-            drop(st);
-            drop(c);
-            return;
-        }
-        st.idle.push(c);
-        if st.idle_reaper.is_none() {
-            st.idle_reaper = self.schedule_reap(self.timeouts.max_idle_age);
-        }
-    }
-
-    fn schedule_reap(self: &Arc<Self>, after: Duration) -> Option<tokio::task::JoinHandle<()>> {
-        let handle = tokio::runtime::Handle::try_current().ok()?;
-        let pool = self.clone();
-        Some(handle.spawn(async move {
-            tokio::time::sleep(after).await;
-            pool.reap();
-        }))
-    }
-
-    /// Closes idle connections past the idle TTL (a prefix: the
-    /// stack is oldest first) and re-arms for the oldest remaining one.
-    fn reap(self: &Arc<Self>) {
-        let stale: Vec<FastCgiConnection> = {
-            let mut st = self.lock();
-            let now = Instant::now();
-            let n = st
-                .idle
-                .iter()
-                .take_while(|c| {
-                    now.saturating_duration_since(c.last_used_at) >= self.timeouts.max_idle_age
-                })
-                .count();
-            let stale = st.idle.drain(..n).collect();
-            st.idle_reaper = None;
-            if !st.closed && !st.idle.is_empty() {
-                let due = (st.idle[0].last_used_at + self.timeouts.max_idle_age)
-                    .saturating_duration_since(now);
-                st.idle_reaper = self.schedule_reap(due);
-            }
-            stale
-        };
-        drop(stale);
-    }
-
-    /// Closes a broken connection and releases its slot.
-    pub fn discard(&self, c: FastCgiConnection) {
-        drop(c);
-    }
-
-    /// Closes idle connections; ones still serving a request are
-    /// closed when they come back. Safe to call more than once.
-    pub fn close(&self) {
-        let idle = {
-            let mut st = self.lock();
-            st.closed = true;
-            if let Some(t) = st.idle_reaper.take() {
-                t.abort();
-            }
-            std::mem::take(&mut st.idle)
-        };
-        drop(idle);
     }
 
     /// The CGI/1.1 environment of one request.
@@ -450,8 +334,8 @@ impl FastCgiConnectionPool {
         params
     }
 
-    /// One request over FastCGI; a failed write is retried once on a
-    /// fresh connection.
+    /// One request over FastCGI on its own connection, closed when this returns. A failed write is not
+    /// retried: PHP-FPM starts the script before it has read the whole body, so a retry could run a POST twice.
     pub async fn send_request(
         self: &Arc<Self>,
         method: &[u8],
@@ -462,58 +346,17 @@ impl FastCgiConnectionPool {
         body: &[u8],
     ) -> Result<FastCgiReply, String> {
         let mut c = self.get().await?;
-        if let Err(err) = self
-            .execute(
-                &mut c,
-                method,
-                request_uri,
-                host,
-                remote_addr,
-                headers,
-                body,
-            )
-            .await
-        {
-            self.discard(c);
-            let Ok(mut c2) = self.get().await else {
-                return Err(err);
-            };
-            if let Err(e3) = self
-                .execute(
-                    &mut c2,
-                    method,
-                    request_uri,
-                    host,
-                    remote_addr,
-                    headers,
-                    body,
-                )
-                .await
-            {
-                self.discard(c2);
-                return Err(e3);
-            }
-            return match self.collect_reply(&mut c2).await {
-                Ok(resp) => {
-                    self.put(c2);
-                    Ok(resp)
-                }
-                Err(e4) => {
-                    self.discard(c2);
-                    Err(e4)
-                }
-            };
-        }
-        match self.collect_reply(&mut c).await {
-            Ok(resp) => {
-                self.put(c);
-                Ok(resp)
-            }
-            Err(e) => {
-                self.discard(c);
-                Err(e)
-            }
-        }
+        self.execute(
+            &mut c,
+            method,
+            request_uri,
+            host,
+            remote_addr,
+            headers,
+            body,
+        )
+        .await?;
+        self.collect_reply(&mut c).await
     }
 
     fn deadline(&self, d: Duration) -> Option<tokio::time::Instant> {
@@ -548,7 +391,8 @@ impl FastCgiConnectionPool {
             content_type = joined(b"content-type");
         }
         let w = c.buffered_stream.get_mut();
-        let begin = [0, FCGI_RESPONDER, FCGI_KEEP_CONN, 0, 0, 0, 0, 0];
+        // Role, then flags 0 (no FCGI_KEEP_CONN): PHP-FPM closes the connection after the reply.
+        let begin = [0, FCGI_RESPONDER, 0, 0, 0, 0, 0, 0];
         send_record(w, deadline, FCGI_REQUEST_ID, FCGI_BEGIN_REQUEST, &begin).await?;
         let params = self.build_cgi_variables(
             method,
@@ -574,7 +418,7 @@ impl FastCgiConnectionPool {
         send_empty_record(w, deadline, FCGI_REQUEST_ID, FCGI_STDIN).await
     }
 
-    /// Reads STDOUT / STDERR / END_REQUEST records.
+    /// Reads STDOUT / STDERR / END_REQUEST records. A record for another request fails the request.
     async fn collect_reply(&self, c: &mut FastCgiConnection) -> Result<FastCgiReply, String> {
         let deadline = self.deadline(self.timeouts.read);
         let mut stdout = Vec::new();
@@ -584,6 +428,12 @@ impl FastCgiConnectionPool {
                 .await
                 .map_err(|e| format!("fcgi: read header: {e}"))?;
             let record_type = hdr[1];
+            let record_request_id = u16::from_be_bytes([hdr[2], hdr[3]]);
+            if record_request_id != FCGI_REQUEST_ID {
+                return Err(format!(
+                    "fcgi: reply record for request {record_request_id}, expected {FCGI_REQUEST_ID}"
+                ));
+            }
             let content_len = usize::from(hdr[4]) << 8 | usize::from(hdr[5]);
             let padding_len = usize::from(hdr[6]);
             let mut content = vec![0u8; content_len];
