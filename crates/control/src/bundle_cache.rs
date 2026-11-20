@@ -12,7 +12,7 @@ use crate::timestamp::{Timestamp, duration_nanos, round_nanos, whole_seconds_tex
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::info;
 
@@ -79,16 +79,9 @@ pub fn save_bundle_cache(
         .mode(0o700)
         .create(dir)
         .map_err(|e| format!("create state dir: {e}"))?;
-    let (mut tmp, tmp_name) = create_temp(dir).map_err(|e| format!("create temp: {e}"))?;
-    struct Cleanup<'a>(&'a Path, bool);
-    impl Drop for Cleanup<'_> {
-        fn drop(&mut self) {
-            if !self.1 {
-                let _ = std::fs::remove_file(self.0);
-            }
-        }
-    }
-    let mut cleanup = Cleanup(&tmp_name, false);
+    let (mut tmp, tmp_name) =
+        create_temp(dir, ".last-bundle-", ".tmp").map_err(|e| format!("create temp: {e}"))?;
+    let mut cleanup = TempGuard::new(&tmp_name);
     tmp.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("chmod temp: {e}"))?;
     tmp.write_all(&env)
@@ -97,7 +90,7 @@ pub fn save_bundle_cache(
     drop(tmp);
     std::fs::rename(&tmp_name, dir.join(BUNDLE_CACHE_FILE_NAME))
         .map_err(|e| format!("rename: {e}"))?;
-    cleanup.1 = true;
+    cleanup.keep();
     // Persist the rename itself; best effort.
     if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
@@ -105,10 +98,11 @@ pub fn save_bundle_cache(
     Ok(())
 }
 
-/// A new temporary file `.last-bundle-*.tmp` in `dir`, created exclusively with mode 0600.
-fn create_temp(dir: &Path) -> std::io::Result<(File, std::path::PathBuf)> {
+/// A new file `<prefix><random><suffix>` in `dir`, created exclusively (so never through a link)
+/// with mode 0600 from the first moment: no other user can read it before anything is written.
+pub fn create_temp(dir: &Path, prefix: &str, suffix: &str) -> std::io::Result<(File, PathBuf)> {
     for _ in 0..10_000 {
-        let name = dir.join(format!(".last-bundle-{}.tmp", random_u64() as u32));
+        let name = dir.join(format!("{prefix}{}{suffix}", random_u64() as u32));
         match OpenOptions::new()
             .read(true)
             .write(true)
@@ -125,6 +119,36 @@ fn create_temp(dir: &Path) -> std::io::Result<(File, std::path::PathBuf)> {
         ErrorKind::AlreadyExists,
         "too many temp file collisions",
     ))
+}
+
+/// Removes a temporary file when it drops, on every path out of the write that made it (an error
+/// or a panic), unless `keep` says it was renamed into place.
+#[must_use = "the temporary file is removed when the guard drops"]
+pub struct TempGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl TempGuard {
+    pub fn new(path: &Path) -> TempGuard {
+        TempGuard {
+            path: path.to_owned(),
+            keep: false,
+        }
+    }
+
+    /// The file is where it belongs now: leave it.
+    pub fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Load and validate `dir/last-bundle.json`. `check` is the full bundle decode

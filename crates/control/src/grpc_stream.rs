@@ -42,7 +42,8 @@ pub const DEFAULT_SECURITY_DATA_DIR: &str = "/etc/wafio/security-data";
 /// Retry bounds for a WAF configuration bundle whose apply failed.
 pub(crate) const WAF_BUNDLE_RETRY_MIN: Duration = Duration::from_secs(2);
 pub(crate) const WAF_BUNDLE_RETRY_MAX: Duration = Duration::from_secs(60);
-/// About 8 minutes of retries; a bundle refused for good must not cost a rebuild forever.
+/// About 8 minutes of retries; a bundle refused for good must not cost a rebuild forever. A bundle
+/// refused because an address is taken is another case: it retries without a limit.
 pub(crate) const WAF_BUNDLE_RETRY_ATTEMPTS: u32 = 10;
 
 /// The security-data components of the agent profile.
@@ -596,8 +597,8 @@ impl ControlLink {
     }
 
     /// Decodes and applies a bundle update, and on success records the generation, the
-    /// provenance and the cache. Returns whether a later attempt could succeed.
-    pub(crate) fn apply_bundle_update(&self, bu: &BundleUpdate) -> (bool, Result<(), String>) {
+    /// provenance and the cache. Returns whether and how a later attempt could succeed.
+    pub(crate) fn apply_bundle_update(&self, bu: &BundleUpdate) -> (Retry, Result<(), String>) {
         let probe = match BundleProbe::parse(&bu.bundle_json) {
             Ok(p) => p,
             Err(e) => {
@@ -605,7 +606,7 @@ impl ControlLink {
                 // reads four fields only.
                 let e = self.sink().check(&bu.bundle_json).err().unwrap_or(e);
                 info!("[agent-grpc] decode bundle: {e}");
-                return (false, Err(e));
+                return (Retry::No, Err(e));
             }
         };
         // The control plane's generation wins over the embedded one.
@@ -618,16 +619,18 @@ impl ControlLink {
             Ok(()) => {}
             Err(BundleError::Decode(e)) => {
                 info!("[agent-grpc] decode bundle: {e}");
-                return (false, Err(e));
+                return (Retry::No, Err(e));
             }
-            Err(BundleError::Apply(e)) => return (!probe.management_only, Err(e)),
+            Err(BundleError::Apply(e)) if probe.management_only => return (Retry::No, Err(e)),
+            Err(BundleError::Apply(e)) => return (Retry::Backoff, Err(e)),
+            Err(BundleError::Bind(e)) => return (Retry::UntilBound, Err(e)),
         }
         if !probe.management_only {
             *self.last_gen.lock().unwrap() = generation;
             self.set_bundle_status(BUNDLE_SOURCE_LIVE, generation);
             self.save_applied_bundle(&bu.bundle_json, generation);
         }
-        (false, Ok(()))
+        (Retry::No, Ok(()))
     }
 
     /// The observer, then the "applied" log line for configuration bundles.
@@ -1000,8 +1003,20 @@ async fn send_certificate_statuses(link: Weak<ControlLink>, mut wake: mpsc::Rece
     }
 }
 
-/// One apply of a bundle: (retryable, result).
-pub(crate) type Attempt = Arc<dyn Fn(&BundleUpdate) -> (bool, Result<(), String>) + Send + Sync>;
+/// What follows a failed apply of a bundle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retry {
+    /// Nothing: the same bundle would fail the same way.
+    No,
+    /// Again with a growing wait, a limited number of times.
+    Backoff,
+    /// Again at the longest wait, without a limit: an address stays taken for as long as the
+    /// program that holds it runs.
+    UntilBound,
+}
+
+/// One apply of a bundle: (what follows a failure, result).
+pub(crate) type Attempt = Arc<dyn Fn(&BundleUpdate) -> (Retry, Result<(), String>) + Send + Sync>;
 
 /// Re-applies the newest failed configuration bundle with backoff until
 /// it applies (then acks it ok under its command id), a newer bundle arrives, the attempts
@@ -1040,18 +1055,18 @@ impl BundleRetry {
             *seq += 1; // supersedes any pending retry
         }
         let my_seq = *seq;
-        let (retryable, res) = run_attempt(&attempt, &bu).await;
+        let (retry, res) = run_attempt(&attempt, &bu).await;
         drop(seq);
         send_bundle_ack(&send, &bu.command_id, &res).await;
         let Err(e) = res else { return };
-        if !retryable || management {
+        if retry == Retry::No || management {
             return;
         }
         info!(
             "[agent-grpc] WAF bundle generation {} not applied: {e} (retrying)",
             bu.generation
         );
-        tasks.spawn(self.clone().run_retries(bu, attempt, send, my_seq));
+        tasks.spawn(self.clone().run_retries(bu, attempt, send, my_seq, retry));
     }
 
     async fn run_retries(
@@ -1060,17 +1075,24 @@ impl BundleRetry {
         attempt: Attempt,
         send: StreamSender,
         my_seq: u64,
+        mut retry: Retry,
     ) {
         let mut wait = self.min_wait;
         let mut n = 1;
         loop {
-            tokio::time::sleep(wait).await;
+            tokio::time::sleep(if retry == Retry::UntilBound {
+                self.max_wait
+            } else {
+                wait
+            })
+            .await;
             let seq = self.seq.lock().await;
             if *seq != my_seq {
                 return; // a newer bundle arrived
             }
-            let (retryable, res) = run_attempt(&attempt, &bu).await;
+            let (next, res) = run_attempt(&attempt, &bu).await;
             drop(seq);
+            retry = next;
             match res {
                 Ok(()) => {
                     info!(
@@ -1080,8 +1102,8 @@ impl BundleRetry {
                     send_bundle_ack(&send, &bu.command_id, &Ok(())).await;
                     return;
                 }
-                Err(_) if !retryable => return,
-                Err(e) if n >= WAF_BUNDLE_RETRY_ATTEMPTS => {
+                Err(_) if retry == Retry::No => return,
+                Err(e) if retry == Retry::Backoff && n >= WAF_BUNDLE_RETRY_ATTEMPTS => {
                     info!(
                         "[agent-grpc] WAF bundle generation {} still not applied after {n} retries: {e} (giving up until the next bundle or reconnect)",
                         bu.generation
@@ -1090,18 +1112,20 @@ impl BundleRetry {
                 }
                 Err(_) => {}
             }
-            wait = (wait * 2).min(self.max_wait);
-            n += 1;
+            if retry == Retry::Backoff {
+                wait = (wait * 2).min(self.max_wait);
+                n += 1;
+            }
         }
     }
 }
 
 /// Runs the (blocking) apply off the async workers. A panicking sink is a retryable failure.
-async fn run_attempt(attempt: &Attempt, bu: &Arc<BundleUpdate>) -> (bool, Result<(), String>) {
+async fn run_attempt(attempt: &Attempt, bu: &Arc<BundleUpdate>) -> (Retry, Result<(), String>) {
     let (a, b) = (attempt.clone(), bu.clone());
     tokio::task::spawn_blocking(move || a(&b))
         .await
-        .unwrap_or_else(|_| (true, Err("bundle apply panicked".into())))
+        .unwrap_or_else(|_| (Retry::Backoff, Err("bundle apply panicked".into())))
 }
 
 #[derive(serde::Serialize)]
@@ -1264,9 +1288,12 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             if c.fetch_add(1, Ordering::SeqCst) < 2 {
-                (true, Err("WAF bundle observer is not ready".into()))
+                (
+                    Retry::Backoff,
+                    Err("WAF bundle observer is not ready".into()),
+                )
             } else {
-                (false, Ok(()))
+                (Retry::No, Ok(()))
             }
         });
         let r = Arc::new(BundleRetry::new(
@@ -1296,10 +1323,10 @@ mod tests {
         let attempt: Attempt = Arc::new(move |b: &BundleUpdate| {
             if b.command_id == "old" {
                 a.lock().unwrap().push("old-failed".to_string());
-                return (true, Err("bind failed".into()));
+                return (Retry::Backoff, Err("bind failed".into()));
             }
             a.lock().unwrap().push(b.command_id.clone());
-            (false, Ok(()))
+            (Retry::No, Ok(()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(5),
@@ -1318,7 +1345,7 @@ mod tests {
         let c = calls.clone();
         let failing: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("still failing".into()))
+            (Retry::Backoff, Err("still failing".into()))
         });
         let r2 = Arc::new(BundleRetry::new(
             Duration::from_millis(5),
@@ -1338,7 +1365,7 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("unsupported unblock command".into()))
+            (Retry::Backoff, Err("unsupported unblock command".into()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(1),
@@ -1364,7 +1391,7 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("port taken".into()))
+            (Retry::Backoff, Err("port taken".into()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(1),
@@ -1379,6 +1406,78 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1 + WAF_BUNDLE_RETRY_ATTEMPTS);
+    }
+
+    /// An address that stays taken is tried again every minute and never given up on, long past
+    /// the ten attempts of any other refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_bind_failure_retries_every_minute_without_a_limit() {
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (t, b) = (times.clone(), bound.clone());
+        let attempt: Attempt = Arc::new(move |_| {
+            t.lock().unwrap().push(tokio::time::Instant::now());
+            if b.load(Ordering::SeqCst) {
+                (Retry::No, Ok(()))
+            } else {
+                (
+                    Retry::UntilBound,
+                    Err("failed to bind WAF route listener".into()),
+                )
+            }
+        });
+        let r = Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX));
+        let (s, _alive, mut rx) = sender();
+        let mut tasks = JoinSet::new();
+        r.handle(bu("g", 9, "{}"), attempt, s, &mut tasks).await;
+        assert_eq!(times.lock().unwrap().len(), 1);
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(times.lock().unwrap().len(), 1, "not before a minute");
+        tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+        let tried = times.lock().unwrap().clone();
+        assert!(
+            tried.len() > 1 + WAF_BUNDLE_RETRY_ATTEMPTS as usize,
+            "still trying after half an hour: {} attempts",
+            tried.len()
+        );
+        assert!(
+            tried
+                .windows(2)
+                .all(|w| w[1] - w[0] >= Duration::from_secs(60)),
+            "no attempt sooner than a minute after the one before"
+        );
+        assert!(!tasks.is_empty(), "the retry is still waiting");
+
+        bound.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let got = acks(&mut rx);
+        assert!(
+            got.last().is_some_and(|a| a.ok && a.command_id == "g"),
+            "{got:?}"
+        );
+    }
+
+    struct BindSink;
+    impl BundleSink for BindSink {
+        fn apply(&self, _: &[u8], _: i64) -> Result<(), BundleError> {
+            Err(BundleError::Bind(
+                "failed to bind WAF route listener".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bind_error_of_the_sink_is_retried_until_it_binds() {
+        let l = bare_link_with(Arc::new(BindSink));
+        let (retry, res) = l.apply_bundle_update(&bu("g", 7, "{}"));
+        assert_eq!(retry, Retry::UntilBound);
+        assert_eq!(res.unwrap_err(), "failed to bind WAF route listener");
+        assert_eq!(*l.last_gen.lock().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1483,17 +1582,17 @@ mod tests {
     async fn negative_ack_keeps_generation_and_no_percentiles_without_samples() {
         let l = bare_link();
         *l.last_gen.lock().unwrap() = 5;
-        let (retryable, res) = l.apply_bundle_update(&bu("failed", 999, "{}"));
-        assert!(retryable && res.is_err());
+        let (retry, res) = l.apply_bundle_update(&bu("failed", 999, "{}"));
+        assert!(retry == Retry::Backoff && res.is_err());
         assert_eq!(*l.last_gen.lock().unwrap(), 5);
         assert_eq!(l.bundle_status(), (String::new(), 0));
-        let (retryable, res) = l.apply_bundle_update(&bu("bad", 1, "{"));
+        let (retry, res) = l.apply_bundle_update(&bu("bad", 1, "{"));
         assert!(
-            !retryable && res.is_err(),
+            retry == Retry::No && res.is_err(),
             "a decode error is never retried"
         );
-        let (retryable, _) = l.apply_bundle_update(&bu("u", 0, r#"{"management_only":true}"#));
-        assert!(!retryable, "a management command is never retried");
+        let (retry, _) = l.apply_bundle_update(&bu("u", 0, r#"{"management_only":true}"#));
+        assert!(retry == Retry::No, "a management command is never retried");
 
         let hb = l.heartbeat(None);
         assert_eq!(hb.analyze_latency_samples, Some(0));
@@ -1503,6 +1602,10 @@ mod tests {
     }
 
     fn bare_link() -> Arc<ControlLink> {
+        bare_link_with(Arc::new(FailSink))
+    }
+
+    fn bare_link_with(bundles: Arc<dyn BundleSink>) -> Arc<ControlLink> {
         ControlLink::new(
             ControlConfig {
                 server_address: "127.0.0.1:1".into(),
@@ -1521,7 +1624,7 @@ mod tests {
                 component_paths: BTreeMap::new(),
             },
             Hooks {
-                bundles: Arc::new(FailSink),
+                bundles,
                 certificates: Arc::new(NoCerts),
                 stats: Arc::new(ZeroStats),
                 security_data: Arc::new(NoSec),

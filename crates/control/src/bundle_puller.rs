@@ -16,6 +16,11 @@ pub enum BundleError {
     /// The observer (the inline proxy) returned an error.
     #[error("{0}")]
     Apply(String),
+    /// An address the bundle names could not be bound, most likely because another program still
+    /// holds it. Retried every minute, without an attempt limit, until it binds or a newer bundle
+    /// arrives.
+    #[error("{0}")]
+    Bind(String),
 }
 
 /// The inline proxy side: decodes and applies a bundle.
