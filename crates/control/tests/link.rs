@@ -29,12 +29,23 @@ fn read(name: &str) -> Vec<u8> {
     std::fs::read(fixture(name)).unwrap()
 }
 
+/// The state directory of one test, in memory where the host has /dev/shm. The link fsyncs the
+/// bundle cache before it acks a bundle, and every message after it waits in the receive loop. On
+/// a disk that a parallel build keeps busy one fsync took seconds and the 5 s waits ran out. On
+/// tmpfs an fsync returns at once, so the waits measure the link and not the host's disk. The
+/// cache's own disk handling is tested in the crate's bundle cache tests.
 fn tmpdir(tag: &str) -> PathBuf {
     let n = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let d = std::env::temp_dir().join(format!("wafio-link-{tag}-{}-{n}", std::process::id()));
+    let shm = Path::new("/dev/shm");
+    let base = if shm.is_dir() {
+        shm.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    let d = base.join(format!("wafio-link-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
