@@ -151,14 +151,7 @@ async fn apply_errors_change_nothing() {
 async fn many_listeners_churn() {
     let u1 = http_upstream().await;
     let h = Harness::new();
-    let held: Vec<_> = (0..200)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let ports: Vec<u16> = held
-        .iter()
-        .map(|l| l.local_addr().unwrap().port())
-        .collect();
-    drop(held);
+    let ports: Vec<u16> = (0..200).map(|_| free_port()).collect();
     let apps = |ps: &[u16]| {
         ps.iter()
             .map(|&p| app(&format!("app{p}"), p, &format!("http://{}", u1.addr)))

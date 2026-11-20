@@ -312,13 +312,21 @@ pub fn analysis_setup(rules: &str) -> Arc<AppAnalysisSetup> {
     Arc::new(wafio_proxy::testing::analysis_setup(rules.as_bytes()))
 }
 
-/// A free local port (bound and released).
+/// The sockets that keep the ports of [`free_port`] taken until the test process ends.
+static RESERVED_PORTS: Mutex<Vec<tokio::net::TcpSocket>> = Mutex::new(Vec::new());
+
+/// A local port that stays reserved for the caller. A port that was bound and released could be
+/// handed to another test's bind to port 0 or outgoing connection before the proxy bound it. The
+/// port stays bound with SO_REUSEADDR and never listens: Linux then gives it to no bind to port 0
+/// and no outgoing connection, refuses connections to it, and still lets the proxy, which also
+/// binds with SO_REUSEADDR, bind and listen on it.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_reuseaddr(true).unwrap();
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = sock.local_addr().unwrap().port();
+    RESERVED_PORTS.lock().unwrap().push(sock);
+    port
 }
 
 pub fn app(id: &str, port: u16, upstream: &str) -> AppSpec {
