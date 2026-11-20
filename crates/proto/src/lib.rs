@@ -23,6 +23,26 @@ impl std::fmt::Debug for v1::CertificateInstall {
     }
 }
 
+impl v1::CertificateInstall {
+    /// Overwrites the key with zeros, spare capacity included, and keeps its length. Best effort:
+    /// tonic keeps its own decode buffer, and a sink that took the key out has copied it.
+    pub fn wipe_key(&mut self) {
+        let key = &mut self.key_pem;
+        key.fill(0);
+        key.spare_capacity_mut().fill(std::mem::MaybeUninit::new(0));
+        // Without this the compiler may drop the writes, as the buffer is freed right after.
+        std::hint::black_box(key.as_ptr());
+    }
+}
+
+/// The wipe sits on the type, not on one code path: a message that is read and dropped, one that is
+/// drained from a closing stream, a clone and one dropped by a panic all zero the key the same way.
+impl Drop for v1::CertificateInstall {
+    fn drop(&mut self) {
+        self.wipe_key();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::v1::{CertificateInstall, ServerMessage, server_message::Kind};
@@ -44,6 +64,16 @@ mod tests {
         for needle in ["KEYBYTES", "PRIVATE KEY", "BEGIN", "["] {
             assert!(!shown.contains(needle), "{needle:?} in {shown}");
         }
+    }
+
+    #[test]
+    fn wipe_key_zeroes_the_key_and_keeps_its_length_and_the_rest() {
+        let mut m = install();
+        let (key_len, chain) = (m.key_pem.len(), m.chain_pem.clone());
+        m.wipe_key();
+        assert_eq!(m.key_pem, vec![0; key_len]);
+        assert_eq!(m.chain_pem, chain);
+        assert_eq!(m.command_id, "cmd-1");
     }
 
     #[test]

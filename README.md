@@ -570,7 +570,9 @@ The only C code in the binary is the TLS provider (`ring`) and the allocator (`m
 
 `CertificateInstall` carries a private key, and prost ignores the proto's `debug_redact`. So `build.rs` leaves out the
 derived `Debug` of that message and `crates/proto/src/lib.rs` writes one that prints the ids, the leaf digest and the
-two byte lengths, which makes the `Debug` of `ServerMessage` safe too.
+two byte lengths, which makes the `Debug` of `ServerMessage` safe too. The same file gives the message a `Drop` that
+zeroes `key_pem`, so a key does not stay in freed memory however the message ends: installed, refused, drained from a
+closing stream or dropped by a panic. This is best effort: tonic keeps its own decode buffer.
 
 ## Release
 

@@ -1,7 +1,5 @@
-//! The install side of the link: the sink the agent supplies, the codes of a refused install and
-//! the wipe of the private key the message carries.
+//! The install side of the link: the sink the agent supplies and the codes of a refused install.
 
-use std::borrow::BorrowMut;
 use std::sync::Arc;
 use wafio_proto::v1::CertificateInstall;
 
@@ -43,49 +41,28 @@ impl AckCode {
 /// The agent's side of a `CertificateInstall`: checks the pair and keeps it.
 ///
 /// Called on a blocking thread, and the receive loop waits for it, so an install is handled in
-/// stream order with the bundles around it. The link zeroes `key_pem` once this returns, also
-/// after a panic; the sink must not log the message or keep a copy of the key it does not need.
+/// stream order with the bundles around it. The message zeroes `key_pem` when it is dropped, which
+/// the link does once this returns, also after a panic. So the sink must not log the message, take
+/// or replace `key_pem`, or keep a copy of the key it does not need.
 pub trait CertificateSink: Send + Sync + 'static {
     fn install(&self, install: &mut CertificateInstall) -> Result<(), AckCode>;
 }
 
-/// Owns a `CertificateInstall` and zeroes its key when dropped, whichever way the install ends,
-/// and also when the closure that holds it is dropped without ever running. `T` is the message or
-/// a mutable borrow of it.
-pub(crate) struct KeyWipe<T: BorrowMut<CertificateInstall>>(pub(crate) T);
-
-impl<T: BorrowMut<CertificateInstall>> Drop for KeyWipe<T> {
-    fn drop(&mut self) {
-        let key = &mut BorrowMut::<CertificateInstall>::borrow_mut(&mut self.0).key_pem;
-        key.fill(0);
-        // Without this the compiler may drop the writes, as the buffer is freed right after.
-        std::hint::black_box(&key[..]);
-    }
-}
-
 /// Hands the install to the sink on a blocking thread. A panic in the sink is a refusal that may
-/// succeed when repeated, as for a bundle.
+/// succeed when repeated, as for a bundle. The message owns the wipe of its key, so it holds on
+/// this path, on a panic and when the closure is dropped without running.
 pub(crate) async fn run_install(
     sink: Arc<dyn CertificateSink>,
-    install: CertificateInstall,
+    mut install: CertificateInstall,
 ) -> Result<(), AckCode> {
-    let held = KeyWipe(install);
-    tokio::task::spawn_blocking(move || install_with_wipe(&*sink, held))
+    tokio::task::spawn_blocking(move || sink.install(&mut install))
         .await
         .unwrap_or(Err(AckCode::WriteFailed))
-}
-
-fn install_with_wipe<T: BorrowMut<CertificateInstall>>(
-    sink: &dyn CertificateSink,
-    mut held: KeyWipe<T>,
-) -> Result<(), AckCode> {
-    sink.install(BorrowMut::<CertificateInstall>::borrow_mut(&mut held.0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn install() -> CertificateInstall {
         CertificateInstall {
@@ -93,7 +70,7 @@ mod tests {
             app_id: "a".into(),
             certificate_id: "i".into(),
             chain_pem: b"public chain".to_vec(),
-            key_pem: b"bytes the sink may read and the link must zero".to_vec(),
+            key_pem: b"bytes the sink may read".to_vec(),
             leaf_sha256: "d".into(),
         }
     }
@@ -120,101 +97,48 @@ mod tests {
         }
     }
 
-    fn assert_wiped(m: &CertificateInstall, key_len: usize) {
-        assert_eq!(
-            m.key_pem.len(),
-            key_len,
-            "the length stays, only the bytes go"
-        );
-        assert!(m.key_pem.iter().all(|b| *b == 0), "{:?}", m.key_pem);
-        assert_eq!(m.chain_pem, b"public chain", "only the key is zeroed");
+    /// The string of the contract for each code. The match is exhaustive, so a new code does not
+    /// compile here until it has one; add it to `ALL` too.
+    fn contract(code: AckCode) -> &'static str {
+        match code {
+            AckCode::BadPem => "bad_pem",
+            AckCode::TooLarge => "too_large",
+            AckCode::KeyMismatch => "key_mismatch",
+            AckCode::LeafMismatch => "leaf_mismatch",
+            AckCode::UnsupportedKey => "unsupported_key",
+            AckCode::NotInBundle => "not_in_bundle",
+            AckCode::WriteFailed => "write_failed",
+        }
     }
+
+    const ALL: [AckCode; 7] = [
+        AckCode::BadPem,
+        AckCode::TooLarge,
+        AckCode::KeyMismatch,
+        AckCode::LeafMismatch,
+        AckCode::UnsupportedKey,
+        AckCode::NotInBundle,
+        AckCode::WriteFailed,
+    ];
 
     #[test]
     fn every_ack_code_is_the_string_of_the_contract() {
-        let table = [
-            (AckCode::BadPem, "bad_pem"),
-            (AckCode::TooLarge, "too_large"),
-            (AckCode::KeyMismatch, "key_mismatch"),
-            (AckCode::LeafMismatch, "leaf_mismatch"),
-            (AckCode::UnsupportedKey, "unsupported_key"),
-            (AckCode::NotInBundle, "not_in_bundle"),
-            (AckCode::WriteFailed, "write_failed"),
-        ];
-        // Written as a match so a code added to the enum fails here until the table has it.
-        for (code, _) in table {
-            match code {
-                AckCode::BadPem
-                | AckCode::TooLarge
-                | AckCode::KeyMismatch
-                | AckCode::LeafMismatch
-                | AckCode::UnsupportedKey
-                | AckCode::NotInBundle
-                | AckCode::WriteFailed => {}
-            }
+        for code in ALL {
+            assert_eq!(code.as_str(), contract(code));
         }
-        for (code, want) in table {
-            assert_eq!(code.as_str(), want);
-        }
-        let mut names: Vec<_> = table.iter().map(|(c, _)| c.as_str()).collect();
+        let mut names = ALL.map(AckCode::as_str);
         names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), 7);
-    }
-
-    #[test]
-    fn the_key_is_zeroed_after_the_sink_returns_ok() {
-        let mut m = install();
-        let key_len = m.key_pem.len();
-        assert_eq!(
-            install_with_wipe(&Sink(Outcome::Ok), KeyWipe(&mut m)),
-            Ok(())
-        );
-        assert_wiped(&m, key_len);
-    }
-
-    #[test]
-    fn the_key_is_zeroed_after_the_sink_returns_an_error() {
-        let mut m = install();
-        let key_len = m.key_pem.len();
-        let r = install_with_wipe(
-            &Sink(Outcome::Refuse(AckCode::KeyMismatch)),
-            KeyWipe(&mut m),
-        );
-        assert_eq!(r, Err(AckCode::KeyMismatch));
-        assert_wiped(&m, key_len);
-    }
-
-    #[test]
-    fn the_key_is_zeroed_when_the_sink_panics() {
-        let mut m = install();
-        let key_len = m.key_pem.len();
-        let r = catch_unwind(AssertUnwindSafe(|| {
-            install_with_wipe(&Sink(Outcome::Panic), KeyWipe(&mut m))
-        }));
-        assert!(r.is_err(), "the panic reaches the caller");
-        assert_wiped(&m, key_len);
-    }
-
-    // The closure that holds the wrapper can be dropped unrun, as at runtime shutdown.
-    #[test]
-    fn the_key_is_zeroed_when_the_install_is_never_handed_to_the_sink() {
-        let mut m = install();
-        let key_len = m.key_pem.len();
-        drop(KeyWipe(&mut m));
-        assert_wiped(&m, key_len);
+        assert!(names.windows(2).all(|w| w[0] != w[1]), "{names:?}");
     }
 
     #[tokio::test]
-    async fn a_panicking_sink_is_a_refusal_that_may_succeed_when_repeated() {
-        let sink: Arc<dyn CertificateSink> = Arc::new(Sink(Outcome::Panic));
+    async fn the_sink_decides_and_a_panic_is_a_refusal_that_may_succeed_when_repeated() {
+        let run = |outcome| run_install(Arc::new(Sink(outcome)), install());
+        assert_eq!(run(Outcome::Ok).await, Ok(()));
         assert_eq!(
-            run_install(sink, install()).await,
-            Err(AckCode::WriteFailed)
+            run(Outcome::Refuse(AckCode::TooLarge)).await,
+            Err(AckCode::TooLarge)
         );
-        let sink: Arc<dyn CertificateSink> = Arc::new(Sink(Outcome::Refuse(AckCode::TooLarge)));
-        assert_eq!(run_install(sink, install()).await, Err(AckCode::TooLarge));
-        let sink: Arc<dyn CertificateSink> = Arc::new(Sink(Outcome::Ok));
-        assert_eq!(run_install(sink, install()).await, Ok(()));
+        assert_eq!(run(Outcome::Panic).await, Err(AckCode::WriteFailed));
     }
 }

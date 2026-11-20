@@ -314,8 +314,8 @@ pub struct ControlLink {
 }
 
 impl ControlLink {
-    /// Arms the link and starts the decision drainer. Call inside a Tokio runtime, before
-    /// the proxy emits decisions.
+    /// Arms the link and starts the decision drainer and the certificate status task. Call inside
+    /// a Tokio runtime, before the proxy emits decisions.
     pub fn new(cfg: ControlConfig, hooks: Hooks) -> Arc<Self> {
         let (status_wake, status_wake_rx) = mpsc::channel(1);
         let link = Arc::new(ControlLink {
@@ -1481,31 +1481,7 @@ mod tests {
     // provenance; a heartbeat without samples carries samples=0 and no percentiles.
     #[tokio::test]
     async fn negative_ack_keeps_generation_and_no_percentiles_without_samples() {
-        let cfg = ControlConfig {
-            server_address: "127.0.0.1:1".into(),
-            server_name: String::new(),
-            cert_pem: Vec::new(),
-            key_pem: Vec::new(),
-            ca_pem: Vec::new(),
-            agent_name: "a".into(),
-            hostname: String::new(),
-            version: "wafio-waf-agent/test".into(),
-            host_key: String::new(),
-            features: Vec::new(),
-            state_dir: String::new(),
-            bundle_cache_max_age: Duration::ZERO,
-            security_data_dir: String::new(),
-            component_paths: BTreeMap::new(),
-        };
-        let hooks = Hooks {
-            bundles: Arc::new(FailSink),
-            certificates: Arc::new(NoCerts),
-            stats: Arc::new(ZeroStats),
-            security_data: Arc::new(NoSec),
-            redact: |_| {},
-            on_dial: |_| {},
-        };
-        let l = ControlLink::new(cfg, hooks);
+        let l = bare_link();
         *l.last_gen.lock().unwrap() = 5;
         let (retryable, res) = l.apply_bundle_update(&bu("failed", 999, "{}"));
         assert!(retryable && res.is_err());
