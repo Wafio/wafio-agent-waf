@@ -299,6 +299,23 @@ fn the_apply_lock_keeps_a_bundle_out_between_a_check_and_its_commit() {
 }
 
 #[test]
+fn a_process_that_is_closing_does_not_take_the_key_directory_lock() {
+    let (a, _proxy, dir) = agent_with_keys();
+    assert!(a.holds_keys() && !a.waits_for_keys());
+    // Another process holds the lock, as the one this replaces does.
+    a.release_keys();
+    let mut other = KeyDir::open(&dir.dir(), my_uid()).unwrap();
+    assert!(other.holds_lock());
+    assert!(a.waits_for_keys() && !a.take_over_keys());
+
+    other.release_lock();
+    a.close();
+    assert!(a.take_over_keys(), "nothing is left to wait for");
+    assert!(!a.holds_keys(), "but the lock stays free for the successor");
+    assert!(other.try_lock());
+}
+
+#[test]
 fn a_refusal_for_an_address_that_cannot_be_bound_is_told_apart() {
     let (a, proxy, _dir) = agent_with_keys();
     *proxy.fail.lock().unwrap() = Some(wafio_proxy::listeners::BIND_ERROR.into());

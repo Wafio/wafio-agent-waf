@@ -147,9 +147,16 @@ impl Agent {
     }
 
     /// Takes the key directory lock if the process that held it let go, and then does what could
-    /// not be done without it. Returns whether this process holds it. Blocking: it may write.
+    /// not be done without it. Returns whether there is nothing left to wait for: this process
+    /// holds the lock, or it has no key directory, or it is closing and leaves the lock to the
+    /// process that replaces it. Blocking: it may write.
     pub fn take_over_keys(&self) -> bool {
-        self.lock().tls.as_mut().is_some_and(Keys::take_over)
+        let mut st = self.lock();
+        let closed = st.closed;
+        match st.tls.as_mut() {
+            Some(keys) if !closed => keys.take_over(),
+            _ => true,
+        }
     }
 
     /// Lets go of the key directory lock for the process that takes over. Call it after `close`:
