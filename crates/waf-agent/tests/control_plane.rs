@@ -3,7 +3,8 @@
 //! the features `script_rules`, `maintenance_mode` and `no_semantic_engine`), the first heartbeat with host info and
 //! counters, the malware sync
 //! into the security-data dir given by `--security-data-dir`, the bundle ack, READY after the
-//! live bundle, the bundle cache, a block decision with its credentials redacted.
+//! live bundle, the bundle cache, a block decision with its credentials redacted, the refusal of a
+//! certificate install.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -361,6 +362,33 @@ async fn agent_talks_to_the_control_plane() {
     }
     assert_eq!(std::fs::read(&installed).unwrap(), malware);
 
+    // An install is refused as not named by the bundle (the agent keeps no uploaded certificate
+    // yet), and the key reaches neither the ack nor the log.
+    c.out
+        .send(Ok(ServerMessage {
+            kind: Some(In::CertificateInstall(CertificateInstall {
+                command_id: "ci1".into(),
+                app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+                certificate_id: "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77".into(),
+                chain_pem: b"chain".to_vec(),
+                key_pem: b"INSTALLKEYBYTES".to_vec(),
+                leaf_sha256: "ab".repeat(32),
+            })),
+        }))
+        .await
+        .unwrap();
+    let refused = loop {
+        if let Some(Out::Ack(a)) = c.next().await.kind
+            && a.command_id == "ci1"
+        {
+            break a;
+        }
+    };
+    assert_eq!(
+        (refused.ok, refused.error.as_str()),
+        (false, "not_in_bundle")
+    );
+
     // KeyRotation: acked, the agent reconnects with the new key...
     let kr = KeyRotation {
         command_id: "k1".into(),
@@ -449,6 +477,11 @@ async fn agent_talks_to_the_control_plane() {
         log.contains("[waf-bundle] applied generation 3 — 1 apps"),
         "{log}"
     );
+    assert!(
+        log.contains("certificate refused") && log.contains("not_in_bundle"),
+        "{log}"
+    );
+    assert!(!log.contains("INSTALLKEYBYTES"), "{log}");
     assert!(
         log.contains("[wafio-waf-agent] shutdown signal — stopping"),
         "{log}"

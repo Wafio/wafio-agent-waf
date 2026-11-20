@@ -1,6 +1,5 @@
 # Vendored copy; scripts/sync-proto.sh <tag> rewrites this file.
-# Imported from Wafio/wafio@30fc16c84801d1d0c3be9cd339eb6831e9afca63; the tag below is created with the first cp-backend push.
 repo: Wafio/wafio-cp-backend
 path: shared/proto/agent/v1/agent_control.proto
-tag: shared/v0.1.0
-sha256: 9960e9439c6a6735328ddad5ddfdf5e3b1f312a32be2ceda913f4fdb547d49da
+tag: shared/v0.3.0
+sha256: 6af7c0308d05aa768acda68e8f42911df1954716d518c6ea78e09cb34515477f

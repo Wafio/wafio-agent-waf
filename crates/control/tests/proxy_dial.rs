@@ -152,6 +152,12 @@ fn link(addr: &str) -> Arc<ControlLink> {
             Ok(())
         }
     }
+    struct NoCertificates;
+    impl CertificateSink for NoCertificates {
+        fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
+            Err(AckCode::NotInBundle)
+        }
+    }
     struct NoSec;
     impl SecurityData for NoSec {
         fn replace_malware_snapshot(&self, _: &Path, _: Vec<u8>) -> Result<(), String> {
@@ -165,6 +171,7 @@ fn link(addr: &str) -> Arc<ControlLink> {
         cfg,
         Hooks {
             bundles: Arc::new(NoSink),
+            certificates: Arc::new(NoCertificates),
             stats: Arc::new(NoStats),
             security_data: Arc::new(NoSec),
             redact: |_| {},

@@ -8,7 +8,7 @@ use std::time::{Instant, SystemTime};
 use wafio_agent_pages::goodbot::VerifiedBotChecker;
 use wafio_application::RateLimitStore;
 use wafio_application::blocklist::BlockStore;
-use wafio_control::{BundleError, BundleSink};
+use wafio_control::{AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink};
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
 use wafio_proxy::{AppAnalysisSetup, AppSpec, TlsSite};
@@ -349,6 +349,16 @@ impl BundleSink for Sink {
 
     fn check(&self, bundle_json: &[u8]) -> Result<(), String> {
         decode_bundle(bundle_json).map(|_| ())
+    }
+}
+
+/// The `CertificateSink` the control link calls (on a blocking thread). The agent keeps no
+/// uploaded certificate yet, so every install is answered as one its bundle does not name.
+pub struct Certificates;
+
+impl CertificateSink for Certificates {
+    fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
+        Err(AckCode::NotInBundle)
     }
 }
 

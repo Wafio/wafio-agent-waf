@@ -3,6 +3,7 @@
 
 use crate::bundle_cache::BUNDLE_SOURCE_LIVE;
 use crate::bundle_puller::{BundleError, BundleProbe, BundleSink, is_management_only};
+use crate::certificates::{AckCode, CertificateSink, run_install};
 use crate::grpc_reconnect::{
     GRPC_CLIENT_KEEPALIVE_TIME, GRPC_CLIENT_KEEPALIVE_TIMEOUT, ReconnectBackoff, jitter,
 };
@@ -23,7 +24,8 @@ use wafio_proto::v1::agent_control_client::AgentControlClient;
 use wafio_proto::v1::agent_message::Kind as Out;
 use wafio_proto::v1::server_message::Kind as In;
 use wafio_proto::v1::{
-    AgentMessage, BundleUpdate, CommandAck, FetchSecurityData, Heartbeat, Hello,
+    AgentMessage, BundleUpdate, CertificateInstall, CertificateStatus, CommandAck,
+    FetchSecurityData, Heartbeat, Hello,
 };
 
 /// Heartbeat period; `Welcome.heartbeat_seconds` is ignored.
@@ -173,6 +175,7 @@ pub trait AgentStats: Send + Sync + 'static {
 /// The agent-side pieces the link calls into.
 pub struct Hooks {
     pub bundles: Arc<dyn BundleSink>,
+    pub certificates: Arc<dyn CertificateSink>,
     pub stats: Arc<dyn AgentStats>,
     pub security_data: Arc<dyn SecurityData>,
     pub redact: Redactor,
@@ -270,6 +273,17 @@ fn ack(command_id: String, ok: bool, error: String) -> AgentMessage {
     }
 }
 
+/// The ack of an install: empty `error` on success, else the code's contract string.
+fn install_ack(command_id: String, res: Result<(), AckCode>) -> AgentMessage {
+    ack(
+        command_id,
+        res.is_ok(),
+        res.err()
+            .map(|c| c.as_str().to_string())
+            .unwrap_or_default(),
+    )
+}
+
 pub(crate) async fn send_bundle_ack(
     send: &StreamSender,
     command_id: &str,
@@ -293,12 +307,17 @@ pub struct ControlLink {
     active: Mutex<Option<StreamSender>>,
     telemetry: Telemetry,
     malware_lock: tokio::sync::Mutex<()>,
+    /// The latest certificate status of each app that the stream has not taken yet.
+    statuses: Mutex<BTreeMap<String, CertificateStatus>>,
+    /// Wakes the status task; one pending wake-up is enough, as it drains `statuses`.
+    status_wake: mpsc::Sender<()>,
 }
 
 impl ControlLink {
     /// Arms the link and starts the decision drainer. Call inside a Tokio runtime, before
     /// the proxy emits decisions.
     pub fn new(cfg: ControlConfig, hooks: Hooks) -> Arc<Self> {
+        let (status_wake, status_wake_rx) = mpsc::channel(1);
         let link = Arc::new(ControlLink {
             control_config: Mutex::new(cfg),
             hooks,
@@ -307,11 +326,17 @@ impl ControlLink {
             active: Mutex::new(None),
             telemetry: Telemetry::new(),
             malware_lock: tokio::sync::Mutex::const_new(()),
+            statuses: Mutex::new(BTreeMap::new()),
+            status_wake,
         });
         (link.hooks.on_dial)(&link.config().server_address);
         if let Some(rx) = link.telemetry.rx.lock().unwrap().take() {
             tokio::spawn(flush_decision_queue(Arc::downgrade(&link), rx));
         }
+        tokio::spawn(send_certificate_statuses(
+            Arc::downgrade(&link),
+            status_wake_rx,
+        ));
         link
     }
 
@@ -344,6 +369,18 @@ impl ControlLink {
         (self.hooks.redact)(&mut ev);
         ev.match_value = None;
         self.telemetry.emit(ev);
+    }
+
+    /// Hands a certificate status to the stream without blocking, from any thread. A newer status
+    /// of the same app replaces one that has not gone out yet, and a status reported while no
+    /// stream is up is dropped. When to report, and how often, is for the caller to decide.
+    pub fn report_certificate_status(&self, status: CertificateStatus) {
+        self.statuses
+            .lock()
+            .unwrap()
+            .insert(status.app_id.clone(), status);
+        // A full channel means a wake-up is already waiting.
+        let _ = self.status_wake.try_send(());
     }
 
     /// One dial + Hello + Welcome within 12 s, so bad credentials fail the start instead of
@@ -470,9 +507,32 @@ impl ControlLink {
                         send.clone(),
                     ));
                 }
+                Some(In::CertificateInstall(ci)) => self.handle_install(ci, &send).await,
                 None => {}
             }
         }
+    }
+
+    /// Runs the install and acks it before the next message is read, so an install and the
+    /// bundles around it are handled, and acked, in the order the stream delivered them.
+    async fn handle_install(&self, install: CertificateInstall, send: &StreamSender) {
+        // The ids only: the message itself is never formatted.
+        let (command_id, app_id, certificate_id) = (
+            install.command_id.clone(),
+            install.app_id.clone(),
+            install.certificate_id.clone(),
+        );
+        let res = run_install(self.hooks.certificates.clone(), install).await;
+        match res {
+            Ok(()) => info!(
+                "[agent-grpc] certificate installed app_id={app_id:?} certificate_id={certificate_id:?}"
+            ),
+            Err(code) => info!(
+                "[agent-grpc] certificate refused app_id={app_id:?} certificate_id={certificate_id:?}: {}",
+                code.as_str()
+            ),
+        }
+        let _ = send.send(install_ack(command_id, res)).await;
     }
 
     /// Host info on connect, then every 30 s.
@@ -728,6 +788,7 @@ fn kind_name(k: &Option<In>) -> &'static str {
         Some(In::KeyRotation(_)) => "*agentv1.ServerMessage_KeyRotation",
         Some(In::Ping(_)) => "*agentv1.ServerMessage_Ping",
         Some(In::FetchSecurityData(_)) => "*agentv1.ServerMessage_FetchSecurityData",
+        Some(In::CertificateInstall(_)) => "*agentv1.ServerMessage_CertificateInstall",
     }
 }
 
@@ -908,6 +969,32 @@ async fn flush_decision_queue(
                     .send_fail
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!("[agent-grpc] dropping decision for {uri:?}: {e}");
+            }
+        }
+    }
+}
+
+/// The single consumer of the certificate statuses: takes the pending ones one app at a time
+/// and waits for room in the stream, so a status that is replaced meanwhile goes out once, in
+/// its latest form. With no stream up the pending ones are dropped: the next live bundle makes
+/// the agent report again.
+async fn send_certificate_statuses(link: Weak<ControlLink>, mut wake: mpsc::Receiver<()>) {
+    while wake.recv().await.is_some() {
+        loop {
+            let Some(l) = link.upgrade() else { return };
+            let Some((app_id, status)) = l.statuses.lock().unwrap().pop_first() else {
+                break;
+            };
+            let Some(send) = l.active.lock().unwrap().clone() else {
+                l.statuses.lock().unwrap().clear();
+                break;
+            };
+            drop(l);
+            let msg = AgentMessage {
+                kind: Some(Out::CertificateStatus(status)),
+            };
+            if let Err(e) = send.send(msg).await {
+                info!("[agent-grpc] dropping certificate status of app {app_id:?}: {e}");
             }
         }
     }
@@ -1374,6 +1461,12 @@ mod tests {
             Vec::new()
         }
     }
+    struct NoCerts;
+    impl CertificateSink for NoCerts {
+        fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
+            Err(AckCode::NotInBundle)
+        }
+    }
     struct NoSec;
     impl SecurityData for NoSec {
         fn replace_malware_snapshot(&self, _: &Path, _: Vec<u8>) -> Result<(), String> {
@@ -1406,6 +1499,7 @@ mod tests {
         };
         let hooks = Hooks {
             bundles: Arc::new(FailSink),
+            certificates: Arc::new(NoCerts),
             stats: Arc::new(ZeroStats),
             security_data: Arc::new(NoSec),
             redact: |_| {},
@@ -1430,5 +1524,193 @@ mod tests {
         assert!(hb.analyze_latency_p50_us.is_none() && hb.analyze_latency_p95_us.is_none());
         assert!(hb.analyze_latency_p99_us.is_none());
         assert_eq!(hb.decisions_total, 0);
+    }
+
+    fn bare_link() -> Arc<ControlLink> {
+        ControlLink::new(
+            ControlConfig {
+                server_address: "127.0.0.1:1".into(),
+                server_name: String::new(),
+                cert_pem: Vec::new(),
+                key_pem: Vec::new(),
+                ca_pem: Vec::new(),
+                agent_name: "a".into(),
+                hostname: String::new(),
+                version: "wafio-waf-agent/test".into(),
+                host_key: String::new(),
+                features: Vec::new(),
+                state_dir: String::new(),
+                bundle_cache_max_age: Duration::ZERO,
+                security_data_dir: String::new(),
+                component_paths: BTreeMap::new(),
+            },
+            Hooks {
+                bundles: Arc::new(FailSink),
+                certificates: Arc::new(NoCerts),
+                stats: Arc::new(ZeroStats),
+                security_data: Arc::new(NoSec),
+                redact: |_| {},
+                on_dial: |_| {},
+            },
+        )
+    }
+
+    fn status(app: &str, state: &str) -> CertificateStatus {
+        CertificateStatus {
+            app_id: app.into(),
+            source: "acme".into(),
+            state: state.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The (app, state) of a status message.
+    fn status_of(m: AgentMessage) -> (String, String) {
+        match m.kind {
+            Some(Out::CertificateStatus(s)) => (s.app_id, s.state),
+            other => panic!("expected a certificate status, got {other:?}"),
+        }
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    // With no stream up a status is dropped, not kept for the next one; any thread may report.
+    #[tokio::test]
+    async fn statuses_reported_with_no_stream_up_are_dropped() {
+        let l = bare_link();
+        l.report_certificate_status(status("a", "pending"));
+        let from_thread = l.clone();
+        std::thread::spawn(move || {
+            from_thread.report_certificate_status(status("b", "pending"));
+            from_thread.report_certificate_status(status("c", "failed"));
+        })
+        .join()
+        .unwrap();
+        until("the status task to drop them", || {
+            l.statuses.lock().unwrap().is_empty()
+        })
+        .await;
+
+        // A stream that comes up afterwards gets only what is reported after it.
+        let (tx, mut rx) = mpsc::channel(8);
+        let (s, _alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s);
+        l.report_certificate_status(status("d", "active"));
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status_of(first), ("d".into(), "active".into()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "nothing else was kept");
+    }
+
+    // While the stream is full a newer state of an app replaces the older one that waits, and
+    // nothing is lost when room comes: each app goes out once, with its latest state.
+    #[tokio::test]
+    async fn a_status_task_keeps_the_latest_state_per_app_and_waits_for_room() {
+        let l = bare_link();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (s, _alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s.clone());
+        // One message fills the stream, so the task blocks on the first status it sends.
+        s.send(AgentMessage::default()).await.unwrap();
+        l.report_certificate_status(status("z", "pending"));
+        until("the task to take the first status", || {
+            l.statuses.lock().unwrap().is_empty()
+        })
+        .await;
+
+        l.report_certificate_status(status("a", "pending"));
+        l.report_certificate_status(status("a", "active"));
+        l.report_certificate_status(status("b", "failed"));
+        l.report_certificate_status(status("a", "failed"));
+
+        let next = async |rx: &mut mpsc::Receiver<AgentMessage>| {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            next(&mut rx).await.kind.is_none(),
+            "the message that filled it"
+        );
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(status_of(next(&mut rx).await));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("z".to_string(), "pending".to_string()),
+                ("a".to_string(), "failed".to_string()),
+                ("b".to_string(), "failed".to_string()),
+            ]
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "the replaced states never went out");
+    }
+
+    // A status that cannot be sent because the stream ended is dropped, and the task goes on.
+    #[tokio::test]
+    async fn a_status_for_a_stream_that_ended_is_dropped() {
+        let l = bare_link();
+        let (tx, rx) = mpsc::channel(1);
+        let (s, alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s);
+        drop(alive);
+        l.report_certificate_status(status("a", "pending"));
+        until("the status to be taken", || {
+            l.statuses.lock().unwrap().is_empty()
+        })
+        .await;
+        drop(rx);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (s, _alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s);
+        l.report_certificate_status(status("b", "active"));
+        let m = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status_of(m), ("b".into(), "active".into()));
+    }
+
+    #[test]
+    fn an_install_ack_carries_the_code_and_nothing_else() {
+        let Some(Out::Ack(ok)) = install_ack("c1".into(), Ok(())).kind else {
+            panic!("not an ack")
+        };
+        assert_eq!(
+            (
+                ok.command_id.as_str(),
+                ok.ok,
+                ok.error.as_str(),
+                ok.payload.len()
+            ),
+            ("c1", true, "", 0)
+        );
+        let Some(Out::Ack(no)) = install_ack("c2".into(), Err(AckCode::LeafMismatch)).kind else {
+            panic!("not an ack")
+        };
+        assert_eq!(
+            (
+                no.command_id.as_str(),
+                no.ok,
+                no.error.as_str(),
+                no.payload.len()
+            ),
+            ("c2", false, "leaf_mismatch", 0)
+        );
     }
 }

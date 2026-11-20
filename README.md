@@ -568,6 +568,10 @@ The only C code in the binary is the TLS provider (`ring`) and the allocator (`m
 `tonic-prost-build`, so no `protoc` is needed. A protocol change starts in wafio-cp-backend; then run
 `scripts/sync-proto.sh <tag>` here. `scripts/sync-proto.sh --check` is part of the gate.
 
+`CertificateInstall` carries a private key, and prost ignores the proto's `debug_redact`. So `build.rs` leaves out the
+derived `Debug` of that message and `crates/proto/src/lib.rs` writes one that prints the ids, the leaf digest and the
+two byte lengths, which makes the `Debug` of `ServerMessage` safe too.
+
 ## Release
 
 The release bundle is made by wafio-release `scripts/release.sh <version> --waf-agent <binary>`, which takes the
