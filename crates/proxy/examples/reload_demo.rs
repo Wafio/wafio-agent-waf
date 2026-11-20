@@ -54,6 +54,7 @@ async fn run() -> std::io::Result<()> {
             .and_then(|f| std::fs::read(f).ok())
             .unwrap_or_default(),
         analysis: Arc::new(wafio_proxy::testing::analysis_setup(br#"{}"#)),
+        tls: None,
     };
     proxy.apply(vec![app]).map_err(std::io::Error::other)?;
     upgrade::notify_ready();

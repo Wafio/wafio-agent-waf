@@ -4,10 +4,21 @@
 //! string, decoded path, re-quoted forward target) and the lower-cased host. Pingora forwards raw
 //! request-targets; every path the pipeline matches or forwards comes from here.
 
+use std::sync::Arc;
+
 use wafio_domain::Headers;
 use wafio_engine_rules::decode_forwarded_path;
 
 use crate::head_parser;
+
+/// What the agent learned from the TLS handshake of a connection it terminated itself.
+#[derive(Debug)]
+pub struct TlsClient {
+    /// The SNI name, lower case.
+    pub server_name: String,
+    /// The JA4 of the ClientHello; `None` when the hello could not be read (one split over records).
+    pub ja4: Option<String>,
+}
 
 /// One request head as the handlers see it.
 #[derive(Clone, Debug, Default)]
@@ -53,6 +64,8 @@ pub struct InboundRequest {
     pub cookies: Vec<(Vec<u8>, Vec<u8>)>,
     /// Length of the raw head (request line + headers + CRLF).
     pub head_len: usize,
+    /// Set when the agent terminated TLS for the connection; `None` on a plain one.
+    pub tls: Option<Arc<TlsClient>>,
 }
 
 /// RFC 9110 tchar.

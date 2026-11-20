@@ -1,4 +1,5 @@
-//! One app listener's connection handler: the request read on the raw stream (read buffer size
+//! A listener's connection handler, for the plain listener of one app and for an HTTPS listener
+//! shared by several: the request read on the raw stream (read buffer size
 //! and read timeout, the head parsed by `head_parser`, the body framed and read by `body_reader`),
 //! the maintenance gate at the head, the whole body read before anything else is decided, then
 //! the pipeline. Nothing of Pingora's HTTP/1 session is used: the stream is read and written
@@ -20,10 +21,11 @@ use tokio::time::Instant;
 use crate::body_reader::{self, BodyState};
 use crate::config::Route;
 use crate::head_parser::{self, HeadError};
+use crate::https::RedirectTable;
 use crate::maintenance::{self, Watch};
 use crate::pipeline::{self, Done};
 use crate::proxy::Shared;
-use crate::request::InboundRequest;
+use crate::request::{InboundRequest, TlsClient};
 use crate::response::OutboundResponse;
 use crate::upstream::ms;
 
@@ -78,28 +80,25 @@ impl RouteApp {
         self.route.subscribe()
     }
 
-    /// One request whose head `read_head` parsed: `buf` holds the head and whatever followed it.
-    /// `Some`: the connection stays open for the next request (its stream and the bytes read past
-    /// this one).
+    /// One request whose head `read_head` parsed (`parts` is its request target): `buf` holds the
+    /// head and whatever followed it. `Some`: the connection stays open for the next request (its
+    /// stream and the bytes read past this one).
+    #[allow(clippy::too_many_arguments)]
     async fn serve_one(
         self: Arc<Self>,
         mut stream: Stream,
         mut buf: BytesMut,
         head: head_parser::Head,
+        parts: head_parser::UriParts,
         deadline: Option<Instant>,
-        peer_ip: Option<IpAddr>,
+        peer: &Peer,
         shutdown: &ShutdownWatch,
     ) -> Option<(Stream, BytesMut)> {
         let route = self.route();
         let write_ms = route.proxy_config.timeouts.write_ms;
         buf.advance(head.len);
-        // The request target is parsed before the body is read.
-        let Ok(parts) = head_parser::uri_parts(&head.host, &head.request_target) else {
-            reject(stream, malformed_request_response(), write_ms).await;
-            return None;
-        };
         // An app in maintenance mode answers from the head: no `100 Continue`, no body read.
-        if let Some(r) = maintenance::gate(&route, &head, peer_ip) {
+        if let Some(r) = maintenance::gate(&route, &head, peer.ip) {
             return write_answer(stream, buf, &head, r, head.len, write_ms, shutdown).await;
         }
         // `Expect: 100-continue` (the exact value) is answered before the body is read.
@@ -158,14 +157,16 @@ impl RouteApp {
             }
         };
         let consumed = head.len + body.data.len();
-        let req = InboundRequest::from_parsed(&head, parts, &body.trailers, body.data.is_empty());
-        let r = match pipeline::handle(&self.shared, &route, req, body.data, peer_ip).await {
+        let mut req =
+            InboundRequest::from_parsed(&head, parts, &body.trailers, body.data.is_empty());
+        req.tls = peer.tls.clone();
+        let r = match pipeline::handle(&self.shared, &route, req, body.data, peer.ip).await {
             Ok(Done::Respond(r)) => r,
             Ok(Done::Stream(s)) => {
                 let close = head.connection_close || *shutdown.borrow();
                 // An event stream has no end of its own: it stops when maintenance turns on.
                 let watch = maintenance::is_event_stream(s.head.content_type())
-                    .then(|| Watch::for_request(self.subscribe(), &route, &head, peer_ip));
+                    .then(|| Watch::for_request(self.subscribe(), &route, &head, peer.ip));
                 return relay(&self.shared, stream, buf, &head, *s, close, write_ms, watch)
                     .await
                     .map(|(stream, rest)| (stream, shrink_idle_buffer(rest, consumed)));
@@ -475,45 +476,136 @@ fn shrink_idle_buffer(buf: BytesMut, consumed: usize) -> BytesMut {
     BytesMut::from(&buf[..])
 }
 
-/// The connection loop for plain HTTP/1 (no TLS, no h2c): the requests are read, bounded and
-/// answered one at a time.
-pub(crate) async fn serve_connection(app: Arc<RouteApp>, stream: Stream, mut stop: ShutdownWatch) {
-    let peer_ip = stream
-        .get_socket_digest()
-        .and_then(|d| d.peer_addr().and_then(|a| a.as_inet()).map(|a| a.ip()));
+/// What the head read of a connection is bounded by.
+pub(crate) struct HeadLimits {
+    /// The read buffer size: the longest head.
+    pub cap: usize,
+    pub read_to: Option<Duration>,
+    /// The write timeout of an answer made before an app serves the request.
+    pub write_ms: i64,
+}
+
+/// What a connection asks of its listener, so that one loop serves the plain listener of an app
+/// and an HTTPS listener shared by several. A type parameter, not a trait object: the plain path
+/// pays for none of it.
+pub(crate) trait Site {
+    /// The limits for the next head, read afresh each time because the route can be swapped.
+    fn limits(&self) -> HeadLimits;
+    /// The app for a request to `host` (lower case, as `head_parser::uri_parts` gives it); `None`
+    /// when this connection must not serve it.
+    fn app(&self, host: &[u8]) -> Option<Arc<RouteApp>>;
+    /// What the handshake of the connection told, if the agent terminated TLS.
+    fn tls(&self) -> Option<Arc<TlsClient>>;
+}
+
+/// The plain listener of one app.
+pub(crate) struct PlainSite(pub Arc<RouteApp>);
+
+impl Site for PlainSite {
+    fn limits(&self) -> HeadLimits {
+        let route = self.0.route();
+        HeadLimits {
+            cap: route.header_buffer_size(),
+            read_to: ms(route.proxy_config.timeouts.read_ms),
+            write_ms: route.proxy_config.timeouts.write_ms,
+        }
+    }
+
+    fn app(&self, _host: &[u8]) -> Option<Arc<RouteApp>> {
+        Some(self.0.clone())
+    }
+
+    fn tls(&self) -> Option<Arc<TlsClient>> {
+        None
+    }
+}
+
+/// The client side of one connection.
+struct Peer {
+    ip: Option<IpAddr>,
+    tls: Option<Arc<TlsClient>>,
+}
+
+/// The connection loop for HTTP/1 (no h2c): the requests are read, bounded and answered one at a
+/// time.
+pub(crate) async fn serve_connection<S: Site>(site: S, stream: Stream, mut stop: ShutdownWatch) {
+    let peer = Peer {
+        ip: stream
+            .get_socket_digest()
+            .and_then(|d| d.peer_addr().and_then(|a| a.as_inet()).map(|a| a.ip())),
+        tls: site.tls(),
+    };
     let mut stream = stream;
     let (mut prefix, mut first) = (BytesMut::new(), true);
     loop {
-        let route = app.route();
-        let read_to = ms(route.proxy_config.timeouts.read_ms);
-        let write_ms = route.proxy_config.timeouts.write_ms;
+        let limits = site.limits();
         let head = read_head(
             &mut stream,
             prefix,
-            route.header_buffer_size(),
+            limits.cap,
             first,
-            read_to,
+            limits.read_to,
             &mut stop,
         )
         .await;
-        drop(route);
         match head {
             Head::Close => return,
-            Head::Answer(r) => return reject(stream, r, write_ms).await,
+            Head::Answer(r) => return reject(stream, r, limits.write_ms).await,
             Head::Ready {
                 buffer: buf,
                 head,
                 deadline,
-            } => match app
-                .clone()
-                .serve_one(stream, buf, head, deadline, peer_ip, &stop)
-                .await
-            {
-                Some((s, rest)) => (stream, prefix, first) = (s, rest, false),
-                None => return,
-            },
+            } => {
+                // The request target is parsed before the body is read.
+                let Ok(parts) = head_parser::uri_parts(&head.host, &head.request_target) else {
+                    return reject(stream, malformed_request_response(), limits.write_ms).await;
+                };
+                let Some(app) = site.app(&parts.host) else {
+                    let r = OutboundResponse::error(421, "Misdirected Request");
+                    return reject(stream, r, limits.write_ms).await;
+                };
+                match app
+                    .serve_one(stream, buf, head, parts, deadline, &peer, &stop)
+                    .await
+                {
+                    Some((s, rest)) => (stream, prefix, first) = (s, rest, false),
+                    None => return,
+                }
+            }
         }
     }
+}
+
+/// The connection of a plain listener that redirects to HTTPS: one answer, then the connection
+/// closes. It has no route, so the head is read with fixed limits.
+pub(crate) async fn serve_redirect(
+    table: Arc<RedirectTable>,
+    mut stream: Stream,
+    mut stop: ShutdownWatch,
+) {
+    const HEAD_LIMIT: usize = 16 * 1024;
+    const READ_TIMEOUT: Duration = Duration::from_secs(10);
+    const WRITE_MS: i64 = 10_000;
+    let head = read_head(
+        &mut stream,
+        BytesMut::new(),
+        HEAD_LIMIT,
+        true,
+        Some(READ_TIMEOUT),
+        &mut stop,
+    )
+    .await;
+    let answer = match head {
+        Head::Close => return,
+        Head::Answer(r) => r,
+        Head::Ready { head, .. } => {
+            match head_parser::uri_parts(&head.host, &head.request_target) {
+                Ok(parts) => table.answer(&parts),
+                Err(()) => malformed_request_response(),
+            }
+        }
+    };
+    reject(stream, answer, WRITE_MS).await;
 }
 
 #[cfg(test)]

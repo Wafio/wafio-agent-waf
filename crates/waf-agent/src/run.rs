@@ -377,13 +377,21 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
     }));
     opts.inherited = inherited;
     let proxy = Arc::new(wafio_proxy::Proxy::new(opts));
-    let agent = Arc::new(Agent::new(
-        base,
-        stores,
-        proxy.clone(),
-        good_bots.clone(),
-        ready.clone(),
-    ));
+    let tls_sites = if f.tls_sites_file.is_empty() {
+        HashMap::new()
+    } else {
+        crate::tls_sites::load(&f.tls_sites_file)?
+    };
+    let agent = Arc::new(
+        Agent::new(
+            base,
+            stores,
+            proxy.clone(),
+            good_bots.clone(),
+            ready.clone(),
+        )
+        .with_tls_sites(tls_sites),
+    );
 
     let link = ControlLink::new(
         cfg,
