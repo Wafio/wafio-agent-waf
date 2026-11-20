@@ -209,8 +209,11 @@ impl Drop for Fpm {
 }
 
 fn start_fpm(bin: &str, max_children: usize) -> Fpm {
+    let port = free_port();
+    // One directory per server: the tests run in parallel, and two servers reading one config
+    // would both listen on the same address.
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("fpm-{}", std::process::id()));
+        .join(format!("fpm-{}-{port}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("www")).unwrap();
     std::fs::write(
@@ -218,7 +221,7 @@ fn start_fpm(bin: &str, max_children: usize) -> Fpm {
         "<?php http_response_code(201); header('X-Worker: '.getmypid()); echo $_SERVER['REQUEST_METHOD'], ' ', $_SERVER['SCRIPT_FILENAME'], ' ', file_get_contents('php://input');",
     )
     .unwrap();
-    let addr = format!("127.0.0.1:{}", free_port());
+    let addr = format!("127.0.0.1:{port}");
     let conf = format!(
         "[global]\npid = {d}/fpm.pid\nerror_log = {d}/fpm.log\ndaemonize = no\n[www]\nlisten = {addr}\npm = static\npm.max_children = {max_children}\nclear_env = no\n",
         d = dir.display()
