@@ -401,3 +401,12 @@ fn rate_limit_unblock_and_login_scope() {
         "unblocked"
     );
 }
+
+#[test]
+fn every_install_is_answered_not_in_bundle_while_the_agent_keeps_no_certificates() {
+    let mut install = CertificateInstall::default();
+    assert_eq!(
+        Certificates.install(&mut install),
+        Err(AckCode::NotInBundle)
+    );
+}

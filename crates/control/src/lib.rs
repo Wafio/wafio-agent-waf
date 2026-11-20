@@ -5,6 +5,7 @@
 
 mod bundle_cache;
 mod bundle_puller;
+mod certificates;
 mod grpc_reconnect;
 mod grpc_stream;
 mod json_members;
@@ -19,6 +20,7 @@ pub use bundle_cache::{
     save_bundle_cache,
 };
 pub use bundle_puller::{BundleError, BundleProbe, BundleSink};
+pub use certificates::{AckCode, CertificateSink};
 pub use grpc_reconnect::{
     GRPC_CLIENT_KEEPALIVE_TIME, GRPC_CLIENT_KEEPALIVE_TIMEOUT, RECONNECT_BACKOFF_MAX,
     RECONNECT_BACKOFF_MIN, RECONNECT_HEALTHY_AFTER, RECONNECT_JITTER, ReconnectBackoff, jitter,
@@ -33,3 +35,5 @@ pub use waf_telemetry::{
     DecisionEvent, Redactor, TELEMETRY_QUEUE_CAP, TelemetryStats, clamp_i32, replace_invalid_utf8,
     to_proto,
 };
+// The messages of the certificate hooks, so the agent names them through this crate.
+pub use wafio_proto::v1::{CertificateInstall, CertificateStatus};

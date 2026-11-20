@@ -19,7 +19,7 @@ use wafio_agent_pages::iprep::{
 };
 use wafio_control::{AgentStats, ControlConfig, ControlLink, HeartbeatCounters, Hooks};
 
-use crate::agent::{Agent, Sink};
+use crate::agent::{Agent, Certificates, Sink};
 use crate::executor::{Stores, startup_executor};
 use crate::flags::{AgentArgs, OsEnv};
 use crate::ready::{Ready, ReadyActions};
@@ -93,6 +93,7 @@ pub fn test_hooks() -> Hooks {
     }
     Hooks {
         bundles: Arc::new(AcceptAll),
+        certificates: Arc::new(Certificates),
         stats: Arc::new(Stats),
         security_data: Arc::new(crate::security_data::AgentSecurityData),
         redact: crate::redact::mask_decision_event,
@@ -397,6 +398,7 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
         cfg,
         Hooks {
             bundles: Arc::new(Sink(agent.clone())),
+            certificates: Arc::new(Certificates),
             stats: Arc::new(Stats),
             security_data: Arc::new(crate::security_data::AgentSecurityData),
             redact: crate::redact::mask_decision_event,

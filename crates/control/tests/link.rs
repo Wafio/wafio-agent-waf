@@ -75,6 +75,17 @@ impl Conn {
         }
     }
 
+    /// The next `n` acks, in the order they arrive, with the heartbeats left out.
+    async fn next_acks(&mut self, n: usize) -> Vec<CommandAck> {
+        let mut acks = Vec::new();
+        while acks.len() < n {
+            if let Some(Out::Ack(a)) = self.next_non_heartbeat().await.kind {
+                acks.push(a);
+            }
+        }
+        acks
+    }
+
     async fn send(&self, k: In) {
         self.out
             .send(Ok(ServerMessage { kind: Some(k) }))
@@ -196,6 +207,17 @@ struct Sink {
     fail: Mutex<Option<BundleError>>,
     /// What the full decode (`check`) says about a document.
     check_error: Mutex<Option<String>>,
+    /// The start and the end of every apply and install, in the order they ran.
+    log: Mutex<Vec<String>>,
+    /// Every apply and install takes this long, so a handler that does not wait for the one
+    /// before it shows up as an overlap in `log`.
+    delay: Mutex<Duration>,
+    /// The key each install carried when the sink got it, by command id.
+    keys: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Installs this sink refuses, by command id.
+    refuse: Mutex<HashMap<String, AckCode>>,
+    /// The install under this command id makes the sink panic.
+    panic_on: Mutex<Option<String>>,
 }
 
 impl BundleSink for Sink {
@@ -203,15 +225,44 @@ impl BundleSink for Sink {
         if let Some(e) = self.fail.lock().unwrap().clone() {
             return Err(e);
         }
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("apply {generation} start"));
+        std::thread::sleep(*self.delay.lock().unwrap());
         self.applied
             .lock()
             .unwrap()
             .push((String::from_utf8(json.to_vec()).unwrap(), generation));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("apply {generation} end"));
         Ok(())
     }
 
     fn check(&self, _: &[u8]) -> Result<(), String> {
         self.check_error.lock().unwrap().clone().map_or(Ok(()), Err)
+    }
+}
+
+impl CertificateSink for Sink {
+    fn install(&self, install: &mut CertificateInstall) -> Result<(), AckCode> {
+        let id = install.command_id.clone();
+        self.log.lock().unwrap().push(format!("install {id} start"));
+        std::thread::sleep(*self.delay.lock().unwrap());
+        self.keys
+            .lock()
+            .unwrap()
+            .push((id.clone(), install.key_pem.clone()));
+        if self.panic_on.lock().unwrap().as_deref() == Some(id.as_str()) {
+            panic!("sink failed");
+        }
+        self.log.lock().unwrap().push(format!("install {id} end"));
+        match self.refuse.lock().unwrap().get(&id) {
+            Some(code) => Err(*code),
+            None => Ok(()),
+        }
     }
 }
 
@@ -289,7 +340,8 @@ fn link(cfg: ControlConfig, sink: Arc<Sink>, sec: Arc<Sec>) -> Arc<ControlLink> 
     ControlLink::new(
         cfg,
         Hooks {
-            bundles: sink,
+            bundles: sink.clone(),
+            certificates: sink,
             stats: Arc::new(Stats),
             security_data: sec,
             redact,
@@ -875,4 +927,205 @@ async fn malware_download_refusals_report_the_refusal_text() {
         task.abort();
         std::fs::remove_dir_all(state).unwrap();
     }
+}
+
+fn bundle_message(id: &str, generation: i64) -> In {
+    In::Bundle(BundleUpdate {
+        command_id: id.into(),
+        generation,
+        bundle_json: format!(r#"{{"generation":{generation},"apps":[]}}"#).into(),
+    })
+}
+
+fn install_message(id: &str) -> In {
+    In::CertificateInstall(CertificateInstall {
+        command_id: id.into(),
+        app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+        certificate_id: "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77".into(),
+        chain_pem: b"chain".to_vec(),
+        key_pem: format!("key of {id}").into_bytes(),
+        leaf_sha256: "ab".repeat(32),
+    })
+}
+
+/// An install is handled between the bundles around it, in the order the stream delivered them,
+/// and the acks go out in that order. Each handler takes time, so one that ran ahead of the one
+/// before it would show as an overlap in the sink's log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn installs_and_bundles_keep_stream_order() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("order");
+    let sink = Arc::new(Sink::default());
+    *sink.delay.lock().unwrap() = Duration::from_millis(40);
+    sink.refuse
+        .lock()
+        .unwrap()
+        .insert("i2".into(), AckCode::KeyMismatch);
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+
+    for m in [
+        bundle_message("b1", 1),
+        install_message("i1"),
+        bundle_message("b2", 2),
+        install_message("i2"),
+    ] {
+        c.send(m).await;
+    }
+    let acks = c.next_acks(4).await;
+    assert_eq!(
+        acks.iter()
+            .map(|a| (a.command_id.as_str(), a.ok, a.error.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("b1", true, ""),
+            ("i1", true, ""),
+            ("b2", true, ""),
+            ("i2", false, "key_mismatch"),
+        ]
+    );
+    assert_eq!(
+        *sink.log.lock().unwrap(),
+        vec![
+            "apply 1 start",
+            "apply 1 end",
+            "install i1 start",
+            "install i1 end",
+            "apply 2 start",
+            "apply 2 end",
+            "install i2 start",
+            "install i2 end",
+        ]
+    );
+    // The sink got each key whole: it is zeroed only after the sink returned.
+    assert_eq!(
+        *sink.keys.lock().unwrap(),
+        vec![
+            ("i1".to_string(), b"key of i1".to_vec()),
+            ("i2".to_string(), b"key of i2".to_vec()),
+        ]
+    );
+    task.abort();
+    std::fs::remove_dir_all(state).unwrap();
+}
+
+/// A sink that panics is a refusal the control plane may retry, and the link goes on with the
+/// next message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_certificate_sink_is_acked_write_failed_and_the_stream_goes_on() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("panic");
+    let sink = Arc::new(Sink::default());
+    *sink.panic_on.lock().unwrap() = Some("boom".into());
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+    // The first heartbeat, with the host info, is read first so the Ping reply is the next one.
+    heartbeat(c.next().await.unwrap());
+
+    c.send(install_message("boom")).await;
+    c.send(install_message("fine")).await;
+    let acks = c.next_acks(2).await;
+    assert_eq!(
+        acks.iter()
+            .map(|a| (a.command_id.as_str(), a.ok, a.error.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("boom", false, "write_failed"), ("fine", true, "")]
+    );
+    assert_eq!(sink.keys.lock().unwrap()[0].1, b"key of boom");
+    c.send(In::Ping(Ping { nonce: 1 })).await;
+    assert!(heartbeat(c.next().await.unwrap()).host_info_json.is_empty());
+    task.abort();
+    std::fs::remove_dir_all(state).unwrap();
+}
+
+/// A control plane that never sends an install, as one that predates the message, sees what it
+/// saw before: no new Hello feature, no certificate status, the same acks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_plane_that_sends_no_install_sees_no_certificate_traffic() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("older");
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        Arc::default(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    let h = hello(c.next().await.unwrap());
+    assert!(h.features.is_empty(), "{:?}", h.features);
+    heartbeat(c.next().await.unwrap());
+
+    c.send(bundle_message("b1", 1)).await;
+    c.send(In::Bundle(BundleUpdate {
+        command_id: "u1".into(),
+        generation: 0,
+        bundle_json: br#"{"management_only":true}"#.to_vec(),
+    }))
+    .await;
+    c.send(In::Ping(Ping { nonce: 2 })).await;
+    let mut seen = Vec::new();
+    loop {
+        match c.next().await.expect("stream open").kind {
+            Some(Out::Heartbeat(hb)) if hb.host_info_json.is_empty() => break,
+            other => seen.push(other),
+        }
+    }
+    let acks: Vec<_> = seen
+        .iter()
+        .map(|k| match k {
+            Some(Out::Ack(a)) => (a.command_id.as_str(), a.ok, a.error.as_str()),
+            other => panic!("unexpected message {other:?}"),
+        })
+        .collect();
+    assert_eq!(acks, vec![("b1", true, ""), ("u1", true, "")]);
+    task.abort();
+    std::fs::remove_dir_all(state).unwrap();
+}
+
+/// A status handed to the link while a stream is up goes out on it with its fields as given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reported_certificate_status_goes_out_on_the_stream() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("status");
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        Arc::default(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+    assert!(link.connected());
+
+    let status = CertificateStatus {
+        app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+        source: "uploaded".into(),
+        state: "missing".into(),
+        certificate_id: "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77".into(),
+        unix_time: 1_700_000_000,
+        ..Default::default()
+    };
+    link.report_certificate_status(status.clone());
+    let got = loop {
+        match c.next().await.expect("stream open").kind {
+            Some(Out::CertificateStatus(s)) => break s,
+            Some(Out::Heartbeat(_)) => {}
+            other => panic!("unexpected message {other:?}"),
+        }
+    };
+    assert_eq!(got, status);
+    task.abort();
+    std::fs::remove_dir_all(state).unwrap();
 }
