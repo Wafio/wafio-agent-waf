@@ -446,8 +446,9 @@ exactly as before.
   kept once: no port, no wildcard, no IP address, no trailing dot, no underscore. An object that fails a check refuses the whole
   bundle (`invalid TLS site settings`, with the app and the field in the log), as an invalid route does: the previous bundle stays and
   the control plane sends it again. A `source` that is empty or not known, or an uploaded one with no certificate named yet, is no
-  refusal: nothing is served for that app. A bundle that cannot bind an address of its apps (another program still holds port
-  443, say) is tried again every minute, for as long as it takes.
+  refusal: nothing is served for that app, and a certificate it was served before is dropped with its file. A bundle that cannot
+  bind an address of its apps (another program still holds port 443, say) is tried again every minute, for as long as it takes.
+  That holds for the cached bundle an agent starts from while the control plane is out of reach, until a live bundle arrives.
 - The certificates are files of the key directory, `/var/lib/wafio-waf-agent/tls/` (the unit's `StateDirectory` is its parent; it does
   not follow `--state-dir`). The agent makes it 0700 if it is missing and uses it only when it is a directory, not a link, owned by
   the user the agent runs as; group and other access is cleared and logged. Otherwise the start logs a warning that names the
@@ -456,13 +457,16 @@ exactly as before.
   bundle is applied (the start, a reload, a new bundle), never through a link and up to 128 KiB. An app is served the file its
   bundle names, if it is there and holds the certificate the bundle names by its leaf; until then, the file it was served before,
   which `state.json` in the same directory remembers across a restart (it holds no key material, and drops the apps that are not in
-  the bundle). A file that no app of the bundle names and none is served from is removed after each applied bundle: once the new
-  certificate is served, the old file goes. The agent sets `PR_SET_DUMPABLE` to 0, so a crash leaves no core dump with the keys in it
-  and ptrace cannot read them.
+  the bundle). That holds for a bundle that names a file; one that names none (see above) serves nothing. A certificate file of
+  the agent (`<certificate id>.pem`, `acme-<app id>.pem`) that no app of the bundle names and none is served from is removed after
+  each applied bundle: once the new certificate is served, the old file goes. Any other file in the directory stays. The agent
+  sets `PR_SET_DUMPABLE` to 0, so a crash leaves no core dump with the keys in it and no other process of the same user can
+  attach to it with ptrace.
 - One process writes in the key directory: the one that holds an exclusive `flock` on `tls.lock` there. A reload's successor reads
   what the process it replaces wrote, serves it, and writes nothing; it takes the lock once the process it replaces has stopped
-  accepting, and then does what it put off (`state.json`, the removal of unused files). Files are written under a temporary name,
-  synced and renamed, so a reader sees a file whole or not at all.
+  accepting, and then does what it put off (`state.json`, the removal of unused files, which spares a file the other process
+  recorded after this one started). Files are written under a temporary name, synced and renamed, so a reader sees a file whole
+  or not at all.
 - Apps that give the same `listen` share the listener and may differ in their `proxy_config`; a host name belongs to one app on a
   listener. Before a request is routed its head is read with the largest read buffer and the largest finite read timeout of those apps, and an answer made
   then uses the largest finite write timeout (60 seconds when no app has one). From the routing on each app's own settings

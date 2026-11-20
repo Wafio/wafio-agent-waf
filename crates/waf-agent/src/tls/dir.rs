@@ -162,9 +162,11 @@ impl KeyDir {
 
     /// The file `name`, read without following a link and without more than `limit` bytes.
     pub fn read(&self, name: &str, limit: usize) -> Result<Vec<u8>, ReadError> {
+        // O_NONBLOCK: opening a named pipe for reading waits for a writer, and the apply lock is
+        // held. It changes nothing for a plain file, and the check below refuses anything else.
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(self.file(name))
             .map_err(|e| match e.kind() {
                 io::ErrorKind::NotFound => ReadError::Missing,
@@ -438,6 +440,21 @@ pub(crate) mod tests {
         assert!(matches!(dir.read("dir.pem", 100), Err(ReadError::Other(_))));
         // Links and directories are not files of the agent's: they are not listed to be removed.
         assert_eq!(dir.pem_files().unwrap(), ["a.pem"]);
+    }
+
+    /// A named pipe under a file name must not hold the caller: it would wait for a writer.
+    #[test]
+    fn a_named_pipe_is_refused_and_does_not_block_the_read() {
+        let s = Scratch::new();
+        let dir = open(&s);
+        let pipe = s.dir().join("pipe.pem");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+        assert!(made.is_ok_and(|status| status.success()), "mkfifo failed");
+        assert!(matches!(
+            dir.read("pipe.pem", 100),
+            Err(ReadError::Other(_))
+        ));
+        assert_eq!(dir.pem_files().unwrap(), Vec::<String>::new());
     }
 
     #[test]

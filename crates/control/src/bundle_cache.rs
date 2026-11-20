@@ -4,7 +4,7 @@
 //! configuration in force came from (`live` | `cache` | `cache_stale`). The envelope is the
 //! format earlier agent versions wrote and read, in both directions.
 
-use crate::bundle_puller::BundleProbe;
+use crate::bundle_puller::{BundleError, BundleProbe};
 use crate::grpc_reconnect::random_u64;
 use crate::grpc_stream::ControlLink;
 use crate::json_members;
@@ -38,6 +38,18 @@ pub struct CachedBundle {
     pub bundle: Vec<u8>,
     pub generation: i64,
     pub saved_at: Timestamp,
+}
+
+/// How starting from the cached bundle ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheStart {
+    /// No cached bundle, an unusable one, or one the sink refused.
+    NotApplied,
+    /// The cached bundle is in force.
+    Applied,
+    /// The sink could not bind an address the bundle names. [`ControlLink::start`] applies this
+    /// bundle again every minute, until it binds or a live bundle arrives.
+    Bind(CachedBundle),
 }
 
 #[derive(Debug)]
@@ -253,32 +265,49 @@ impl ControlLink {
         }
     }
 
-    /// Apply the cached bundle, if any, through the sink; true when one was applied. Run before
-    /// the stream starts so a live bundle always wins ([`ControlLink::start`] does). Blocking.
-    pub fn install_cached_bundle(&self) -> bool {
-        let (dir, max_age) = self.bundle_cache_config();
+    /// Apply the cached bundle, if any, through the sink. Run before the stream starts so a live
+    /// bundle always wins ([`ControlLink::start`] does). Blocking.
+    pub fn install_cached_bundle(&self) -> CacheStart {
+        let (dir, _) = self.bundle_cache_config();
         if dir.is_empty() {
-            return false;
+            return CacheStart::NotApplied;
         }
         let c = match load_bundle_cache(Path::new(&dir), &|b| self.sink().check(b)) {
             Ok(c) => c,
-            Err(CacheReadError::NotFound) => return false,
+            Err(CacheReadError::NotFound) => return CacheStart::NotApplied,
             Err(e) => {
                 info!(
                     "[waf-bundle] ignoring cached bundle {}: {e}",
                     Path::new(&dir).join(BUNDLE_CACHE_FILE_NAME).display()
                 );
-                return false;
+                return CacheStart::NotApplied;
             }
         };
-        let probe = BundleProbe::parse(&c.bundle).unwrap_or_default();
-        if let Err(e) = self.hand_bundle_to_sink(&c.bundle, c.generation, &probe) {
-            info!(
-                "[waf-bundle] cached bundle generation {} not applied: {e}",
-                c.generation
-            );
-            return false;
+        match self.apply_cached_bundle(&c) {
+            Ok(()) => CacheStart::Applied,
+            Err(BundleError::Bind(e)) => {
+                info!(
+                    "[waf-bundle] cached bundle generation {} not applied: {e} (retrying)",
+                    c.generation
+                );
+                CacheStart::Bind(c)
+            }
+            Err(e) => {
+                info!(
+                    "[waf-bundle] cached bundle generation {} not applied: {e}",
+                    c.generation
+                );
+                CacheStart::NotApplied
+            }
         }
+    }
+
+    /// Hands a cached bundle to the sink and, once it is in force, records where the configuration
+    /// came from.
+    pub(crate) fn apply_cached_bundle(&self, c: &CachedBundle) -> Result<(), BundleError> {
+        let (_, max_age) = self.bundle_cache_config();
+        let probe = BundleProbe::parse(&c.bundle).unwrap_or_default();
+        self.hand_bundle_to_sink(&c.bundle, c.generation, &probe)?;
         let age = c.saved_at.nanos_until(SystemTime::now());
         let max = duration_nanos(max_age);
         let source = if age > max {
@@ -299,7 +328,7 @@ impl ControlLink {
         };
         self.set_bundle_status(source, c.generation);
         *self.last_gen.lock().unwrap() = c.generation;
-        true
+        Ok(())
     }
 }
 

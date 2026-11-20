@@ -221,6 +221,8 @@ async fn agent_talks_to_the_control_plane() {
         ])
         .env("NOTIFY_SOCKET", &notify_path)
         .env("RUNTIME_DIRECTORY", &dir)
+        // A key directory of its own: the fixed one may belong to an agent installed on this host.
+        .env("WAFIO_TEST_TLS_DIR", dir.join("tls"))
         // A library installed on this host must not give the agent an engine: name one that does not exist.
         .env("WAFIO_ENGINE_LIB", dir.join("no-engine.so"))
         .stderr(Stdio::from(

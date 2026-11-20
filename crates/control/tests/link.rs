@@ -729,7 +729,7 @@ async fn starts_from_cached_bundle() {
     )
     .unwrap();
     let l = link(cfg, Arc::default(), Arc::default());
-    assert!(l.install_cached_bundle());
+    assert_eq!(l.install_cached_bundle(), CacheStart::Applied);
     assert_eq!(l.bundle_status(), ("cache_stale".to_string(), 42));
 
     let sink = Arc::new(Sink::default());
@@ -739,7 +739,7 @@ async fn starts_from_cached_bundle() {
         sink,
         Arc::default(),
     );
-    assert!(!l.install_cached_bundle());
+    assert_eq!(l.install_cached_bundle(), CacheStart::NotApplied);
     assert_eq!(l.bundle_status(), (String::new(), 0));
     assert_eq!(l.heartbeat(None).bundle_source, None);
 
@@ -749,7 +749,8 @@ async fn starts_from_cached_bundle() {
         Arc::default(),
         Arc::default(),
     );
-    assert!(!l.is_cached_bundle_usable() && !l.install_cached_bundle());
+    assert!(!l.is_cached_bundle_usable());
+    assert_eq!(l.install_cached_bundle(), CacheStart::NotApplied);
     std::fs::remove_dir_all(state).unwrap();
 }
 

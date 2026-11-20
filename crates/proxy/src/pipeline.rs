@@ -777,6 +777,7 @@ pub(crate) async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cert_store::BookChange;
     use crate::config::{AppSpec, TlsSite, build_route};
     use crate::request::TlsClient;
     use wafio_domain::ip_address::parse_ip_address;
@@ -800,7 +801,7 @@ mod tests {
             tls: edge.then(|| TlsSite {
                 listen: "0.0.0.0:443".into(),
                 hosts: vec!["shop.test".into()],
-                certificate: None,
+                certificate: BookChange::Keep,
                 redirect_listen: None,
             }),
         })

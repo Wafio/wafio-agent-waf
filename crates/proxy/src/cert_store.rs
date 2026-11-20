@@ -11,9 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs;
 use std::hash::Hash;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use pingora::tls::sign::CertifiedKey;
@@ -25,13 +23,6 @@ use sha2::{Digest, Sha256};
 /// The ALPN protocol of a TLS-ALPN-01 validation.
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
-/// A certificate chain (leaf first) and its private key, both PEM files.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CertFiles {
-    pub certificate: PathBuf,
-    pub key: PathBuf,
-}
-
 /// What the book serves for one app.
 #[derive(Clone)]
 pub struct BookEntry {
@@ -40,6 +31,18 @@ pub struct BookEntry {
     /// is answered HTTP-01 challenges and `503`, and the redirect listener does not send the
     /// app's hosts to HTTPS.
     pub placeholder: bool,
+}
+
+/// What an apply does to the entry of one app in the book.
+#[derive(Clone)]
+pub enum BookChange {
+    /// Serve this entry from the next handshake on.
+    Set(BookEntry),
+    /// Leave what the book holds: the previous certificate while the wanted one is not ready.
+    Keep,
+    /// Hold nothing. The bundle names no certificate for the app, so the one it had is not served
+    /// on.
+    Clear,
 }
 
 /// What is offered under one name, oldest first, each with the id of its offer. The newest answers
@@ -109,16 +112,20 @@ impl CertBook {
         true
     }
 
-    /// Makes the book hold exactly the apps of `wanted`. `Some` switches the app to that entry;
-    /// `None` keeps what it holds now (the previous certificate while the wanted one is not ready).
+    /// Makes the book hold exactly the apps of `wanted`, each changed as its [`BookChange`] says.
     /// An app that is not in `wanted` is dropped, and `set` refuses it until a later `follow` names
-    /// it again. Challenge entries stay.
-    pub fn follow(&self, wanted: HashMap<String, Option<BookEntry>>) {
+    /// it again. One that is named and cleared holds nothing but can be `set`. Challenge entries
+    /// stay.
+    pub fn follow(&self, wanted: HashMap<String, BookChange>) {
         let mut state = self.write();
         let names: HashSet<String> = wanted.keys().cloned().collect();
         let mut next = HashMap::with_capacity(wanted.len());
-        for (app, entry) in wanted {
-            let entry = entry.or_else(|| state.apps.remove(&app));
+        for (app, change) in wanted {
+            let entry = match change {
+                BookChange::Set(entry) => Some(entry),
+                BookChange::Keep => state.apps.remove(&app),
+                BookChange::Clear => None,
+            };
             if let Some(entry) = entry {
                 next.insert(app, entry);
             }
@@ -285,26 +292,6 @@ pub fn leaf_sha256(key: &CertifiedKey) -> String {
         .collect()
 }
 
-fn read_error(path: &Path, e: &std::io::Error) -> String {
-    format!("{}: cannot read ({})", path.display(), e.kind())
-}
-
-/// Reads a certificate chain and one PKCS#8, PKCS#1 or SEC1 key that matches its leaf. The error
-/// names the file and the kind of failure, never key bytes.
-pub fn load_certified_key(files: &CertFiles) -> Result<CertifiedKey, String> {
-    let cert = fs::read(&files.certificate).map_err(|e| read_error(&files.certificate, &e))?;
-    let chain = parse_chain(&cert).map_err(|f| format!("{}: {f}", files.certificate.display()))?;
-    let key = fs::read(&files.key).map_err(|e| read_error(&files.key, &e))?;
-    parse_key(chain, &key).map_err(|f| match f {
-        PairFault::KeyMismatch => format!(
-            "{}: key does not match {}",
-            files.key.display(),
-            files.certificate.display()
-        ),
-        f => format!("{}: {f}", files.key.display()),
-    })
-}
-
 /// The rustls config of a TLS listener: TLS 1.2 and 1.3, certificates from `resolver`. ALPN lists
 /// `acme-tls/1` first because rustls takes the first of this list that the client offers; a
 /// browser never offers it, a certificate authority validating a name offers only it.
@@ -321,10 +308,29 @@ pub fn server_config(resolver: Arc<dyn ResolvesServerCert>) -> Arc<ServerConfig>
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use pingora::tls::SignatureScheme;
+
+    /// A certificate chain (leaf first) and its private key, both PEM files.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct CertFiles {
+        pub(crate) certificate: PathBuf,
+        pub(crate) key: PathBuf,
+    }
+
+    /// The key of a pair of files, for the tests that make them with openssl.
+    pub(crate) fn load_certified_key(files: &CertFiles) -> Result<CertifiedKey, PairFault> {
+        let pem = [
+            fs::read(&files.key).unwrap(),
+            fs::read(&files.certificate).unwrap(),
+        ]
+        .concat();
+        certified_key_from_pem(&pem)
+    }
 
     /// A scratch directory in the system temp dir, removed on drop. The keys never leave it.
     pub(crate) struct Scratch(PathBuf);
@@ -384,40 +390,11 @@ pub(crate) mod tests {
         load_certified_key(files).unwrap().cert
     }
 
-    fn entry(key: &Arc<CertifiedKey>) -> Option<BookEntry> {
-        Some(BookEntry {
+    fn entry(key: &Arc<CertifiedKey>) -> BookChange {
+        BookChange::Set(BookEntry {
             key: key.clone(),
             placeholder: false,
         })
-    }
-
-    #[test]
-    fn load_names_the_file_that_fails_and_never_the_key() {
-        let dir = Scratch::new();
-        let (live, next) = (dir.pair("live"), dir.pair("next"));
-
-        fs::write(&live.certificate, "not a certificate").unwrap();
-        let err = load_certified_key(&live).err().unwrap();
-        assert!(
-            err.contains("live.crt") && err.contains("no certificate"),
-            "{err}"
-        );
-
-        // A half-copied pair: the new certificate, the old key.
-        fs::rename(&next.certificate, &live.certificate).unwrap();
-        let err = load_certified_key(&live).err().unwrap();
-        assert!(
-            err.contains("does not match") && err.contains("live.key"),
-            "{err}"
-        );
-        assert!(!err.contains("PRIVATE KEY"), "{err}");
-
-        let absent = CertFiles {
-            certificate: dir.0.join("absent.crt"),
-            key: dir.0.join("absent.key"),
-        };
-        let err = load_certified_key(&absent).err().unwrap();
-        assert!(err.contains("absent.crt"), "{err}");
     }
 
     #[test]
@@ -457,7 +434,11 @@ pub(crate) mod tests {
     }
 
     fn wants(book: &CertBook, apps: &[&str]) {
-        book.follow(apps.iter().map(|a| ((*a).to_owned(), None)).collect());
+        book.follow(
+            apps.iter()
+                .map(|a| ((*a).to_owned(), BookChange::Keep))
+                .collect(),
+        );
     }
 
     #[test]
@@ -520,24 +501,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn follow_sets_keeps_and_drops() {
+    fn follow_sets_keeps_clears_and_drops() {
         let dir = Scratch::new();
         let book = CertBook::default();
         let key = |name: &str| Arc::new(load_certified_key(&dir.pair(name)).unwrap());
         let (kept, replaced, dropped, added) =
             (key("kept"), key("replaced"), key("dropped"), key("added"));
-        let replacement = key("replacement");
-        wants(&book, &["kept", "replaced", "dropped"]);
+        let (cleared, replacement) = (key("cleared"), key("replacement"));
+        wants(&book, &["kept", "replaced", "dropped", "cleared"]);
         assert!(book.set("kept", kept.clone(), false));
         assert!(book.set("replaced", replaced, false));
         assert!(book.set("dropped", dropped, false));
+        assert!(book.set("cleared", cleared.clone(), false));
 
         book.follow(HashMap::from([
-            ("kept".to_owned(), None),
+            ("kept".to_owned(), BookChange::Keep),
             ("replaced".to_owned(), entry(&replacement)),
             ("added".to_owned(), entry(&added)),
+            ("cleared".to_owned(), BookChange::Clear),
             // Nothing held and nothing wanted yet: stays out.
-            ("waiting".to_owned(), None),
+            ("waiting".to_owned(), BookChange::Keep),
         ]));
 
         assert!(Arc::ptr_eq(&book.get("kept").unwrap().key, &kept));
@@ -548,6 +531,9 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(&book.get("added").unwrap().key, &added));
         assert!(book.get("dropped").is_none());
         assert!(book.get("waiting").is_none());
+        // A cleared app holds nothing, and stays one the book takes a certificate for.
+        assert!(book.get("cleared").is_none());
+        assert!(book.set("cleared", cleared, false));
     }
 
     #[test]

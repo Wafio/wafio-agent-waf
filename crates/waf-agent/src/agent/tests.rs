@@ -138,8 +138,8 @@ fn only_an_app_with_a_tls_object_is_served_over_https() {
     assert_eq!(site.listen, "0.0.0.0:443");
     assert_eq!(site.hosts, ["shop.example.com"]);
     assert!(
-        site.certificate.is_none(),
-        "its file is not in the directory"
+        matches!(site.certificate, BookChange::Keep),
+        "its file is not in the directory, so the book keeps what it holds"
     );
     assert!(sites[1].is_none());
     let apps = a.tls_apps();
@@ -159,7 +159,9 @@ fn the_certificate_in_the_key_directory_goes_to_the_proxy_with_its_app() {
     );
     apply(&a, &bundle_of(std::slice::from_ref(&shop)), 1).unwrap();
     let site = proxy.tls.lock().unwrap()[0][0].clone().unwrap();
-    let entry = site.certificate.expect("the proxy gets the certificate");
+    let BookChange::Set(entry) = site.certificate else {
+        panic!("the proxy gets the certificate");
+    };
     assert!(!entry.placeholder);
     assert_eq!(
         a.tls_apps()[0].2.as_deref(),
@@ -170,7 +172,47 @@ fn the_certificate_in_the_key_directory_goes_to_the_proxy_with_its_app() {
     std::fs::remove_file(dir.dir().join(format!("{CERT}.pem"))).unwrap();
     apply(&a, &bundle_of(&[shop]), 2).unwrap();
     let again = proxy.tls.lock().unwrap()[1][0].clone().unwrap();
-    assert!(Arc::ptr_eq(&entry.key, &again.certificate.unwrap().key));
+    let BookChange::Set(again) = again.certificate else {
+        panic!("the proxy gets the certificate again");
+    };
+    assert!(Arc::ptr_eq(&entry.key, &again.key));
+}
+
+#[test]
+fn an_app_whose_bundle_names_no_certificate_any_more_has_the_one_it_had_cleared_in_the_proxy() {
+    let (a, proxy, dir) = agent_with_keys();
+    let (pem, leaf) = make_pem(&dir.0, "shop");
+    let file = dir.dir().join(format!("{CERT}.pem"));
+    std::fs::write(&file, &pem).unwrap();
+    let with = |tls: String| bundle_of(&[app_json(SHOP, 18080, Some(&tls))]);
+    apply(&a, &with(tls_object("shop.example.com", CERT, &leaf)), 1).unwrap();
+    assert_eq!(
+        a.tls_apps()[0].2.as_deref(),
+        Some(format!("{CERT}.pem").as_str())
+    );
+
+    // Uploaded with no certificate named, source empty, a source this agent does not know.
+    let none = [
+        r#"{"hosts":["shop.example.com"],"source":"uploaded"}"#,
+        r#"{"hosts":["shop.example.com"],"source":""}"#,
+        r#"{"hosts":["shop.example.com"],"source":"mystery"}"#,
+    ];
+    for (n, tls) in none.iter().enumerate() {
+        let generation = 2 + n as i64;
+        std::fs::write(&file, &pem).unwrap();
+        apply(
+            &a,
+            &with(tls_object("shop.example.com", CERT, &leaf)),
+            generation * 10,
+        )
+        .unwrap();
+        apply(&a, &with((*tls).to_owned()), generation * 10 + 1).unwrap();
+        let sent = proxy.tls.lock().unwrap();
+        let site = sent.last().unwrap()[0].as_ref().unwrap();
+        assert!(matches!(site.certificate, BookChange::Clear), "{tls}");
+        assert_eq!(a.tls_apps()[0].2, None, "{tls}");
+        assert!(!file.exists(), "its file goes with it: {tls}");
+    }
 }
 
 #[test]

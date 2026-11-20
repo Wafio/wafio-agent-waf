@@ -24,7 +24,7 @@ use wafio_domain::{
     ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config, timeout_or_default_ms,
 };
 
-use crate::cert_store::BookEntry;
+use crate::cert_store::BookChange;
 use crate::maintenance::MaintenanceRoute;
 
 /// What one app's requests are analysed with. Immutable once applied; a bundle replaces it as
@@ -80,9 +80,9 @@ pub struct TlsSite {
     /// The host names the app answers for: lower case, no port, no trailing dot. SNI and `Host`
     /// are matched against them.
     pub hosts: Vec<String>,
-    /// What the book serves for the app from this apply on; `None` leaves what it holds (the
-    /// certificate it served before, or nothing).
-    pub certificate: Option<BookEntry>,
+    /// What this apply does to the certificate the book serves for the app: replaces it, leaves
+    /// it (the one served before, or nothing), or removes it.
+    pub certificate: BookChange,
     /// `host:port` of a plain listener that redirects these hosts to HTTPS once the app has a real
     /// certificate and answers HTTP-01 validations; `None` = no such listener.
     pub redirect_listen: Option<String>,

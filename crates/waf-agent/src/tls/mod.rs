@@ -18,7 +18,7 @@ use wafio_proxy::cert_store::{BookEntry, certified_key_from_pem, leaf_sha256};
 use crate::bundle::BundleApp;
 use dir::{KeyDir, MAX_KEY_FILE, ReadError};
 use entry::{Refusal, Settings, check, is_known_source};
-use state_file::{AppRecord, STATE_FILE, StateFile};
+use state_file::{AppRecord, STATE_FILE, StateFile, is_key_file};
 
 /// The certificate an app is served with, and where it came from.
 #[derive(Clone)]
@@ -118,34 +118,43 @@ impl Keys {
     /// What the app is served with: the certificate its settings want if the directory has it;
     /// else the one it is served with now (a replaced certificate, a changed source or host list
     /// keeps serving the previous one until the new one arrives); else, after a restart, the file
-    /// the state remembers.
+    /// the state remembers. Settings that name no file (no source, one this agent does not know,
+    /// uploaded with no certificate) serve nothing, so a certificate the bundle dropped is not
+    /// served on.
     fn resolve(&self, app_id: &str, settings: &Settings) -> Option<Served> {
+        let file = settings.wanted_file(app_id)?;
         let previous = self.applied.get(app_id).and_then(|a| a.served.as_ref());
         let leaf = settings
             .certificate
             .as_ref()
             .map(|c| c.leaf_sha256.as_str());
-        if let Some(file) = settings.wanted_file(app_id) {
-            if let Some(held) = previous
-                && held.file == file
-                && leaf.is_none_or(|leaf| leaf == held.leaf_sha256)
-            {
-                return Some(held.clone());
-            }
-            match self.load(&file, leaf) {
-                Ok(served) => return Some(served),
-                Err(Fault::Read(ReadError::Missing)) => {}
-                Err(e) => tracing::info!("[tls] app {app_id}: {file}: {e}"),
-            }
+        if let Some(held) = previous
+            && held.file == file
+            && leaf.is_none_or(|leaf| leaf == held.leaf_sha256)
+        {
+            return Some(held.clone());
+        }
+        match self.load(&file, leaf) {
+            Ok(served) => return Some(served),
+            Err(Fault::Read(ReadError::Missing)) => {}
+            Err(e) => tracing::info!("[tls] app {app_id}: {file}: {e}"),
         }
         if let Some(held) = previous {
             return Some(held.clone());
         }
-        let file = self.state.apps.get(app_id)?.served.as_deref()?;
-        match self.load(file, None) {
+        // The wanted file was tried with its leaf above; reading it again without one would serve
+        // a certificate the bundle does not name.
+        let remembered = self
+            .state
+            .apps
+            .get(app_id)?
+            .served
+            .as_deref()
+            .filter(|remembered| *remembered != file)?;
+        match self.load(remembered, None) {
             Ok(served) => Some(served),
             Err(e) => {
-                tracing::info!("[tls] app {app_id}: {file}: {e}");
+                tracing::info!("[tls] app {app_id}: {remembered}: {e}");
                 None
             }
         }
@@ -186,7 +195,7 @@ impl Keys {
                 })
                 .collect(),
         };
-        self.settle();
+        self.settle(&HashSet::new());
     }
 
     /// Takes the lock if the process that held it let go, and then does what it could not do
@@ -199,7 +208,20 @@ impl Keys {
             return false;
         }
         tracing::info!("[tls] this process writes in the key directory now");
-        self.settle();
+        // The process that let go may have got a newer bundle than the one this process applied
+        // and written its certificates since: those are files this process does not know about.
+        let known: HashSet<&str> = self
+            .written
+            .iter()
+            .flat_map(StateFile::served_files)
+            .collect();
+        let newer: HashSet<String> = StateFile::load(&self.dir)
+            .0
+            .served_files()
+            .filter(|file| !known.contains(file))
+            .map(str::to_owned)
+            .collect();
+        self.settle(&newer);
         true
     }
 
@@ -212,8 +234,9 @@ impl Keys {
     }
 
     /// Writes the state if it changed and removes the files nothing needs, when this process may
-    /// write and a bundle has said what is wanted.
-    fn settle(&mut self) {
+    /// write and a bundle has said what is wanted. `keep` names files to leave in place besides
+    /// the ones the bundle uses.
+    fn settle(&mut self, keep: &HashSet<String>) {
         if !self.dir.holds_lock() || !self.bundle_seen {
             return;
         }
@@ -223,12 +246,13 @@ impl Keys {
                 Err(e) => tracing::info!("[tls] cannot write {STATE_FILE}: {}", e.kind()),
             }
         }
-        self.remove_unused();
+        self.remove_unused(keep);
     }
 
-    /// Removes each `*.pem` that no app of the bundle names and none serves: the certificate an
-    /// app was served with goes once the one that replaces it is served.
-    fn remove_unused(&self) {
+    /// Removes each certificate file of the agent (`<uuid>.pem`, `acme-<uuid>.pem`) that no app of
+    /// the bundle names and none serves: the certificate an app was served with goes once the one
+    /// that replaces it is served. Any other file is none of the agent's and stays.
+    fn remove_unused(&self, keep: &HashSet<String>) {
         let needed: HashSet<String> = self
             .applied
             .iter()
@@ -246,7 +270,10 @@ impl Keys {
                 return;
             }
         };
-        for file in files.iter().filter(|f| !needed.contains(*f)) {
+        for file in files
+            .iter()
+            .filter(|f| is_key_file(f) && !needed.contains(*f) && !keep.contains(*f))
+        {
             match self.dir.remove(file) {
                 Ok(()) => tracing::info!("[tls] removed {file}: no app of the bundle uses it"),
                 Err(e) => tracing::info!("[tls] cannot remove {file}: {}", e.kind()),
@@ -448,6 +475,8 @@ pub(crate) mod tests {
         let ((x_pem, x_leaf), (y_pem, y_leaf)) = (make_pem(&s.0, "x"), make_pem(&s.0, "y"));
         k.dir.write(&format!("{X}.pem"), &x_pem).unwrap();
         k.dir.write(&format!("{Y}.pem"), &y_pem).unwrap();
+        // A file that is none of the agent's stays, whatever the bundle says.
+        std::fs::write(s.dir().join("notes.pem"), "an operator's file").unwrap();
         apply(
             &mut k,
             &[
@@ -473,13 +502,52 @@ pub(crate) mod tests {
         assert_eq!(state.apps.keys().collect::<Vec<_>>(), [APP]);
         assert_eq!(
             files(&s.dir()),
-            [format!("{X}.pem").as_str(), STATE_FILE, "tls.lock"]
+            [
+                format!("{X}.pem").as_str(),
+                "notes.pem",
+                STATE_FILE,
+                "tls.lock"
+            ]
         );
 
         let none = k.prepare(&[]).unwrap();
         k.commit(none);
         assert!(state_on_disk(&s.dir()).apps.is_empty());
-        assert_eq!(files(&s.dir()), [STATE_FILE, "tls.lock"]);
+        assert_eq!(files(&s.dir()), ["notes.pem", STATE_FILE, "tls.lock"]);
+    }
+
+    /// Source `""`, one the agent does not know, and `uploaded` with no certificate named.
+    fn entries_that_name_no_file() -> [String; 3] {
+        let entry = |source: &str| {
+            format!(
+                r#"{{"listen":"0.0.0.0:443","hosts":["shop.example.com"],"source":"{source}"}}"#
+            )
+        };
+        [entry(""), entry("mystery"), entry("uploaded")]
+    }
+
+    #[test]
+    fn an_app_whose_settings_name_no_file_is_served_nothing_and_the_certificate_it_had_goes() {
+        let s = Scratch::new();
+        let (x_pem, x_leaf) = make_pem(&s.0, "x");
+        let x_file = format!("{X}.pem");
+        for restart in [false, true] {
+            for none in entries_that_name_no_file() {
+                let mut k = keys(&s);
+                k.dir.write(&x_file, &x_pem).unwrap();
+                let first = apply(&mut k, &[(APP, uploaded(X, &x_leaf))]);
+                assert_eq!(served(&first, APP), Some(x_file.clone()));
+                if restart {
+                    // The state remembers X.pem, and must not bring it back.
+                    drop(k);
+                    k = keys(&s);
+                }
+                let applied = apply(&mut k, &[(APP, none.clone())]);
+                assert_eq!(served(&applied, APP), None, "{none}, restart {restart}");
+                assert_eq!(files(&s.dir()), [STATE_FILE, "tls.lock"], "{none}");
+                assert!(state_on_disk(&s.dir()).apps.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -501,6 +569,23 @@ pub(crate) mod tests {
         let applied = apply(&mut k, &[(APP, uploaded(Y, &y_leaf))]);
         assert_eq!(served(&applied, APP), Some(y_file));
         assert!(!files(&s.dir()).contains(&x_file));
+    }
+
+    #[test]
+    fn after_a_restart_a_file_with_another_certificate_than_the_bundle_names_is_not_served() {
+        let s = Scratch::new();
+        let ((x_pem, x_leaf), (y_pem, _)) = (make_pem(&s.0, "x"), make_pem(&s.0, "y"));
+        let x_file = format!("{X}.pem");
+        {
+            let mut k = keys(&s);
+            k.dir.write(&x_file, &x_pem).unwrap();
+            apply(&mut k, &[(APP, uploaded(X, &x_leaf))]);
+        }
+        // Another pair under the name of X: the state remembers X.pem, but the leaf is not X's.
+        std::fs::write(s.dir().join(&x_file), &y_pem).unwrap();
+        let mut k = keys(&s);
+        let applied = apply(&mut k, &[(APP, uploaded(X, &x_leaf))]);
+        assert_eq!(served(&applied, APP), None);
     }
 
     #[test]
@@ -551,6 +636,34 @@ pub(crate) mod tests {
             state_on_disk(&s.dir()).apps[APP].served.as_deref(),
             Some(y_file.as_str())
         );
+    }
+
+    #[test]
+    fn a_file_the_process_it_replaces_wrote_after_this_one_started_stays_when_it_takes_over() {
+        let s = Scratch::new();
+        let ((x_pem, x_leaf), (y_pem, y_leaf)) = (make_pem(&s.0, "x"), make_pem(&s.0, "y"));
+        let (x_file, y_file) = (format!("{X}.pem"), format!("{Y}.pem"));
+        let mut first = keys(&s);
+        first.dir.write(&x_file, &x_pem).unwrap();
+        apply(&mut first, &[(APP, uploaded(X, &x_leaf))]);
+
+        // The successor starts from the bundle that names X, and the first gets a newer one that
+        // names Y, writes it and records it.
+        let mut second = keys(&s);
+        apply(&mut second, &[(APP, uploaded(X, &x_leaf))]);
+        first.dir.write(&y_file, &y_pem).unwrap();
+        apply(&mut first, &[(APP, uploaded(Y, &y_leaf))]);
+        assert_eq!(files(&s.dir()), [y_file.as_str(), STATE_FILE, "tls.lock"]);
+
+        first.release();
+        assert!(second.take_over());
+        assert_eq!(
+            files(&s.dir()),
+            [y_file.as_str(), STATE_FILE, "tls.lock"],
+            "Y.pem is not in the bundle this process applied, and it is the one in use"
+        );
+        let applied = apply(&mut second, &[(APP, uploaded(Y, &y_leaf))]);
+        assert_eq!(served(&applied, APP), Some(y_file));
     }
 
     #[test]

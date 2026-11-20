@@ -11,6 +11,7 @@ use wafio_application::blocklist::BlockStore;
 use wafio_control::{AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink};
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
+use wafio_proxy::cert_store::BookChange;
 use wafio_proxy::{AppAnalysisSetup, AppSpec, TlsSite};
 
 use crate::bundle::{Bundle, BundleApp, UnblockEntry, decode_bundle};
@@ -311,7 +312,12 @@ impl Agent {
             exec.analyze.custom_tuning_rules = tuning;
             let exec = Arc::new(exec);
             executors.insert(app.app_id.clone(), (exec.clone(), stores));
-            let spec = app_spec(app, exec, tls.get(&app.app_id).map(tls_site));
+            let spec = app_spec(
+                app,
+                exec,
+                tls.get(&app.app_id)
+                    .map(|applied| tls_site(&app.app_id, applied)),
+            );
             // The route is built here, so a bad route fails before later apps are built.
             if let Err(e) = wafio_proxy::config::build_route(&spec) {
                 tracing::info!("[waf-bundle] {e}");
@@ -380,11 +386,18 @@ impl ApplyLock<'_> {
 }
 
 /// The proxy's view of an app's `tls` object: where it listens and which certificate it brings.
-fn tls_site(applied: &Applied) -> TlsSite {
+fn tls_site(app_id: &str, applied: &Applied) -> TlsSite {
+    let certificate = match (&applied.served, applied.settings.wanted_file(app_id)) {
+        (Some(served), _) => BookChange::Set(book_entry(served)),
+        // The bundle names a file that cannot be served yet: what the book holds stays.
+        (None, Some(_)) => BookChange::Keep,
+        // The bundle names none: whatever the book holds is not served on.
+        (None, None) => BookChange::Clear,
+    };
     TlsSite {
         listen: applied.settings.listen.clone(),
         hosts: applied.settings.hosts.clone(),
-        certificate: applied.served.as_ref().map(book_entry),
+        certificate,
         redirect_listen: applied.settings.redirect_listen.clone(),
     }
 }

@@ -60,6 +60,11 @@ impl StateFile {
         }
     }
 
+    /// The files the state says apps are served from.
+    pub fn served_files(&self) -> impl Iterator<Item = &str> {
+        self.apps.values().filter_map(|r| r.served.as_deref())
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap_or_default()
     }

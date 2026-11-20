@@ -28,10 +28,17 @@ use pingora::tls::{
 use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
-use wafio_proxy::cert_store::{BookEntry, CertFiles, load_certified_key};
+use wafio_proxy::cert_store::{BookChange, BookEntry, certified_key_from_pem};
 use wafio_proxy::{AppSpec, Proxy, ProxyOptions, TlsSite};
 
 use common::*;
+
+/// A certificate chain (leaf first) and its private key, both PEM files.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CertFiles {
+    certificate: PathBuf,
+    key: PathBuf,
+}
 
 /// A certificate authority in a scratch directory, removed on drop, and the certificates it signs.
 struct Pki(PathBuf);
@@ -301,7 +308,7 @@ fn with_tls(mut a: AppSpec, port: u16, hosts: &[&str], files: &CertFiles) -> App
     a.tls = Some(TlsSite {
         listen: format!("127.0.0.1:{port}"),
         hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
-        certificate: Some(BookEntry {
+        certificate: BookChange::Set(BookEntry {
             key: key_of(files),
             placeholder: false,
         }),
@@ -513,7 +520,12 @@ async fn the_plain_listener_redirects_every_method_to_https_and_keeps_host_path_
 
 /// The key of a pair of files, as the book holds it.
 fn key_of(files: &CertFiles) -> Arc<CertifiedKey> {
-    Arc::new(load_certified_key(files).unwrap())
+    let pem = [
+        fs::read(&files.key).unwrap(),
+        fs::read(&files.certificate).unwrap(),
+    ]
+    .concat();
+    Arc::new(certified_key_from_pem(&pem).unwrap())
 }
 
 /// The DER of the leaf of a pair of files.
@@ -540,7 +552,7 @@ async fn an_apply_that_names_a_certificate_switches_it_and_one_that_names_none_l
 
     // An app that brings no certificate keeps the one the book holds.
     let mut keeps = tls_app("shop", &up, port, &["shop.test"], &files);
-    keeps.tls.as_mut().unwrap().certificate = None;
+    keeps.tls.as_mut().unwrap().certificate = BookChange::Keep;
     h.proxy.apply(vec![keeps]).unwrap();
     let unchanged = Https::connect(port, &pki, "shop.test").await.unwrap();
     assert_eq!(unchanged.certificate(), before);
@@ -569,6 +581,33 @@ async fn an_apply_that_names_a_certificate_switches_it_and_one_that_names_none_l
         before,
         "an open connection keeps its handshake"
     );
+}
+
+#[tokio::test]
+async fn an_apply_that_clears_the_certificate_stops_serving_it_until_one_is_named_again() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let port = free_port();
+    let h = Harness::new();
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    assert!(Https::connect(port, &pki, "shop.test").await.is_ok());
+
+    let mut cleared = tls_app("shop", &up, port, &["shop.test"], &files);
+    cleared.tls.as_mut().unwrap().certificate = BookChange::Clear;
+    h.proxy.apply(vec![cleared]).unwrap();
+    assert!(h.proxy.certificates().get("shop").is_none());
+    assert!(
+        Https::connect(port, &pki, "shop.test").await.is_err(),
+        "the certificate the bundle no longer names is not served"
+    );
+
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    assert!(Https::connect(port, &pki, "shop.test").await.is_ok());
 }
 
 #[tokio::test]
@@ -1685,7 +1724,7 @@ async fn the_redirect_listener_answers_503_until_the_app_has_a_real_certificate_
     // A real certificate: the redirect, as before.
     book.follow(HashMap::from([(
         "shop".to_owned(),
-        Some(BookEntry {
+        BookChange::Set(BookEntry {
             key: key_of(&files),
             placeholder: false,
         }),

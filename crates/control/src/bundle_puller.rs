@@ -18,7 +18,7 @@ pub enum BundleError {
     Apply(String),
     /// An address the bundle names could not be bound, most likely because another program still
     /// holds it. Retried every minute, without an attempt limit, until it binds or a newer bundle
-    /// arrives.
+    /// arrives; so is the cached bundle of the start.
     #[error("{0}")]
     Bind(String),
 }
