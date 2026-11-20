@@ -79,14 +79,14 @@ fn first_bundle_applies_and_signals_ready() {
     assert!(a.shared_executor().is_some());
 }
 
-#[test]
-fn only_an_app_named_in_the_tls_sites_is_served_over_https() {
+/// An agent whose apps `sites` names are served over HTTPS.
+fn agent_serving(sites: Vec<(&str, &str)>) -> (Agent, Arc<FakeProxy>) {
     let stores = Stores::new();
     let base = startup_executor(&stores, "", None).unwrap();
     let proxy = Arc::new(FakeProxy::default());
-    let site = wafio_proxy::TlsSite {
+    let site = |host: &str| wafio_proxy::TlsSite {
         listen: "0.0.0.0:443".into(),
-        hosts: vec!["shop.example.com".into()],
+        hosts: vec![host.into()],
         cert: wafio_proxy::cert_store::CertFiles {
             certificate: "/etc/wafio/tls/shop.crt".into(),
             key: "/etc/wafio/tls/shop.key".into(),
@@ -100,7 +100,18 @@ fn only_an_app_named_in_the_tls_sites_is_served_over_https() {
         Arc::new(VerifiedBotChecker::new()),
         Arc::new(Ready::new(ReadyActions::default())),
     )
-    .with_tls_sites(HashMap::from([("a1".to_string(), site)]));
+    .with_tls_sites(
+        sites
+            .into_iter()
+            .map(|(app, host)| (app.to_string(), site(host)))
+            .collect(),
+    );
+    (a, proxy)
+}
+
+#[test]
+fn only_an_app_named_in_the_tls_sites_is_served_over_https() {
+    let (a, proxy) = agent_serving(vec![("a1", "shop.example.com")]);
     let other = APP.replace("a1", "a2").replace("18080", "18081");
     apply(
         &a,
@@ -111,6 +122,46 @@ fn only_an_app_named_in_the_tls_sites_is_served_over_https() {
     assert_eq!(
         proxy.tls.lock().unwrap()[0],
         vec![Some("0.0.0.0:443".to_string()), None]
+    );
+}
+
+#[test]
+fn the_bundle_address_of_an_app_served_over_https_is_not_checked() {
+    let (a, proxy) = agent_serving(vec![("a1", "shop.example.com"), ("a3", "big.example.com")]);
+    // a2 plain on the address a1's bundle entry names; a3 names a port that cannot be bound.
+    let same_address = APP.replace("a1", "a2");
+    let big_port = APP.replace("a1", "a3").replace("18080", "70000");
+    apply(
+        &a,
+        &format!(
+            r#"{{"agent_id":"x","project_id":"p1","apps":[{APP},{same_address},{big_port}]}}"#
+        ),
+        1,
+    )
+    .unwrap();
+    assert_eq!(proxy.applied.lock().unwrap()[0].len(), 3);
+
+    // The same two entries without an HTTPS site are still refused.
+    let (plain, _) = agent_serving(Vec::new());
+    assert_eq!(
+        apply(
+            &plain,
+            &format!(r#"{{"agent_id":"x","apps":[{APP},{same_address}]}}"#),
+            1
+        ),
+        Err(BundleError::Apply(
+            "duplicate listener in WAF bundle".into()
+        ))
+    );
+    assert_eq!(
+        apply(
+            &plain,
+            &format!(r#"{{"agent_id":"x","apps":[{big_port}]}}"#),
+            1
+        ),
+        Err(BundleError::Apply(
+            "failed to bind WAF route listener".into()
+        ))
     );
 }
 

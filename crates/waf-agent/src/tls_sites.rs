@@ -1,6 +1,6 @@
 //! The local TLS sites file (`--tls-sites-file`): the apps this agent serves over HTTPS itself.
 //! The control plane does not send it. It is read once at start, so a change takes effect on a
-//! reload; the certificate files are watched separately by the proxy.
+//! reload; the certificate files are read by the proxy each time a bundle is applied.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -12,10 +12,10 @@ use wafio_agent_pages::challenge_handler::CaptchaVerifier;
 use wafio_agent_pages::goodbot::VerifiedBotChecker;
 use wafio_agent_pages::iprep::ReputationChecker;
 
-use crate::cert_store::CERT_POLL_INTERVAL;
+use crate::cert_store::CertBook;
 use crate::config::{AppSpec, Route, TlsSite, build_route};
 use crate::decision::DecisionSink;
-use crate::https::TLS_HANDSHAKE_TIMEOUT;
+use crate::https::{RedirectTarget, TLS_HANDSHAKE_TIMEOUT};
 use crate::listeners::{ROUTE_DRAIN_GRACE, RouteManager, RouteSpec, Serves};
 use crate::route::CONNECTION_LIMIT;
 
@@ -34,8 +34,6 @@ pub struct ProxyOptions {
     pub inherited: HashMap<String, StdListener>,
     /// Drain timeout of a removed or shut down route.
     pub drain_timeout: Duration,
-    /// How often the certificate files of an HTTPS listener are checked for a change.
-    pub cert_poll_interval: Duration,
     /// How long a client of an HTTPS listener has for its first TLS record and the handshake.
     pub tls_handshake_timeout: Duration,
     /// Connections one listener serves at once; more are closed (a plain listener answers 503).
@@ -51,7 +49,6 @@ impl ProxyOptions {
             captcha: None,
             inherited: HashMap::new(),
             drain_timeout: ROUTE_DRAIN_GRACE,
-            cert_poll_interval: CERT_POLL_INTERVAL,
             tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
             connection_limit: CONNECTION_LIMIT,
         }
@@ -66,6 +63,8 @@ pub(crate) struct Shared {
     pub captcha: Option<Arc<dyn CaptchaVerifier + Send + Sync>>,
     pub connector: Connector,
     pub transport: TransportConnector,
+    /// The certificates of every TLS listener, by app.
+    pub book: Arc<CertBook>,
 }
 
 pub struct Proxy {
@@ -89,12 +88,12 @@ impl Proxy {
             captcha: opts.captcha,
             connector: Connector::new(None),
             transport: TransportConnector::new(None),
+            book: Arc::default(),
         });
         Proxy {
             manager: RouteManager::new(
                 shared,
                 opts.drain_timeout,
-                opts.cert_poll_interval,
                 opts.tls_handshake_timeout,
                 opts.connection_limit,
                 opts.inherited,
@@ -103,8 +102,9 @@ impl Proxy {
     }
 
     /// Makes the live listeners exactly the bundle's apps with a listen port, plus the HTTPS and
-    /// redirect listeners of the apps that have a `tls` site. Every route is built, every
-    /// certificate read and every new socket bound first; any error changes nothing. Kept
+    /// redirect listeners of the apps that have a `tls` site; such an app opens no plain listener
+    /// of its own. Every route is built, every certificate read and every new socket bound first;
+    /// any error changes nothing. Kept
     /// listeners switch to the new route for their next request, removed ones stop accepting at
     /// once and drain; FastCGI pools of replaced routes are closed, and a request still running
     /// there finishes on its own connection. The binary publishes its executors (stores for the
@@ -114,7 +114,7 @@ impl Proxy {
         let mut addresses = HashSet::new();
         let mut proxy_cfgs = Vec::new();
         let mut https: BTreeMap<String, Vec<(Arc<Route>, TlsSite)>> = BTreeMap::new();
-        let mut redirects: BTreeMap<String, HashMap<String, u16>> = BTreeMap::new();
+        let mut redirects: BTreeMap<String, HashMap<String, RedirectTarget>> = BTreeMap::new();
         for app in &apps {
             let route = build_route(app).map_err(|e| {
                 tracing::warn!("[waf-agent] {e}");
@@ -136,11 +136,15 @@ impl Proxy {
                 };
                 if let Some(address) = &site.redirect_listen {
                     let hosts = redirects.entry(address.clone()).or_default();
+                    let target = RedirectTarget {
+                        port,
+                        app_id: app.app_id.clone(),
+                    };
                     for host in &site.hosts {
-                        let other = hosts.insert(host.to_ascii_lowercase(), port);
-                        if other.is_some_and(|other| other != port) {
+                        let other = hosts.insert(host.to_ascii_lowercase(), target.clone());
+                        if other.is_some_and(|other| other != target) {
                             tracing::warn!(
-                                "[waf-agent] app {}: host {host} redirects to two HTTPS ports",
+                                "[waf-agent] app {}: host {host} redirects to two places",
                                 app.app_id
                             );
                             return Err("invalid TLS site settings".into());
@@ -151,6 +155,8 @@ impl Proxy {
                     .entry(site.listen.clone())
                     .or_default()
                     .push((route.clone(), site.clone()));
+                // The bundle's address is not served: the app answers on its HTTPS listener only.
+                continue;
             }
             if app.listen_port == 0 {
                 continue;
@@ -180,6 +186,11 @@ impl Proxy {
         self.manager.apply(specs)?;
         wafio_agent_io::ip_jail_guard::install_trusted_proxy_configs(proxy_cfgs);
         Ok(())
+    }
+
+    /// The certificates the TLS listeners serve, by app id, and the validation answers they give.
+    pub fn certificates(&self) -> Arc<CertBook> {
+        self.manager.certificates()
     }
 
     /// Live listen addresses.

@@ -1,7 +1,9 @@
-//! HTTPS listeners through the public API: the certificate chosen by SNI, the app chosen by
-//! `Host`, the redirect listener, certificate files swapped under a running listener, the JA4
-//! of the handshake, the scheme a FastCGI app is told, and what bounds a client that is slow or
-//! many. Keys are made by `openssl` into a temporary directory and never leave it.
+//! HTTPS listeners through the public API: the certificate chosen by SNI and the book, the app
+//! chosen by `Host`, the redirect listener, certificate validation (HTTP-01 on both listeners,
+//! every ALPN case of TLS-ALPN-01), the placeholder certificate, an address that changes kind, the
+//! limits of apps that share a listener, the JA4 of the handshake, the scheme a FastCGI app is
+//! told, and what bounds a client that is slow or many. Keys are made by `openssl` into a
+//! temporary directory and never leave it.
 
 mod common;
 
@@ -10,21 +12,23 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use pingora::tls::sign::CertifiedKey;
 use pingora::tls::{
     CertificateDer, ClientConfig, ClientTlsStream, RootCertStore, ServerName, TlsConnector,
 };
 use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
-use wafio_proxy::cert_store::CertFiles;
+use wafio_proxy::cert_store::{BookEntry, CertFiles, load_certified_key};
 use wafio_proxy::{AppSpec, Proxy, ProxyOptions, TlsSite};
 
 use common::*;
@@ -146,6 +150,15 @@ impl Pki {
     }
 }
 
+impl Pki {
+    /// As `client_config`, offering `alpn` in the ClientHello (none: no ALPN extension).
+    fn client_config_alpn(&self, alpn: &[&[u8]]) -> Arc<ClientConfig> {
+        let mut config = Arc::unwrap_or_clone(self.client_config());
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Arc::new(config)
+    }
+}
+
 impl Drop for Pki {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -218,16 +231,36 @@ impl Https {
         sni: &str,
         cut: Option<(usize, Duration)>,
     ) -> io::Result<Https> {
+        Https::connect_as(port, pki.client_config(), sni, cut).await
+    }
+
+    /// As `connect_cut` for any client config. With `cut` = `(usize::MAX, pause)` the whole
+    /// ClientHello goes out at once and everything after it, the client's `Finished`, waits until
+    /// `pause` has passed since connecting: the server is mid-handshake meanwhile.
+    async fn connect_as(
+        port: u16,
+        config: Arc<ClientConfig>,
+        sni: &str,
+        cut: Option<(usize, Duration)>,
+    ) -> io::Result<Https> {
         let tap = Tap {
             inner: TcpStream::connect(("127.0.0.1", port)).await?,
             written: Arc::default(),
             cut: cut.map(|(at, pause)| (at, Box::pin(tokio::time::sleep(pause)))),
         };
         let name = ServerName::try_from(sni.to_owned()).unwrap();
-        let tls = TlsConnector::from(pki.client_config())
-            .connect(name, tap)
-            .await?;
+        let tls = TlsConnector::from(config).connect(name, tap).await?;
         Ok(Https(BufReader::new(tls)))
+    }
+
+    /// How long until the server ends the connection (a close or a reset), `None` when it is
+    /// still open after `max`.
+    async fn closed_within(&mut self, max: Duration) -> Option<Duration> {
+        let start = Instant::now();
+        let mut sink = [0u8; 256];
+        let end = async { while matches!(self.0.read(&mut sink).await, Ok(n) if n > 0) {} };
+        tokio::time::timeout(max, end).await.ok()?;
+        Some(start.elapsed())
     }
 
     async fn send(&mut self, raw: &[u8]) -> io::Result<ReplyParts> {
@@ -295,11 +328,6 @@ fn harness_with(configure: impl FnOnce(&mut ProxyOptions)) -> Harness {
         proxy: Proxy::new(opts),
         events,
     }
-}
-
-/// A proxy that looks at certificate files every `poll`.
-fn harness_polling(poll: Duration) -> Harness {
-    harness_with(|opts| opts.cert_poll_interval = poll)
 }
 
 /// Runs `attempt` until it gives a value.
@@ -480,16 +508,28 @@ async fn the_plain_listener_redirects_every_method_to_https_and_keeps_host_path_
     assert_eq!(up.count(), 0, "nothing is proxied by the redirect listener");
 }
 
+/// The key of a pair of files, as the book holds it.
+fn key_of(files: &CertFiles) -> Arc<CertifiedKey> {
+    Arc::new(load_certified_key(files).unwrap())
+}
+
+/// The DER of the leaf of a pair of files.
+fn leaf_of(files: &CertFiles) -> Vec<u8> {
+    key_of(files).cert[0].as_ref().to_vec()
+}
+
 #[tokio::test]
-async fn a_swapped_certificate_file_is_served_to_new_connections_and_open_ones_go_on() {
+async fn a_replaced_certificate_file_is_served_after_the_next_apply_and_open_connections_go_on() {
     let up = http_upstream().await;
     let pki = Pki::new();
     let files = pki.leaf("shop", &["shop.test"]);
     let port = free_port();
-    let h = harness_polling(Duration::from_millis(100));
-    h.proxy
-        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
-        .unwrap();
+    let h = Harness::new();
+    let apply = || {
+        h.proxy
+            .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+    };
+    apply().unwrap();
     let mut open = Https::connect(port, &pki, "shop.test").await.unwrap();
     let before = open.certificate();
     assert_eq!(
@@ -501,13 +541,23 @@ async fn a_swapped_certificate_file_is_served_to_new_connections_and_open_ones_g
     let renewed = pki.leaf("renewed", &["shop.test"]);
     fs::rename(&renewed.key, &files.key).unwrap();
     fs::rename(&renewed.certificate, &files.certificate).unwrap();
-    let after = until("the renewed certificate", || async {
-        let c = Https::connect(port, &pki, "shop.test").await.ok()?;
-        (c.certificate() != before).then(|| c.certificate())
-    })
-    .await;
-    assert_ne!(after, before);
+    // Nothing looks at the files between applies.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let unchanged = Https::connect(port, &pki, "shop.test").await.unwrap();
+    assert_eq!(unchanged.certificate(), before);
 
+    apply().unwrap();
+    let mut fresh = Https::connect(port, &pki, "shop.test").await.unwrap();
+    assert_ne!(fresh.certificate(), before);
+    assert_eq!(fresh.certificate(), leaf_of(&files));
+    assert_eq!(
+        fresh
+            .send(&get_host("shop.test", "/"))
+            .await
+            .unwrap()
+            .status,
+        200
+    );
     assert_eq!(
         open.send(&get_host("shop.test", "/")).await.unwrap().status,
         200
@@ -517,41 +567,70 @@ async fn a_swapped_certificate_file_is_served_to_new_connections_and_open_ones_g
         before,
         "an open connection keeps its handshake"
     );
-    let mut fresh = Https::connect(port, &pki, "shop.test").await.unwrap();
-    assert_eq!(fresh.certificate(), after);
-    assert_eq!(
-        fresh
-            .send(&get_host("shop.test", "/"))
-            .await
-            .unwrap()
-            .status,
-        200
-    );
 }
 
 #[tokio::test]
-async fn a_pair_that_cannot_be_read_keeps_the_old_certificate() {
+async fn a_pair_that_cannot_be_read_fails_the_apply_and_keeps_the_old_certificate() {
     let up = http_upstream().await;
     let pki = Pki::new();
     let files = pki.leaf("shop", &["shop.test"]);
     let port = free_port();
-    let h = harness_polling(Duration::from_millis(100));
-    h.proxy
-        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
-        .unwrap();
+    let h = Harness::new();
+    let apply = || {
+        h.proxy
+            .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+    };
+    apply().unwrap();
     let before = Https::connect(port, &pki, "shop.test")
         .await
         .unwrap()
         .certificate();
 
     fs::write(&files.certificate, b"half a copy").unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(apply(), Err("invalid TLS site settings".into()));
     let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
     assert_eq!(c.certificate(), before);
     assert_eq!(
         c.send(&get_host("shop.test", "/")).await.unwrap().status,
         200
     );
+}
+
+#[tokio::test]
+async fn the_book_switches_one_apps_certificate_and_an_apply_follows_the_bundle() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let (files, installed) = (
+        pki.leaf("shop", &["shop.test"]),
+        pki.leaf("installed", &["shop.test"]),
+    );
+    let port = free_port();
+    let h = Harness::new();
+    let book = h.proxy.certificates();
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    let held = book.get("shop").unwrap();
+    assert!(!held.placeholder);
+    assert_eq!(held.key.cert, key_of(&files).cert);
+
+    let mut open = Https::connect(port, &pki, "shop.test").await.unwrap();
+    let before = open.certificate();
+    assert!(book.set("shop", key_of(&installed), false));
+    let fresh = Https::connect(port, &pki, "shop.test").await.unwrap();
+    assert_eq!(fresh.certificate(), leaf_of(&installed));
+    assert_eq!(open.certificate(), before);
+    assert_eq!(
+        open.send(&get_host("shop.test", "/")).await.unwrap().status,
+        200
+    );
+
+    // The book holds the apps of the bundle and no others, and takes nothing for an app that left:
+    // a certificate that finishes after its app was dropped is refused.
+    h.proxy.apply(vec![]).unwrap();
+    assert!(book.get("shop").is_none());
+    assert!(!book.set("shop", key_of(&installed), false));
+    assert!(book.get("shop").is_none());
 }
 
 #[tokio::test]
@@ -654,36 +733,6 @@ async fn a_reload_keeps_the_https_listener_and_changes_what_it_serves() {
     assert!(Https::connect(port, &pki, "a.test").await.is_err());
 }
 
-#[tokio::test]
-async fn a_listener_cannot_change_kind_and_apps_on_it_must_share_their_limits() {
-    let up = http_upstream().await;
-    let pki = Pki::new();
-    let files = pki.leaf("shop", &["shop.test"]);
-    let port = free_port();
-    let h = Harness::new();
-    h.proxy
-        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
-        .unwrap();
-    assert_eq!(
-        h.proxy.apply(vec![app("shop", port, &url(&up))]),
-        Err("listener kind changed; agent restart required".into())
-    );
-    let mut other = tls_app("other", &up, port, &["other.test"], &files);
-    other.proxy_config = br#"{"max_body_bytes":2048}"#.to_vec();
-    assert_eq!(
-        h.proxy.apply(vec![
-            tls_app("shop", &up, port, &["shop.test"], &files),
-            other
-        ]),
-        Err("apps sharing a TLS listener differ in timeouts or limits".into())
-    );
-    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
-    assert_eq!(
-        c.send(&get_host("shop.test", "/")).await.unwrap().status,
-        200
-    );
-}
-
 /// Rules that block the clients whose JA4 is listed.
 fn block_ja4(ja4: &str) -> String {
     format!(
@@ -743,49 +792,33 @@ async fn the_ja4_of_the_handshake_reaches_the_analysis_and_a_header_cannot_repla
 }
 
 #[tokio::test]
-async fn an_app_served_by_the_agent_reads_fingerprint_headers_only_from_a_trusted_proxy() {
+async fn an_app_served_over_tls_opens_no_listener_at_its_bundle_address() {
     let up = http_upstream().await;
     let pki = Pki::new();
     let files = pki.leaf("shop", &["shop.test"]);
-    let trusting = br#"{"trust_forwarded":true}"#;
-    // As before for an app the file does not name: the header is read.
-    assert_eq!(plain_listener_status(&up, &files, false, b"").await, 403);
-    // An app the agent serves itself: a client may not name its own fingerprint ...
-    assert_eq!(plain_listener_status(&up, &files, true, b"").await, 200);
-    // ... but a proxy in front of it may.
-    assert_eq!(
-        plain_listener_status(&up, &files, true, trusting).await,
-        403
-    );
-}
-
-/// The status of a request that names a listed JA4 in a header, to the bundle listener of an app
-/// that is also served over HTTPS by the agent (`edge`) or is not.
-async fn plain_listener_status(
-    up: &TestUpstream,
-    files: &CertFiles,
-    edge: bool,
-    proxy_config: &[u8],
-) -> u16 {
-    let spoof = "t13d0000h2_000000000000_000000000000";
-    let plain = free_port();
-    let mut a = if edge {
-        tls_app("shop", up, free_port(), &["shop.test"], files)
-    } else {
-        app("shop", 0, &url(up))
-    };
+    let (port, plain) = (free_port(), free_port());
+    let mut a = tls_app("shop", &up, port, &["shop.test"], &files);
     a.listen_port = plain;
-    a.proxy_config = proxy_config.to_vec();
-    a.analysis = analysis_setup(&block_ja4(spoof));
     let h = Harness::new();
     h.proxy.apply(vec![a]).unwrap();
+
+    assert_eq!(h.proxy.addresses(), vec![format!("127.0.0.1:{port}")]);
+    assert!(TcpStream::connect(("127.0.0.1", plain)).await.is_err());
+    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
+    assert_eq!(
+        c.send(&get_host("shop.test", "/")).await.unwrap().status,
+        200
+    );
+
+    // An app the agent does not serve over TLS keeps its listener and reads a client's JA4 header.
+    let spoof = "t13d0000h2_000000000000_000000000000";
+    let other = free_port();
+    let mut b = app("plain", other, &url(&up));
+    b.analysis = analysis_setup(&block_ja4(spoof));
+    h.proxy.apply(vec![b]).unwrap();
     let raw = format!("GET / HTTP/1.1\r\nHost: shop.test\r\nX-JA4: {spoof}\r\n\r\n");
-    one(
-        format!("127.0.0.1:{plain}").parse().unwrap(),
-        raw.as_bytes(),
-    )
-    .await
-    .status
+    let to: SocketAddr = format!("127.0.0.1:{other}").parse().unwrap();
+    assert_eq!(one(to, raw.as_bytes()).await.status, 403);
 }
 
 #[tokio::test]
@@ -997,39 +1030,720 @@ async fn a_client_header_in_any_spelling_cannot_turn_https_off_for_a_fastcgi_app
     }
 }
 
+/// `a` with its `proxy_config` set.
+fn configured(mut a: AppSpec, proxy_config: &str) -> AppSpec {
+    a.proxy_config = proxy_config.as_bytes().to_vec();
+    a
+}
+
+/// The inode of the socket behind a listening address: the same inode is the same socket.
+fn socket_of(h: &Harness, address: &str) -> u64 {
+    let fd = h
+        .proxy
+        .handover_fds()
+        .into_iter()
+        .find(|(a, _)| a == address)
+        .expect("a listener at the address")
+        .1;
+    fs::metadata(format!("/proc/self/fd/{fd}")).unwrap().ino()
+}
+
+/// Connects to `to` over and over until `stop`; how many tries were made and how the failed ones
+/// failed.
+async fn connect_until(to: SocketAddr, stop: Arc<AtomicBool>) -> (usize, Vec<String>) {
+    let (mut tries, mut failures) = (0, Vec::new());
+    while !stop.load(Ordering::Relaxed) {
+        tries += 1;
+        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(to)).await {
+            Ok(Ok(_)) => {}
+            other => failures.push(format!("{other:?}")),
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    (tries, failures)
+}
+
 #[tokio::test]
-async fn the_plain_listener_of_an_app_served_over_tls_still_passes_the_clients_forwarded_proto() {
-    let (fcgi, fake) = fake_fcgi().await;
+async fn an_address_changes_from_a_plain_app_to_a_redirect_on_the_same_socket() {
+    let up = http_upstream_delayed("", b"ok", Duration::from_millis(400)).await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let (plain, tls) = (free_port(), free_port());
+    let (address, to) = (
+        format!("127.0.0.1:{plain}"),
+        format!("127.0.0.1:{plain}").parse::<SocketAddr>().unwrap(),
+    );
+    let h = Harness::new();
+    h.proxy.apply(vec![app("shop", plain, &url(&up))]).unwrap();
+    let socket = socket_of(&h, &address);
+
+    // A request is in flight on the plain app, and clients keep connecting, while the address
+    // becomes the redirect listener of an app served over TLS.
+    let in_flight = tokio::spawn(async move {
+        Client::connect(to)
+            .await
+            .unwrap()
+            .send(&get_host("shop.test", "/"))
+            .await
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let probe = tokio::spawn(connect_until(to, stop.clone()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut redirect = tls_app("shop", &up, tls, &["shop.test"], &files);
+    redirect.tls.as_mut().unwrap().redirect_listen = Some(address.clone());
+    h.proxy.apply(vec![redirect]).unwrap();
+    assert_eq!(socket_of(&h, &address), socket, "bound again");
+
+    let r = in_flight.await.unwrap().unwrap();
+    assert_eq!((r.status, r.text()), (200, "ok".to_owned()));
+    let r = one(to, &get_host("shop.test", "/cart?a=1")).await;
+    assert_eq!(r.status, 308);
+    assert_eq!(
+        r.header("location"),
+        Some(format!("https://shop.test:{tls}/cart?a=1").as_str())
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stop.store(true, Ordering::Relaxed);
+    let (tries, failures) = probe.await.unwrap();
+    assert!(tries >= 20, "{tries} tries");
+    assert!(failures.is_empty(), "{failures:?}");
+    let mut live = h.proxy.addresses();
+    let mut wanted = vec![address, format!("127.0.0.1:{tls}")];
+    live.sort();
+    wanted.sort();
+    assert_eq!(live, wanted);
+}
+
+#[tokio::test]
+async fn an_address_changes_from_https_to_a_plain_app_on_the_same_socket() {
+    let up = http_upstream_delayed("", b"ok", Duration::from_millis(400)).await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test"]);
+    let port = free_port();
+    let (address, to) = (
+        format!("127.0.0.1:{port}"),
+        format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap(),
+    );
+    let h = Harness::new();
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    let socket = socket_of(&h, &address);
+    let mut open = Https::connect(port, &pki, "shop.test").await.unwrap();
+    let in_flight = tokio::spawn(async move { open.send(&get_host("shop.test", "/")).await });
+    let stop = Arc::new(AtomicBool::new(false));
+    let probe = tokio::spawn(connect_until(to, stop.clone()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    h.proxy.apply(vec![app("shop", port, &url(&up))]).unwrap();
+    assert_eq!(socket_of(&h, &address), socket, "bound again");
+    let r = in_flight.await.unwrap().unwrap();
+    assert_eq!((r.status, r.text()), (200, "ok".to_owned()));
+    let r = one(to, &get_host("shop.test", "/")).await;
+    assert_eq!((r.status, r.text()), (200, "ok".to_owned()));
+    assert!(Https::connect(port, &pki, "shop.test").await.is_err());
+    stop.store(true, Ordering::Relaxed);
+    let (tries, failures) = probe.await.unwrap();
+    assert!(tries >= 20, "{tries} tries");
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(h.proxy.addresses(), vec![address]);
+}
+
+/// A request whose head is exactly `len` bytes.
+fn head_of_len(host: &str, len: usize) -> Vec<u8> {
+    let (start, end) = (
+        format!("GET /pad HTTP/1.1\r\nHost: {host}\r\nX-Pad: "),
+        "\r\n\r\n",
+    );
+    let pad = "a".repeat(len - start.len() - end.len());
+    format!("{start}{pad}{end}").into_bytes()
+}
+
+/// A request with a body of `len` bytes, whose head is sent at once and whose body is not.
+fn post_head(host: &str, len: usize) -> Vec<u8> {
+    format!("POST /up HTTP/1.1\r\nHost: {host}\r\nContent-Length: {len}\r\n\r\n").into_bytes()
+}
+
+/// Two apps, `a.test` and `b.test`, that share one HTTPS listener.
+struct Pair {
+    h: Harness,
+    pki: Pki,
+    port: u16,
+    ua: TestUpstream,
+    ub: TestUpstream,
+    files: (CertFiles, CertFiles),
+}
+
+impl Pair {
+    async fn new(a: &str, b: &str) -> Pair {
+        let pki = Pki::new();
+        let files = (pki.leaf("a", &["a.test"]), pki.leaf("b", &["b.test"]));
+        let pair = Pair {
+            h: Harness::new(),
+            port: free_port(),
+            ua: http_upstream().await,
+            ub: http_upstream().await,
+            pki,
+            files,
+        };
+        pair.apply(a, b).unwrap();
+        pair
+    }
+
+    fn apply(&self, a: &str, b: &str) -> Result<(), String> {
+        self.h.proxy.apply(vec![
+            configured(
+                tls_app("a", &self.ua, self.port, &["a.test"], &self.files.0),
+                a,
+            ),
+            configured(
+                tls_app("b", &self.ub, self.port, &["b.test"], &self.files.1),
+                b,
+            ),
+        ])
+    }
+
+    async fn connect(&self, name: &str) -> Https {
+        Https::connect(self.port, &self.pki, name).await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn on_a_shared_listener_the_head_is_read_with_the_largest_buffer_and_held_to_the_apps_own() {
+    let pair = Pair::new("", r#"{"read_buf":65536}"#).await;
+    // a's buffer holds 16384 bytes, b's 65536; the listener reads with the larger.
+    for (name, len, status) in [
+        ("a.test", 16384, 200),
+        ("a.test", 16385, 431),
+        ("a.test", 40000, 431),
+        ("b.test", 16385, 200),
+        ("b.test", 65536, 200),
+        ("b.test", 65537, 431),
+    ] {
+        let mut c = pair.connect(name).await;
+        let r = c.send(&head_of_len(name, len)).await.unwrap();
+        assert_eq!(r.status, status, "{name} {len}");
+        if status == 431 {
+            assert_eq!(r.header("connection"), Some("close"), "{name} {len}");
+        }
+    }
+    assert_eq!(
+        (pair.ua.count(), pair.ub.count()),
+        (1, 2),
+        "431 reaches no app"
+    );
+}
+
+#[tokio::test]
+async fn on_a_shared_listener_the_head_may_take_the_largest_finite_timeout_and_the_body_the_apps_own()
+ {
+    let pair = Pair::new(
+        r#"{"timeouts":{"read_ms":800}}"#,
+        r#"{"timeouts":{"read_ms":2400}}"#,
+    )
+    .await;
+
+    // A head that takes longer than a's timeout reaches a: a has no body to wait for.
+    let mut slow = pair.connect("a.test").await;
+    let head = get_host("a.test", "/slow-head");
+    slow.0.get_mut().write_all(&head[..12]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    slow.0.get_mut().write_all(&head[12..]).await.unwrap();
+    assert_eq!(read_reply(&mut slow.0).await.unwrap().status, 200);
+
+    // A body that comes 1.2 s after its head is late for a and in time for b.
+    let late_body = |name: &'static str| {
+        let c = pair.connect(name);
+        async move {
+            let mut c = c.await;
+            c.0.get_mut().write_all(&post_head(name, 4)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let _ = c.0.get_mut().write_all(b"abcd").await;
+            read_reply(&mut c.0).await.unwrap().status
+        }
+    };
+    let (a, b) = tokio::join!(late_body("a.test"), late_body("b.test"));
+    assert_eq!((a, b), (408, 200));
+}
+
+#[tokio::test]
+async fn on_a_shared_listener_with_an_unlimited_app_an_idle_connection_closes_at_the_finite_deadline()
+ {
+    let pair = Pair::new(
+        r#"{"timeouts":{"read_ms":800}}"#,
+        r#"{"timeouts":{"read_ms":-1}}"#,
+    )
+    .await;
+
+    // Nothing sent: the first request never starts, whichever app it was meant for.
+    let mut idle = pair.connect("b.test").await;
+    let start = Instant::now();
+    let r = read_reply(&mut idle.0).await.unwrap();
+    assert_eq!(r.status, 408);
+    assert!(
+        (Duration::from_millis(700)..Duration::from_secs(3)).contains(&start.elapsed()),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // After a request to the unlimited app the connection waits for the next one as long as the
+    // finite deadline, and then ends without an answer.
+    let mut kept = pair.connect("b.test").await;
+    assert_eq!(
+        kept.send(&get_host("b.test", "/")).await.unwrap().status,
+        200
+    );
+    let closed = kept.closed_within(Duration::from_secs(5)).await;
+    assert!(
+        closed.is_some_and(|t| t >= Duration::from_millis(700) && t < Duration::from_secs(3)),
+        "{closed:?}"
+    );
+
+    // Once the request is routed the unlimited app has no deadline at all, where a's applies.
+    let late_body = |name: &'static str| {
+        let c = pair.connect(name);
+        async move {
+            let mut c = c.await;
+            c.0.get_mut().write_all(&post_head(name, 4)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = c.0.get_mut().write_all(b"abcd").await;
+            read_reply(&mut c.0).await.unwrap().status
+        }
+    };
+    let (a, b) = tokio::join!(late_body("a.test"), late_body("b.test"));
+    assert_eq!((a, b), (408, 200));
+}
+
+#[tokio::test]
+async fn on_a_shared_listener_each_app_has_its_own_body_limit_and_limits_change_in_place() {
+    let pair = Pair::new(r#"{"max_body_bytes":2048}"#, "").await;
+    let upload = |host: &str, len: usize| {
+        let mut raw = post_head(host, len);
+        raw.extend(std::iter::repeat_n(b'x', len));
+        raw
+    };
+    for (name, len, status) in [
+        ("a.test", 1000, 200),
+        ("a.test", 4096, 400),
+        ("b.test", 4096, 200),
+    ] {
+        let r = pair
+            .connect(name)
+            .await
+            .send(&upload(name, len))
+            .await
+            .unwrap();
+        assert_eq!(r.status, status, "{name} {len}");
+    }
+
+    // A connection that is open when the limits change follows them; the apply is not refused.
+    let mut open = pair.connect("a.test").await;
+    assert_eq!(open.send(&upload("a.test", 100)).await.unwrap().status, 200);
+    pair.apply(r#"{"max_body_bytes":8192,"read_buf":65536}"#, "")
+        .unwrap();
+    assert_eq!(
+        open.send(&upload("a.test", 4096)).await.unwrap().status,
+        200
+    );
+    assert_eq!(
+        open.send(&head_of_len("a.test", 30000))
+            .await
+            .unwrap()
+            .status,
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_connection_made_for_the_placeholder_is_answered_validations_and_503_only() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let (files, stand_in) = (
+        pki.leaf("shop", &["shop.test"]),
+        pki.leaf("stand-in", &["shop.test"]),
+    );
+    let port = free_port();
+    let h = Harness::new();
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    let book = h.proxy.certificates();
+    let _pending = book.offer_http01("shop.test", "tok-1", "tok-1.thumb");
+
+    // The app has only its placeholder: the handshake succeeds, the app is not reached.
+    assert!(book.set("shop", key_of(&stand_in), true));
+    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
+    assert_eq!(c.certificate(), leaf_of(&stand_in));
+    let r = c.send(&get_host("shop.test", "/cart")).await.unwrap();
+    assert_eq!(r.status, 503);
+    assert_eq!(r.header("retry-after"), Some("60"));
+    assert_eq!(r.header("connection"), Some("close"));
+    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
+    let r = c
+        .send(&get_host("shop.test", "/.well-known/acme-challenge/tok-1"))
+        .await
+        .unwrap();
+    assert_eq!((r.status, r.text()), (200, "tok-1.thumb".to_owned()));
+    assert_eq!(up.count(), 0);
+
+    // The real certificate arrives: new connections reach the app.
+    assert!(book.set("shop", key_of(&files), false));
+    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
+    assert_eq!(c.certificate(), leaf_of(&files));
+    assert_eq!(
+        c.send(&get_host("shop.test", "/cart"))
+            .await
+            .unwrap()
+            .status,
+        200
+    );
+    assert_eq!(up.count(), 1);
+}
+
+/// What a connection gets whose handshake is held half way (the client's `Finished` waits), while
+/// the book changes under it: `before` is what the book holds for the app when the hello arrives,
+/// `after` what it holds when the handshake ends.
+async fn status_of_a_connection_that_sees_the_book_change(
+    placeholder_before: bool,
+    placeholder_after: bool,
+) -> (u16, usize) {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let (files, stand_in) = (
+        pki.leaf("shop", &["shop.test"]),
+        pki.leaf("stand-in", &["shop.test"]),
+    );
+    let port = free_port();
+    let h = Harness::new();
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    let book = h.proxy.certificates();
+    let hold = |placeholder| {
+        if placeholder {
+            (key_of(&stand_in), true)
+        } else {
+            (key_of(&files), false)
+        }
+    };
+    let (key, flag) = hold(placeholder_before);
+    assert!(book.set("shop", key, flag));
+
+    let connecting = tokio::spawn(Https::connect_as(
+        port,
+        pki.client_config(),
+        "shop.test",
+        Some((usize::MAX, Duration::from_millis(1200))),
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (key, flag) = hold(placeholder_after);
+    assert!(book.set("shop", key, flag));
+    let mut c = connecting.await.unwrap().unwrap();
+    let status = c
+        .send(&get_host("shop.test", "/cart"))
+        .await
+        .unwrap()
+        .status;
+    (status, up.count())
+}
+
+#[tokio::test]
+async fn the_placeholder_is_read_before_the_handshake_from_the_name_in_the_hello() {
+    // The hello arrives while the app has the placeholder; it is the real certificate by the end.
+    assert_eq!(
+        status_of_a_connection_that_sees_the_book_change(true, false).await,
+        (503, 0)
+    );
+}
+
+#[tokio::test]
+async fn the_placeholder_is_read_after_the_handshake_from_the_name_it_ended_with() {
+    // The hello arrives while the app has its real certificate; the placeholder is back by the end.
+    assert_eq!(
+        status_of_a_connection_that_sees_the_book_change(false, true).await,
+        (503, 0)
+    );
+    // And a connection that sees the real certificate on both sides reaches the app.
+    assert_eq!(
+        status_of_a_connection_that_sees_the_book_change(false, false).await,
+        (200, 1)
+    );
+}
+
+#[tokio::test]
+async fn every_alpn_case_gets_the_certificate_and_the_ending_it_is_meant_for() {
+    const ACME: &[u8] = b"acme-tls/1";
+    const HTTP: &[u8] = b"http/1.1";
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let (files, challenge) = (
+        pki.leaf("shop", &["shop.test"]),
+        pki.leaf("challenge", &["shop.test"]),
+    );
+    let port = free_port();
+    let h = Harness::new();
+    h.proxy
+        .apply(vec![tls_app("shop", &up, port, &["shop.test"], &files)])
+        .unwrap();
+    let book = h.proxy.certificates();
+    let connect = |name: &'static str, offered: &[&[u8]]| {
+        Https::connect_as(port, pki.client_config_alpn(offered), name, None)
+    };
+
+    // A client that offers http/1.1, h2 and http/1.1, or no protocol, is served the app, with or
+    // without a validation pending: the challenge key never goes to an ordinary client.
+    let mut served = 0;
+    for pending in [false, true] {
+        let _offered = pending.then(|| book.offer_tls_alpn("shop.test", key_of(&challenge)));
+        for (offered, chosen) in [
+            (vec![HTTP], Some(HTTP)),
+            (vec![&b"h2"[..], HTTP], Some(HTTP)),
+            (vec![], None),
+        ] {
+            let mut c = connect("shop.test", &offered).await.unwrap();
+            assert_eq!(c.alpn().as_deref(), chosen, "{offered:?} pending {pending}");
+            assert_eq!(c.certificate(), leaf_of(&files));
+            let r = c.send(&get_host("shop.test", "/")).await.unwrap();
+            assert_eq!(r.status, 200);
+            served += 1;
+        }
+    }
+
+    // acme-tls/1 with no validation pending gets no handshake, also next to http/1.1.
+    for offered in [vec![ACME], vec![ACME, HTTP], vec![HTTP, ACME]] {
+        assert!(connect("shop.test", &offered).await.is_err(), "{offered:?}");
+    }
+
+    // With one pending it gets the challenge key, negotiates acme-tls/1 and is closed after the
+    // handshake without a request being read.
+    let _offered = book.offer_tls_alpn("shop.test", key_of(&challenge));
+    for offered in [vec![ACME], vec![ACME, HTTP], vec![HTTP, ACME]] {
+        let mut c = connect("shop.test", &offered).await.unwrap();
+        assert_eq!(c.alpn().as_deref(), Some(ACME), "{offered:?}");
+        assert_eq!(c.certificate(), leaf_of(&challenge));
+        let closed = c.closed_within(Duration::from_secs(3)).await;
+        assert!(closed.is_some(), "{offered:?}: still open");
+    }
+
+    // A name the listener does not serve is not validated even when a key is offered for it.
+    let _other = book.offer_tls_alpn("nobody.test", key_of(&challenge));
+    assert!(connect("nobody.test", &[ACME]).await.is_err());
+    assert_eq!(up.count(), served);
+}
+
+/// The path of the HTTP-01 resource of `token`.
+fn challenge_path(token: &str) -> String {
+    format!("/.well-known/acme-challenge/{token}")
+}
+
+#[tokio::test]
+async fn http01_is_answered_on_the_tls_listener_before_routing_and_only_for_the_pending_name() {
+    let (ua, ub) = (http_upstream().await, http_upstream().await);
+    let pki = Pki::new();
+    let (fa, fb) = (pki.leaf("a", &["a.test"]), pki.leaf("b", &["b.test"]));
+    let port = free_port();
+    let h = Harness::new();
+    h.proxy
+        .apply(vec![
+            tls_app("a", &ua, port, &["a.test"], &fa),
+            tls_app("b", &ub, port, &["b.test"], &fb),
+        ])
+        .unwrap();
+    let book = h.proxy.certificates();
+    let long = "t".repeat(129);
+    let pending = [
+        book.offer_http01("a.test", "tok-1", "tok-1.thumb"),
+        book.offer_http01("a.test", &long, "too-long.thumb"),
+        book.offer_http01("a.test", "tok_2", "tok_2.thumb"),
+    ];
+    let mut c = Https::connect(port, &pki, "a.test").await.unwrap();
+
+    // The pending name, with a port and in any case, gets the key authorization.
+    for host in ["a.test", "a.test:8443", "A.Test", "a.test."] {
+        let r = c
+            .send(&get_host(host, &challenge_path("tok-1")))
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.status, r.text()),
+            (200, "tok-1.thumb".to_owned()),
+            "{host}"
+        );
+        assert_eq!(r.header("content-type"), Some("application/octet-stream"));
+        assert_eq!(r.header("connection"), Some("close"));
+        c = Https::connect(port, &pki, "a.test").await.unwrap();
+    }
+    assert_eq!((ua.count(), ub.count()), (0, 0), "no app is reached");
+
+    // Before routing: a connection made for the name `a.test` is answered for any pending name.
+    let _b = book.offer_http01("b.test", "tok-b", "tok-b.thumb");
+    let r = c
+        .send(&get_host("b.test", &challenge_path("tok-b")))
+        .await
+        .unwrap();
+    assert_eq!((r.status, r.text()), (200, "tok-b.thumb".to_owned()));
+
+    // What is not a validation goes on to routing, which answers as it always does: the app for a
+    // path it knows, 421 for a name the connection was not set up for.
+    let not_answered = [
+        ("a.test", challenge_path("tok-3"), "GET"),
+        ("a.test", challenge_path(&long), "GET"),
+        ("a.test", challenge_path("tok-1/"), "GET"),
+        ("a.test", challenge_path("tok-1?x=1"), "GET"),
+        ("a.test", challenge_path("tok%2D1"), "GET"),
+        ("a.test", challenge_path("tok-1."), "GET"),
+        ("a.test", challenge_path(""), "GET"),
+        ("a.test", "/.well-known/acme-challenge".to_owned(), "GET"),
+        ("a.test", challenge_path("TOK-1"), "GET"),
+        ("a.test", challenge_path("tok-1"), "POST"),
+    ];
+    let mut routed = 0;
+    for (host, path, method) in not_answered {
+        let mut c = Https::connect(port, &pki, "a.test").await.unwrap();
+        let raw = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
+        c.0.get_mut().write_all(raw.as_bytes()).await.unwrap();
+        let r = read_reply(&mut c.0).await;
+        // The upstream answers 200 `ok`: the app was reached, not the validation answer.
+        assert!(
+            r.is_ok_and(|r| (r.status, r.text()) == (200, "ok".to_owned())),
+            "{method} {path}"
+        );
+        routed += 1;
+    }
+    assert_eq!(ua.count(), routed);
+    // The name of another app on this connection is not served by a.test's SNI, and has no answer.
+    let mut c = Https::connect(port, &pki, "a.test").await.unwrap();
+    let r = c
+        .send(&get_host("nobody.test", &challenge_path("tok-1")))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 421);
+
+    // Once the order is over there is no answer.
+    drop(pending);
+    let mut c = Https::connect(port, &pki, "a.test").await.unwrap();
+    let r = c
+        .send(&get_host("a.test", &challenge_path("tok-1")))
+        .await
+        .unwrap();
+    assert_eq!(r.text(), "ok");
+}
+
+/// An app served over TLS on `port` with the redirect listener at `plain`.
+fn redirected_app(up: &TestUpstream, port: u16, plain: u16, files: &CertFiles) -> AppSpec {
+    let mut a = tls_app("shop", up, port, &["shop.test"], files);
+    a.tls.as_mut().unwrap().redirect_listen = Some(format!("127.0.0.1:{plain}"));
+    a
+}
+
+#[tokio::test]
+async fn http01_is_answered_on_the_redirect_listener_and_only_for_the_pending_name() {
+    let up = http_upstream().await;
     let pki = Pki::new();
     let files = pki.leaf("shop", &["shop.test"]);
     let (port, plain) = (free_port(), free_port());
-    let mut a = php_app(fcgi, port, &files);
-    a.listen_port = plain;
     let h = Harness::new();
-    h.proxy.apply(vec![a]).unwrap();
+    h.proxy
+        .apply(vec![redirected_app(&up, port, plain, &files)])
+        .unwrap();
     let to: SocketAddr = format!("127.0.0.1:{plain}").parse().unwrap();
+    let book = h.proxy.certificates();
+    let long = "t".repeat(129);
+    let pending = [
+        book.offer_http01("shop.test", "tok-1", "tok-1.thumb"),
+        book.offer_http01("shop.test", &long, "too-long.thumb"),
+    ];
+    let status = |host: &str, path: &str, method: &str| {
+        let raw = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n");
+        async move { one(to, raw.as_bytes()).await }
+    };
 
-    for (header, https, server_port, proto) in [
-        (
-            "X-Forwarded-Proto: https\r\n",
-            Some("on"),
-            "443",
-            Some("https"),
-        ),
-        ("X-Forwarded-Proto: http\r\n", None, "80", Some("http")),
-        ("", None, "80", None),
-    ] {
-        let raw = format!("GET /index.php HTTP/1.1\r\nHost: shop.test\r\n{header}\r\n");
-        assert_eq!(one(to, raw.as_bytes()).await.status, 201);
-        let p = last_params(&fake);
+    for host in ["shop.test", "shop.test:80", "SHOP.test", "shop.test."] {
+        let r = status(host, &challenge_path("tok-1"), "GET").await;
         assert_eq!(
-            (
-                p.get("HTTPS").map(String::as_str),
-                p["SERVER_PORT"].as_str(),
-                p.get("HTTP_X_FORWARDED_PROTO").map(String::as_str)
-            ),
-            (https, server_port, proto),
-            "{header:?}"
+            (r.status, r.text()),
+            (200, "tok-1.thumb".to_owned()),
+            "{host}"
         );
+        assert_eq!(r.header("content-type"), Some("application/octet-stream"));
     }
+    // Not a validation: the redirect that every other request gets (the certificate is real), or
+    // 404 for a name the listener does not know.
+    for (host, path, method, expected) in [
+        ("shop.test", challenge_path("tok-2"), "GET", 308),
+        ("shop.test", challenge_path(&long), "GET", 308),
+        ("shop.test", challenge_path("tok-1/"), "GET", 308),
+        ("shop.test", challenge_path("tok-1?x=1"), "GET", 308),
+        ("shop.test", challenge_path("tok%2D1"), "GET", 308),
+        ("shop.test", challenge_path(""), "GET", 308),
+        ("shop.test", challenge_path("TOK-1"), "GET", 308),
+        ("shop.test", challenge_path("tok-1"), "POST", 308),
+        ("shop.test", challenge_path("tok-1"), "HEAD", 308),
+        ("other.test", challenge_path("tok-1"), "GET", 404),
+    ] {
+        let r = status(host, &path, method).await;
+        assert_eq!(r.status, expected, "{method} {host} {path}");
+    }
+    assert_eq!(up.count(), 0);
+
+    drop(pending);
+    assert_eq!(
+        status("shop.test", &challenge_path("tok-1"), "GET")
+            .await
+            .status,
+        308
+    );
+}
+
+#[tokio::test]
+async fn the_redirect_listener_answers_503_until_the_app_has_a_real_certificate_then_308() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let (files, stand_in) = (
+        pki.leaf("shop", &["shop.test"]),
+        pki.leaf("stand-in", &["shop.test"]),
+    );
+    let (port, plain) = (free_port(), free_port());
+    let h = Harness::new();
+    h.proxy
+        .apply(vec![redirected_app(&up, port, plain, &files)])
+        .unwrap();
+    let to: SocketAddr = format!("127.0.0.1:{plain}").parse().unwrap();
+    let book = h.proxy.certificates();
+    let ask = |host: &'static str| async move { one(to, &get_host(host, "/cart?a=1")).await };
+    let waiting = |r: &ReplyParts| {
+        assert_eq!(r.status, 503);
+        assert_eq!(r.header("retry-after"), Some("60"));
+        assert_eq!(r.header("connection"), Some("close"));
+        assert!(r.header("location").is_none());
+        let text = r.text();
+        assert!(
+            !text.trim().is_empty() && text.trim().lines().count() == 1,
+            "{text}"
+        );
+    };
+
+    assert_eq!(ask("shop.test").await.status, 308);
+    // Only the placeholder, then nothing at all: the app's hosts wait, others are still unknown.
+    assert!(book.set("shop", key_of(&stand_in), true));
+    waiting(&ask("shop.test").await);
+    assert_eq!(ask("other.test").await.status, 404);
+    book.follow(HashMap::new());
+    waiting(&ask("shop.test").await);
+    // A real certificate: the redirect, as before.
+    book.follow(HashMap::from([(
+        "shop".to_owned(),
+        Some(BookEntry {
+            key: key_of(&files),
+            placeholder: false,
+        }),
+    )]));
+    let r = ask("shop.test").await;
+    assert_eq!(r.status, 308);
+    assert_eq!(
+        r.header("location"),
+        Some(format!("https://shop.test:{port}/cart?a=1").as_str())
+    );
+    assert_eq!(ask("other.test").await.status, 404);
+    assert_eq!(up.count(), 0);
 }

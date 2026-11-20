@@ -441,20 +441,32 @@ that does not parse, or names a certificate or key file that cannot be read, sto
 - `tls: false` leaves the entry out, so it can stay in the file while the app is off. `redirect_listen` is optional. An app id that
   the bundle does not have serves nothing. Unknown fields are an error.
 - `hosts` are exact names: no port and no wildcard, lower case, written without a trailing dot. A name belongs to one app on a
-  listener. Apps that give the same `listen` share the listener, and then must agree on the read and write timeouts, the body
-  limit and the read buffer size of their `proxy_config`.
-- The app keeps the plain listener its bundle names, so the dashboard still shows it. An address in the file that the bundle also
-  uses fails the apply with `duplicate listener in WAF bundle`.
-- TLS 1.2 and 1.3, with ALPN `http/1.1` only. The SNI name picks the certificate and the `Host` header picks the app. A client
+  listener. Apps that give the same `listen` share the listener and may differ in their `proxy_config`. Before a request is
+  routed its head is read with the largest read buffer and the largest finite read timeout of those apps, and an answer made
+  then uses the largest finite write timeout (60 seconds when no app has one). From the routing on each app's own settings
+  apply: a head longer than its read buffer gets `431`, its read timeout counts from the start of the head and covers the body,
+  and its body limit and write timeout hold. An unlimited timeout applies after the routing only, so an idle connection on a
+  listener where one app is unlimited still ends at the finite timeout of another. A change of these settings takes effect
+  with the next bundle, without a restart. An address that changes from a plain listener to a redirect listener, or from HTTPS
+  to a plain listener, keeps its socket: no connection is refused and new ones get the new kind. A request in flight on an old
+  connection finishes; an old connection that is idle between requests closes at once.
+- An app named in the file opens no plain listener of its own: the address its bundle names is not served and not checked (another
+  app may use it), and the app answers on its HTTPS listener only. An address in the file that another app of the bundle uses
+  fails the apply with `duplicate listener in WAF bundle`.
+- TLS 1.2 and 1.3. The SNI name picks the app and the certificate the agent holds for it, and the `Host` header picks the app.
+  ALPN is `acme-tls/1`, then `http/1.1`: a client that offers `acme-tls/1` is a certificate validation, and gets a handshake only
+  for a name with a validation pending, which ends with the handshake; every other client negotiates `http/1.1` or none. A client
   that sends no name, or a name no `hosts` list has, gets no handshake. A `Host` that differs from the SNI name gets `421`
   and the connection closes, so no request reaches another app's upstream over a certificate that was not made for it.
-- The certificate file holds the chain with the leaf first, the key file one private key (PKCS#8, PKCS#1 or SEC1). The agent checks
-  every 30 seconds whether either file changed (modification time, size or inode, so a symlink swap counts) and loads the new pair for
-  the next handshake. Open connections go on. A pair that cannot be read, or whose key does not match its certificate, keeps the
-  previous one and is logged once with the file name. Private keys are never logged. The files must be readable by the user the
+- The certificate file holds the chain with the leaf first, the key file one private key (PKCS#8, PKCS#1 or SEC1). The agent reads
+  the pair when a bundle is applied (the start, a reload, a new bundle) and not in between, so a renewed pair is served from the next
+  apply on. Open connections go on. A pair that cannot be read, or whose key does not match its certificate, fails the apply with
+  the file name in the log, and the previous bundle stays. Private keys are never logged. The files must be readable by the user the
   agent runs as.
 - `redirect_listen` answers every method with `308` to `https://<host>[:port]` and the same path and query, for the hosts of the file, and
-  `404` for any other, then closes the connection.
+  `404` for any other, then closes the connection. It answers `503` with `Retry-After: 60` instead of the `308` for an app that has
+  no real certificate yet. A `GET /.well-known/acme-challenge/<token>` for a name with that HTTP-01 validation pending gets `200` and
+  the key authorization, here and on the HTTPS listener, before the request is routed.
 - The agent computes the JA4 fingerprint from the ClientHello of each TLS connection, and the bot checks use it. For an app in the
   file, the JA4 and JA3 headers of a proxy in front are read only from a peer that `proxy_config` trusts as a proxy; `X-Forwarded-Proto`
   is `https` for a TLS connection. A ClientHello that spans two TLS records gets no JA4.

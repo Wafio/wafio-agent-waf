@@ -65,8 +65,8 @@ pub struct AppSpec {
     /// The `maintenance` object of the bundle app; empty = none.
     pub maintenance: Vec<u8>,
     pub analysis: Arc<AppAnalysisSetup>,
-    /// The agent serves the app over HTTPS itself (the local TLS sites file); `None` = only the
-    /// bundle listener, as before.
+    /// The agent serves the app over HTTPS itself (the local TLS sites file) and opens no listener
+    /// at the bundle's address for it; `None` = only the bundle listener, as before.
     pub tls: Option<TlsSite>,
 }
 
@@ -79,8 +79,10 @@ pub struct TlsSite {
     /// The host names the app answers for: lower case, no port, no trailing dot. SNI and `Host`
     /// are matched against them.
     pub hosts: Vec<String>,
+    /// The files the certificate is read from when a bundle is applied.
     pub cert: CertFiles,
-    /// `host:port` of a plain listener that redirects these hosts to HTTPS; `None` = no redirect.
+    /// `host:port` of a plain listener that redirects these hosts to HTTPS once the app has a real
+    /// certificate and answers HTTP-01 validations; `None` = no such listener.
     pub redirect_listen: Option<String>,
 }
 

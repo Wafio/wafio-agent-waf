@@ -20,7 +20,7 @@ use tokio::time::Instant;
 
 use crate::body_reader::{self, BodyState};
 use crate::config::Route;
-use crate::head_parser::{self, HeadError};
+use crate::head_parser::{self, HeadError, UriParts};
 use crate::https::RedirectTable;
 use crate::maintenance::{self, Watch};
 use crate::pipeline::{self, Done};
@@ -340,6 +340,8 @@ enum Head {
     Ready {
         buffer: BytesMut,
         head: head_parser::Head,
+        /// When the head's clock started: the accept, or the first byte of a kept-alive request.
+        started: Instant,
         deadline: Option<Instant>,
     },
     /// An answer is written and the connection ends: a head that cannot be parsed (400), one that
@@ -366,7 +368,8 @@ async fn read_head(
 ) -> Head {
     let clock = |from: Instant| read_to.map(|d| from + d);
     let mut idle = !first && buf.is_empty();
-    let mut deadline = clock(Instant::now());
+    let mut started = Instant::now();
+    let mut deadline = clock(started);
     // Bytes pipelined behind the previous request are parsed at once.
     let mut dirty = !buf.is_empty();
     loop {
@@ -376,6 +379,7 @@ async fn read_head(
                     return Head::Ready {
                         buffer: buf,
                         head,
+                        started,
                         deadline,
                     };
                 }
@@ -407,7 +411,8 @@ async fn read_head(
             Ok(Ok(n)) if n > 0 => {
                 if idle {
                     idle = false;
-                    deadline = clock(Instant::now());
+                    started = Instant::now();
+                    deadline = clock(started);
                 }
                 dirty = buf[buf.len() - n..].contains(&b'\n');
             }
@@ -477,6 +482,7 @@ fn shrink_idle_buffer(buf: BytesMut, consumed: usize) -> BytesMut {
 }
 
 /// What the head read of a connection is bounded by.
+#[derive(Clone, Copy)]
 pub(crate) struct HeadLimits {
     /// The read buffer size: the longest head.
     pub cap: usize,
@@ -496,6 +502,30 @@ pub(crate) trait Site {
     fn app(&self, host: &[u8]) -> Option<Arc<RouteApp>>;
     /// What the handshake of the connection told, if the agent terminated TLS.
     fn tls(&self) -> Option<Arc<TlsClient>>;
+
+    /// An answer that is made before the request is routed, and ends the connection: a certificate
+    /// validation, or the refusal to serve a connection that was set up for a placeholder
+    /// certificate. `None`: route the request.
+    fn early_answer(&self, _method: &[u8], _parts: &UriParts) -> Option<OutboundResponse> {
+        None
+    }
+
+    /// Whether a head of `len` bytes fits `app`'s read buffer, for a listener whose head read
+    /// used the largest buffer of its apps.
+    fn head_fits(&self, _app: &RouteApp, _len: usize) -> bool {
+        true
+    }
+
+    /// The deadline of the body of a request routed to `app`; `started` is when the head's clock
+    /// began and `head_deadline` the one the head was read under.
+    fn body_deadline(
+        &self,
+        _app: &RouteApp,
+        _started: Instant,
+        head_deadline: Option<Instant>,
+    ) -> Option<Instant> {
+        head_deadline
+    }
 }
 
 /// The plain listener of one app.
@@ -554,16 +584,26 @@ pub(crate) async fn serve_connection<S: Site>(site: S, stream: Stream, mut stop:
             Head::Ready {
                 buffer: buf,
                 head,
+                started,
                 deadline,
             } => {
                 // The request target is parsed before the body is read.
                 let Ok(parts) = head_parser::uri_parts(&head.host, &head.request_target) else {
                     return reject(stream, malformed_request_response(), limits.write_ms).await;
                 };
+                if let Some(r) = site.early_answer(&head.method, &parts) {
+                    return reject(stream, r, limits.write_ms).await;
+                }
                 let Some(app) = site.app(&parts.host) else {
                     let r = OutboundResponse::error(421, "Misdirected Request");
                     return reject(stream, r, limits.write_ms).await;
                 };
+                if !site.head_fits(&app, head.len) {
+                    // The app is chosen: its own write timeout holds, not the listener's.
+                    let write_ms = app.route().proxy_config.timeouts.write_ms;
+                    return reject(stream, too_big_request(), write_ms).await;
+                }
+                let deadline = site.body_deadline(&app, started, deadline);
                 match app
                     .serve_one(stream, buf, head, parts, deadline, &peer, &stop)
                     .await
@@ -576,8 +616,9 @@ pub(crate) async fn serve_connection<S: Site>(site: S, stream: Stream, mut stop:
     }
 }
 
-/// The connection of a plain listener that redirects to HTTPS: one answer, then the connection
-/// closes. It has no route, so the head is read with fixed limits.
+/// The connection of a plain listener that redirects to HTTPS: one answer (a certificate
+/// validation, the redirect, or the wait for a certificate), then the connection closes. It has
+/// no route, so the head is read with fixed limits.
 pub(crate) async fn serve_redirect(
     table: Arc<RedirectTable>,
     mut stream: Stream,
@@ -600,7 +641,7 @@ pub(crate) async fn serve_redirect(
         Head::Answer(r) => r,
         Head::Ready { head, .. } => {
             match head_parser::uri_parts(&head.host, &head.request_target) {
-                Ok(parts) => table.answer(&parts),
+                Ok(parts) => table.answer(&head.method, &parts),
                 Err(()) => malformed_request_response(),
             }
         }

@@ -244,7 +244,9 @@ impl Agent {
                 tracing::info!("[waf-bundle] {e}");
                 return Err(apply_error("invalid app route in WAF bundle"));
             }
-            if app.listen_port > 0 {
+            // An app with an HTTPS site opens no listener at its bundle address, so that address
+            // is neither checked for a duplicate nor for a port that cannot be bound.
+            if app.listen_port > 0 && spec.tls.is_none() {
                 let host = if app.listen_host.is_empty() {
                     "0.0.0.0"
                 } else {
@@ -282,8 +284,9 @@ impl Agent {
     }
 }
 
-/// The `AppSpec` of a bundle app (`listen_port` ≤ 0 = no listener; > 65535 is refused by
-/// `install_bundle` before this is used).
+/// The `AppSpec` of a bundle app (`listen_port` ≤ 0 = no listener). A port above 65535 is
+/// refused by `install_bundle` for an app without an HTTPS site; for an app with one it becomes 0,
+/// since that app opens no listener at its bundle address.
 fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>, tls: Option<TlsSite>) -> AppSpec {
     AppSpec {
         app_id: app.app_id.clone(),

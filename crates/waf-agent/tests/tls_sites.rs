@@ -1,8 +1,8 @@
-//! The real binary started with `--tls-sites-file`: an app served over HTTPS next to its plain
-//! listener, the redirect listener, a reload while connections are open, a settings file that
-//! stops the start, and an agent without the flag. The control plane is unreachable and the app
-//! comes from the bundle cache, as in `operations.rs`. Keys are made by `openssl` at test time
-//! into a scratch directory that is removed when the test ends.
+//! The real binary started with `--tls-sites-file`: an app served over HTTPS, which opens no
+//! plain listener of its own, the redirect listener, a reload while connections are open, a
+//! settings file that stops the start, and an agent without the flag. The control plane is
+//! unreachable and the app comes from the bundle cache, as in `operations.rs`. Keys are made by
+//! `openssl` at test time into a scratch directory that is removed when the test ends.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -596,13 +596,14 @@ impl Drop for Agent {
 }
 
 #[tokio::test]
-async fn an_app_named_in_the_sites_file_is_served_over_https_and_keeps_its_plain_listener() {
+async fn an_app_named_in_the_sites_file_is_served_over_https_and_opens_no_plain_listener() {
     let s = Setup::new("https");
     let agent = Agent::start(&s, true);
     assert_eq!(
         listening_ports(agent.first),
-        BTreeSet::from([s.plain, s.https, s.redirect])
+        BTreeSet::from([s.https, s.redirect])
     );
+    assert!(TcpStream::connect(("127.0.0.1", s.plain)).await.is_err());
 
     let mut client = Https::connect(s.https, &s.client, HOST).await.unwrap();
     assert_eq!(client.alpn().as_deref(), Some(&b"http/1.1"[..]));
@@ -623,18 +624,6 @@ async fn an_app_named_in_the_sites_file_is_served_over_https_and_keeps_its_plain
             .contains("x-forwarded-proto: https"),
         "the upstream is told the request came over HTTPS: {}",
         heads[0]
-    );
-
-    let r = plain(s.plain, HOST, "/plain").await.unwrap();
-    assert_eq!((r.status, r.body.as_str()), (200, "ok"));
-    let heads = s.upstream.heads();
-    assert!(heads[2].starts_with("GET /plain HTTP/1.1"), "{}", heads[2]);
-    assert!(
-        !heads[2]
-            .to_ascii_lowercase()
-            .contains("x-forwarded-proto: https"),
-        "{}",
-        heads[2]
     );
 }
 
@@ -741,8 +730,8 @@ async fn a_reload_hands_over_the_https_listeners_without_a_refused_connection_an
     assert_eq!(r.status, 308);
     assert_eq!(
         listening_ports(second),
-        BTreeSet::from([s.plain, s.https, s.redirect]),
-        "the successor holds all three sockets"
+        BTreeSet::from([s.https, s.redirect]),
+        "the successor holds both sockets"
     );
 
     tokio::time::sleep(Duration::from_millis(300)).await;
