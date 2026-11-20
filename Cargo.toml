@@ -51,8 +51,8 @@ memchr = "2.8"
 # The 2.x line of mimalloc: about a quarter less resident memory than the default 3.x line at the same speed on this workload.
 mimalloc = { version = "0.1", features = ["v2"] }
 miniz_oxide = "0.9"
-# Safe wrappers of statfs, getifaddrs, if_nametoindex and shutdown. Already in the tree through pingora-core.
-nix = { version = "0.31", default-features = false, features = ["fs", "net"] }
+# Safe wrappers of statfs, getifaddrs, if_nametoindex, shutdown, flock, geteuid and prctl. Already in the tree through pingora-core.
+nix = { version = "0.31", default-features = false, features = ["fs", "net", "process", "user"] }
 pingora = { version = "0.9", default-features = false, features = ["rustls"] }
 prost = "0.14"
 protox = "0.10"

@@ -109,9 +109,13 @@ scripts/ci-local.sh
 
 In order: agent-material check (`scripts/check-ai.sh`), secret scan (`gitleaks`), proto copy check
 (`scripts/sync-proto.sh --check`), notices (`scripts/gen-notices.py`), advisories, the test certificates,
-`cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and
-`cargo test --locked --workspace`. In a copy of the tree without `.git` the gate skips the agent-material check
+`cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets --features wafio-waf-agent/test-tls -- -D warnings` and
+`cargo test --locked --workspace --features wafio-waf-agent/test-tls`. In a copy of the tree without `.git` the gate skips the agent-material check
 and scans the files for secrets instead of the history; run `scripts/check-ai.sh` in the checkout then.
+
+The feature `test-tls` of `wafio-waf-agent` lets `WAFIO_TEST_TLS_DIR` name the key directory, so that the tests of the binary can use a
+directory that the user they run as owns (the fixed path needs the user of the unit); `tests/tls_bundle.rs` is built only with it. No
+release build enables it.
 
 The gate needs nothing from the private repository. The loader's file checks are tested here (`crates/engine-loader`) and the
 encodings with random and damaged buffers of a fixed seed (`crates/engine-abi/tests`); loading a real library, the failure cases that need
@@ -397,7 +401,7 @@ start and names every missing one): `--grpc-server` (`WAFIO_GRPC_SERVER`), `--cl
 `--ca-cert`, `--agent-name`, `--geo-country-db`, `--geo-city-db`, `--geo-asn-db`, `--bot-ua-file`, and one of
 `--bot-ja4-file` or `--bot-ja3-file` (when `--bot-ja4-file` is empty the agent uses the first non-empty `ja4.txt` it finds under
 `security-data/ja4/`, `/etc/wafio/security-data/ja4/` and `/usr/local/share/wafio/ja4/`). Optional ones include `--host-key`,
-`--state-dir`, `--bundle-cache-max-age` (default `168h0m0s`), `--tls-sites-file` (see "HTTPS from the agent"), the IP reputation and
+`--state-dir`, `--bundle-cache-max-age` (default `168h0m0s`), the IP reputation and
 jail files and `--pid-file`. `wafio-waf-agent-open --help` lists all of them.
 
 The security data (GeoIP databases, user-agent and fingerprint lists, IP reputation lists, malware hashes) lives in one
@@ -426,23 +430,41 @@ before a production host.
 ## HTTPS from the agent
 
 By default an app listens on plain HTTP, where its bundle says, and a proxy or load balancer in front of the agent ends TLS. An
-app can instead be served over HTTPS by the agent itself. The settings stay on the agent, in a JSON file that the control
-plane does not send: `--tls-sites-file` (`WAFIO_TLS_SITES_FILE`, empty by default). An app that the file does not name
-behaves exactly as before. The file is read once at start, so `systemctl reload wafio-waf-agent` applies a change to it; a file
-that does not parse, or names a certificate or key file that cannot be read, stops the start and names the reason.
+app can instead be served over HTTPS by the agent itself. The settings come from the bundle: an app whose entry has a `tls`
+object (the control plane sends it while the app is in gateway mode) is served over HTTPS, and an app without one behaves
+exactly as before.
 
 ```json
-{"apps": {"<app id>": {"tls": true, "listen": "0.0.0.0:443",
-  "hosts": ["shop.example.com", "www.shop.example.com"],
-  "certificate": "/etc/wafio/tls/shop/fullchain.pem", "key": "/etc/wafio/tls/shop/privkey.pem",
-  "redirect_listen": "0.0.0.0:80"}}}
+{"app_id": "<app id>", "tls": {"listen": "0.0.0.0:443",
+  "hosts": ["shop.example.com", "www.shop.example.com"], "redirect_listen": "0.0.0.0:80",
+  "source": "uploaded", "certificate_id": "<certificate id>", "leaf_sha256": "<hex>"}}
 ```
 
-- `tls: false` leaves the entry out, so it can stay in the file while the app is off. `redirect_listen` is optional. An app id that
-  the bundle does not have serves nothing. Unknown fields are an error.
-- `hosts` are exact names: no port and no wildcard, lower case, written without a trailing dot. A name belongs to one app on a
-  listener. Apps that give the same `listen` share the listener and may differ in their `proxy_config`. Before a request is
-  routed its head is read with the largest read buffer and the largest finite read timeout of those apps, and an answer made
+- The agent checks the object as the control plane does, and no stricter. `app_id` (and `certificate_id`) must be a lower-case UUID, as
+  they name files. `listen` and `redirect_listen` are an IP address with a port from 1 to 65535 (an IPv6 address in square brackets),
+  and differ; `listen` is `0.0.0.0:443` when it is left out. `hosts` are 1 to 100 plain DNS names, trimmed, lower-cased and each
+  kept once: no port, no wildcard, no IP address, no trailing dot, no underscore. An object that fails a check refuses the whole
+  bundle (`invalid TLS site settings`, with the app and the field in the log), as an invalid route does: the previous bundle stays and
+  the control plane sends it again. A `source` that is empty or not known, or an uploaded one with no certificate named yet, is no
+  refusal: nothing is served for that app. A bundle that cannot bind an address of its apps (another program still holds port
+  443, say) is tried again every minute, for as long as it takes.
+- The certificates are files of the key directory, `/var/lib/wafio-waf-agent/tls/` (the unit's `StateDirectory` is its parent; it does
+  not follow `--state-dir`). The agent makes it 0700 if it is missing and uses it only when it is a directory, not a link, owned by
+  the user the agent runs as; group and other access is cleared and logged. Otherwise the start logs a warning that names the
+  directory and the cause, and the `tls` objects are ignored. A file holds one private key and the chain, leaf first
+  (`<certificate id>.pem` for an uploaded certificate, `acme-<app id>.pem` for an ordered one), and is 0600. A file is read when a
+  bundle is applied (the start, a reload, a new bundle), never through a link and up to 128 KiB. An app is served the file its
+  bundle names, if it is there and holds the certificate the bundle names by its leaf; until then, the file it was served before,
+  which `state.json` in the same directory remembers across a restart (it holds no key material, and drops the apps that are not in
+  the bundle). A file that no app of the bundle names and none is served from is removed after each applied bundle: once the new
+  certificate is served, the old file goes. The agent sets `PR_SET_DUMPABLE` to 0, so a crash leaves no core dump with the keys in it
+  and ptrace cannot read them.
+- One process writes in the key directory: the one that holds an exclusive `flock` on `tls.lock` there. A reload's successor reads
+  what the process it replaces wrote, serves it, and writes nothing; it takes the lock once the process it replaces has stopped
+  accepting, and then does what it put off (`state.json`, the removal of unused files). Files are written under a temporary name,
+  synced and renamed, so a reader sees a file whole or not at all.
+- Apps that give the same `listen` share the listener and may differ in their `proxy_config`; a host name belongs to one app on a
+  listener. Before a request is routed its head is read with the largest read buffer and the largest finite read timeout of those apps, and an answer made
   then uses the largest finite write timeout (60 seconds when no app has one). From the routing on each app's own settings
   apply: a head longer than its read buffer gets `431`, its read timeout counts from the start of the head and covers the body,
   and its body limit and write timeout hold. An unlimited timeout applies after the routing only, so an idle connection on a
@@ -450,25 +472,23 @@ that does not parse, or names a certificate or key file that cannot be read, sto
   with the next bundle, without a restart. An address that changes from a plain listener to a redirect listener, or from HTTPS
   to a plain listener, keeps its socket: no connection is refused and new ones get the new kind. A request in flight on an old
   connection finishes; an old connection that is idle between requests closes at once.
-- An app named in the file opens no plain listener of its own: the address its bundle names is not served and not checked (another
-  app may use it), and the app answers on its HTTPS listener only. An address in the file that another app of the bundle uses
+- An app with a `tls` object opens no plain listener of its own: the address its bundle names is not served and not checked (another
+  app may use it), and the app answers on its HTTPS listener only. An address of the object that another app of the bundle uses
   fails the apply with `duplicate listener in WAF bundle`.
 - TLS 1.2 and 1.3. The SNI name picks the app and the certificate the agent holds for it, and the `Host` header picks the app.
   ALPN is `acme-tls/1`, then `http/1.1`: a client that offers `acme-tls/1` is a certificate validation, and gets a handshake only
   for a name with a validation pending, which ends with the handshake; every other client negotiates `http/1.1` or none. A client
   that sends no name, or a name no `hosts` list has, gets no handshake. A `Host` that differs from the SNI name gets `421`
   and the connection closes, so no request reaches another app's upstream over a certificate that was not made for it.
-- The certificate file holds the chain with the leaf first, the key file one private key (PKCS#8, PKCS#1 or SEC1). The agent reads
-  the pair when a bundle is applied (the start, a reload, a new bundle) and not in between, so a renewed pair is served from the next
-  apply on. Open connections go on. A pair that cannot be read, or whose key does not match its certificate, fails the apply with
-  the file name in the log, and the previous bundle stays. Private keys are never logged. The files must be readable by the user the
-  agent runs as.
-- `redirect_listen` answers every method with `308` to `https://<host>[:port]` and the same path and query, for the hosts of the file, and
+- A new certificate is served from the next handshake on, and open connections go on. A file that cannot be read, or whose key does
+  not match its certificate, is not served: the app keeps the certificate it has, and the file name and the kind of failure are
+  in the log. Private keys are never logged.
+- `redirect_listen` answers every method with `308` to `https://<host>[:port]` and the same path and query, for the hosts of the app, and
   `404` for any other, then closes the connection. It answers `503` with `Retry-After: 60` instead of the `308` for an app that has
   no real certificate yet. A `GET /.well-known/acme-challenge/<token>` for a name with that HTTP-01 validation pending gets `200` and
   the key authorization, here and on the HTTPS listener, before the request is routed.
-- The agent computes the JA4 fingerprint from the ClientHello of each TLS connection, and the bot checks use it. For an app in the
-  file, the JA4 and JA3 headers of a proxy in front are read only from a peer that `proxy_config` trusts as a proxy; `X-Forwarded-Proto`
+- The agent computes the JA4 fingerprint from the ClientHello of each TLS connection, and the bot checks use it. For an app
+  with a `tls` object, the JA4 and JA3 headers of a proxy in front are read only from a peer that `proxy_config` trusts as a proxy; `X-Forwarded-Proto`
   is `https` for a TLS connection. A ClientHello that spans two TLS records gets no JA4.
 - Every TLS connection counts against the listener's connection limit, and the handshake has 10 seconds. A failed handshake closes
   without an answer.
@@ -608,7 +628,7 @@ the Go agent until it takes a release made this way.
 ```
 Cargo.toml  Cargo.lock       workspace of 18 crates
 crates/
-  waf-agent                  the library and the binary wafio-waf-agent-open: flags, run loop, bundle apply, reload
+  waf-agent                  the library and the binary wafio-waf-agent-open: flags, run loop, bundle apply, key directory, reload
   control                    gRPC link to the control plane, bundle cache, telemetry
   proxy                      per-application reverse proxy and WebSocket handling, HTTPS listeners and certificates
   application                request analysis pipeline, in-memory block and rate-limit stores

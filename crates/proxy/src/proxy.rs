@@ -208,6 +208,13 @@ impl Proxy {
         self.manager.handover_fds()
     }
 
+    /// Stops accepting and returns once no accept loop of this process accepts any more;
+    /// connections already accepted go on until `shutdown`. Later `apply` calls fail.
+    /// `handed_over`: a successor serves the same sockets (close, never shut down).
+    pub async fn stop_accepting(&self, handed_over: bool) {
+        self.manager.stop_accepting(handed_over).await;
+    }
+
     /// Stops accepting and drains; later `apply` calls fail.
     /// `handed_over`: a successor serves the same sockets (close, never shut down).
     pub async fn shutdown(&self, handed_over: bool) {

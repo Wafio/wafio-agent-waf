@@ -177,3 +177,42 @@ async fn many_listeners_churn() {
     assert_eq!(one(addr(ports[50]), &get("/")).await.status, 200);
     eprintln!("apply: 200 listeners added in {add:?}, 100 removed in {remove:?}");
 }
+
+#[tokio::test]
+async fn stop_accepting_returns_before_the_connections_drain_and_closes_the_door() {
+    let slow = http_upstream_delayed("X-Tag: slow\r\n", b"ok", Duration::from_millis(800)).await;
+    let h = Harness::new();
+    let port = free_port();
+    h.proxy
+        .apply(vec![app("A", port, &format!("http://{}", slow.addr))])
+        .unwrap();
+    let in_flight = tokio::spawn(async move {
+        Client::connect(addr(port))
+            .await
+            .unwrap()
+            .send(&get("/slow"))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let t = Instant::now();
+    h.proxy.stop_accepting(false).await;
+    assert!(
+        t.elapsed() < Duration::from_millis(400),
+        "the stop does not wait for the request in flight: {:?}",
+        t.elapsed()
+    );
+    assert!(
+        Client::connect(addr(port)).await.is_err(),
+        "nothing is accepted after the stop"
+    );
+    assert_eq!(
+        h.proxy
+            .apply(vec![app("A", port, &format!("http://{}", slow.addr))])
+            .unwrap_err(),
+        "agent is shutting down"
+    );
+    let resp = in_flight.await.unwrap().unwrap();
+    assert_eq!((resp.status, resp.header("x-tag")), (200, Some("slow")));
+    h.proxy.shutdown(false).await;
+}

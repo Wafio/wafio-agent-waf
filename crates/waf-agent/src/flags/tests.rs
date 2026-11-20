@@ -181,15 +181,19 @@ fn env_fills_only_empty_flags() {
 }
 
 #[test]
-fn the_tls_sites_file_comes_from_the_flag_or_the_environment() {
-    assert_eq!(parse(&[]).tls_sites_file, "");
-    let vars = [("WAFIO_TLS_SITES_FILE", "/etc/wafio/tls-sites.json")];
-    let mut f = parse(&[]);
-    f.fill_from_env(&env(&vars, &[]));
-    assert_eq!(f.tls_sites_file, "/etc/wafio/tls-sites.json");
-    let mut f = parse(&["--tls-sites-file", "/srv/sites.json"]);
-    f.fill_from_env(&env(&vars, &[]));
-    assert_eq!(f.tls_sites_file, "/srv/sites.json");
+fn the_tls_sites_file_is_gone_and_its_variable_gets_one_warning() {
+    assert!(Cli::try_parse_from(["wafio-waf-agent", "--tls-sites-file", "x"]).is_err());
+    let warning = |vars: &[(&'static str, &'static str)]| {
+        parse(&[])
+            .fill_from_env(&env(vars, &[]))
+            .into_iter()
+            .filter(|l| l.contains("WAFIO_TLS_SITES_FILE"))
+            .collect::<Vec<_>>()
+    };
+    assert!(warning(&[]).is_empty());
+    let lines = warning(&[("WAFIO_TLS_SITES_FILE", "/etc/wafio/tls-sites.json")]);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("no longer read") && lines[0].contains("dashboard"));
 }
 
 #[test]

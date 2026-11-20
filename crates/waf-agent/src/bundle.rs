@@ -29,6 +29,24 @@ pub struct BundleApp {
     pub custom_tuning_rules: Vec<Vec<u8>>,
     /// Raw JSON of the maintenance object, present only while maintenance mode is on; empty = absent.
     pub maintenance: Vec<u8>,
+    /// The app is served over HTTPS by the agent itself: present only in gateway mode.
+    pub tls: Option<TlsEntry>,
+}
+
+/// The `tls` object of an app as sent, before any check (`crate::tls::entry`). It never carries key
+/// material or a chain: the agent keeps the bundle in plain text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlsEntry {
+    pub listen: String,
+    pub hosts: Vec<String>,
+    pub redirect_listen: String,
+    /// `""`, `acme` or `uploaded`.
+    pub source: String,
+    /// The certificate of an uploaded source, by id and by the SHA-256 of its leaf.
+    pub certificate_id: String,
+    pub leaf_sha256: String,
+    /// A new id asks the agent to order a certificate now.
+    pub acme_request_id: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -150,7 +168,7 @@ fn raw_slice(
     })
 }
 
-const APP_FIELDS: [&str; 16] = [
+const APP_FIELDS: [&str; 17] = [
     "app_id",
     "listen_host",
     "listen_port",
@@ -167,7 +185,40 @@ const APP_FIELDS: [&str; 16] = [
     "custom_tuning_rules",
     "maintenance",
     "fcgi_keep_conn",
+    "tls",
 ];
+
+const TLS_FIELDS: [&str; 7] = [
+    "listen",
+    "hosts",
+    "redirect_listen",
+    "source",
+    "certificate_id",
+    "leaf_sha256",
+    "acme_request_id",
+];
+
+fn decode_tls(d: &mut DecodeTrace, v: &Value, t: &mut TlsEntry) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.TLSEntry",
+        "TLSEntry",
+        &TLS_FIELDS,
+        |d, i, v| {
+            match i {
+                0 => json_decode::string(d, v, &mut t.listen),
+                1 => json_decode::strings(d, v, &mut t.hosts)?,
+                2 => json_decode::string(d, v, &mut t.redirect_listen),
+                3 => json_decode::string(d, v, &mut t.source),
+                4 => json_decode::string(d, v, &mut t.certificate_id),
+                5 => json_decode::string(d, v, &mut t.leaf_sha256),
+                _ => json_decode::string(d, v, &mut t.acme_request_id),
+            }
+            Ok(())
+        },
+    )
+}
 
 fn decode_app(
     d: &mut DecodeTrace,
@@ -198,7 +249,8 @@ fn decode_app(
                 12 => raw_slice(d, sp, v, &mut a.custom_script_rules)?,
                 13 => raw_slice(d, sp, v, &mut a.custom_tuning_rules)?,
                 14 => a.maintenance = sp.raw(v),
-                _ => json_decode::boolean(d, v, &mut a.fcgi_keep_conn),
+                15 => json_decode::boolean(d, v, &mut a.fcgi_keep_conn),
+                _ => json_decode::optional(d, v, &mut a.tls, decode_tls)?,
             }
             Ok(())
         },
@@ -325,6 +377,45 @@ mod tests {
         assert_eq!(on, [true, false, false]);
         assert_eq!(b.apps[0].maintenance, br#"{"enabled":true}"#.to_vec());
         assert!(b.apps[1].maintenance.is_empty());
+    }
+
+    #[test]
+    fn the_tls_object_is_read_with_unknown_keys_ignored_and_wrong_types_refused() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"x","tls":{"listen":"0.0.0.0:443","Hosts":["a.example.com","b.example.com"],
+               "redirect_listen":"0.0.0.0:80","source":"uploaded","certificate_id":"c1","leaf_sha256":"ab",
+               "acme_request_id":"r1","future":{"k":[1]}}},{"app_id":"y"},{"app_id":"z","tls":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            b.apps[0].tls,
+            Some(TlsEntry {
+                listen: "0.0.0.0:443".into(),
+                hosts: vec!["a.example.com".into(), "b.example.com".into()],
+                redirect_listen: "0.0.0.0:80".into(),
+                source: "uploaded".into(),
+                certificate_id: "c1".into(),
+                leaf_sha256: "ab".into(),
+                acme_request_id: "r1".into(),
+            })
+        );
+        assert_eq!(b.apps[1].tls, None, "absent");
+        assert_eq!(b.apps[2].tls, None, "null");
+        let empty = decode_bundle(br#"{"apps":[{"tls":{}}]}"#).unwrap();
+        assert_eq!(empty.apps[0].tls, Some(TlsEntry::default()));
+
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"tls":{"hosts":"a.example.com"}}]}"#).unwrap_err(),
+            "apps.tls.hosts: expected an array of strings, got a string"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"tls":{"listen":443}}]}"#).unwrap_err(),
+            "apps.tls.listen: expected a string, got a number"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"tls":"yes"}]}"#).unwrap_err(),
+            "apps.tls: expected an object, got a string"
+        );
     }
 
     #[test]

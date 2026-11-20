@@ -5,6 +5,7 @@
 //! challenge) and hands the apps to [`crate::Proxy::apply`] as [`AppSpec`]s. Everything that
 //! needs Pingora or the FastCGI pool (upstream parsing, timeouts, pools) is built here.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,7 +24,7 @@ use wafio_domain::{
     ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config, timeout_or_default_ms,
 };
 
-use crate::cert_store::CertFiles;
+use crate::cert_store::BookEntry;
 use crate::maintenance::MaintenanceRoute;
 
 /// What one app's requests are analysed with. Immutable once applied; a bundle replaces it as
@@ -65,13 +66,13 @@ pub struct AppSpec {
     /// The `maintenance` object of the bundle app; empty = none.
     pub maintenance: Vec<u8>,
     pub analysis: Arc<AppAnalysisSetup>,
-    /// The agent serves the app over HTTPS itself (the local TLS sites file) and opens no listener
-    /// at the bundle's address for it; `None` = only the bundle listener, as before.
+    /// The agent serves the app over HTTPS itself (its bundle entry has a `tls` object) and opens
+    /// no listener at the bundle's address for it; `None` = only the bundle listener, as before.
     pub tls: Option<TlsSite>,
 }
 
-/// One app's HTTPS settings, kept on the agent and not sent by the control plane.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One app's HTTPS settings, from the bundle entry of the app.
+#[derive(Clone)]
 pub struct TlsSite {
     /// `host:port` of the TLS listener (an IPv6 host in brackets); apps naming the same address
     /// share it.
@@ -79,11 +80,23 @@ pub struct TlsSite {
     /// The host names the app answers for: lower case, no port, no trailing dot. SNI and `Host`
     /// are matched against them.
     pub hosts: Vec<String>,
-    /// The files the certificate is read from when a bundle is applied.
-    pub cert: CertFiles,
+    /// What the book serves for the app from this apply on; `None` leaves what it holds (the
+    /// certificate it served before, or nothing).
+    pub certificate: Option<BookEntry>,
     /// `host:port` of a plain listener that redirects these hosts to HTTPS once the app has a real
     /// certificate and answers HTTP-01 validations; `None` = no such listener.
     pub redirect_listen: Option<String>,
+}
+
+/// Prints no certificate: the entry holds a private key.
+impl fmt::Debug for TlsSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsSite")
+            .field("listen", &self.listen)
+            .field("hosts", &self.hosts)
+            .field("redirect_listen", &self.redirect_listen)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) enum Target {

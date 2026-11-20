@@ -14,6 +14,14 @@ path = "src/main.rs"
 # An agent that accepts an engine library owned by the user it runs as. For tests that cannot be root; a release build
 # never enables it.
 test-owner = ["wafio-engine-loader/test-owner"]
+# An agent whose key directory is the one WAFIO_TEST_TLS_DIR names, for tests that cannot own the fixed path; a release
+# build never enables it.
+test-tls = []
+
+# Starts the binary with a key directory of its own, which only a build with test-tls reads from the environment.
+[[test]]
+name = "tls_bundle"
+required-features = ["test-tls"]
 
 [dependencies]
 wafio-agent-io.workspace = true

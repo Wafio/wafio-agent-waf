@@ -240,11 +240,11 @@ impl TlsListener {
     }
 }
 
-/// The book entries for the apps of the TLS listeners of an apply, read from their files and put
-/// into `entries`. A host name may belong to one app only. Nothing is switched: the book follows
-/// once every listener of the apply is ready.
+/// The book entries for the apps of the TLS listeners of an apply, put into `entries`: an app that
+/// brings a certificate gets it, one that does not keeps what the book holds. A host name may
+/// belong to one app only. Nothing is switched: the book follows once every listener of the apply
+/// is ready.
 pub(crate) fn prepare_certificates(
-    book: &CertBook,
     sites: &[(Arc<Route>, TlsSite)],
     entries: &mut HashMap<String, Option<BookEntry>>,
 ) -> Result<(), String> {
@@ -257,12 +257,7 @@ pub(crate) fn prepare_certificates(
         }
     }
     for (route, site) in sites {
-        let key = book.load(&site.cert)?;
-        let entry = BookEntry {
-            key,
-            placeholder: false,
-        };
-        entries.insert(route.app_id().to_owned(), Some(entry));
+        entries.insert(route.app_id().to_owned(), site.certificate.clone());
     }
     Ok(())
 }

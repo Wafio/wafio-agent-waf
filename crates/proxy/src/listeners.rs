@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pingora::protocols::l4::listener::Listener as L4Listener;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::cert_store::CertBook;
@@ -26,6 +26,9 @@ use crate::route::{PlainSite, RouteApp, serve_connection, serve_redirect};
 
 /// How long the connections of a retired route may drain.
 pub const ROUTE_DRAIN_GRACE: Duration = Duration::from_secs(30);
+/// The error of an apply that could not bind an address its bundle names, so the caller can tell it
+/// from a refusal that no retry will change.
+pub const BIND_ERROR: &str = "failed to bind WAF route listener";
 const LISTEN_BACKLOG: u32 = 4096;
 
 /// What a listener address serves.
@@ -97,6 +100,8 @@ struct Live {
     stop: watch::Sender<bool>,
     /// A duplicate of the listening socket: stops it on retire, is handed to a successor.
     sock: StdListener,
+    /// Resolves when the accept loop no longer accepts; taken by the first `stop_accepting`.
+    accepting: Option<oneshot::Receiver<()>>,
     done: JoinHandle<()>,
 }
 
@@ -186,13 +191,13 @@ impl RouteManager {
                 );
             }
         }
-        // Certificates are read before anything binds or switches.
+        // The certificates the apps bring are collected before anything binds or switches.
         let mut certificates = HashMap::new();
         for spec in &specs {
             let Serves::Tls(sites) = &spec.serves else {
                 continue;
             };
-            prepare_certificates(&self.shared.book, sites, &mut certificates).map_err(|e| {
+            prepare_certificates(sites, &mut certificates).map_err(|e| {
                 tracing::warn!("TLS listener {}: {e}", spec.address);
                 "invalid TLS site settings".to_string()
             })?;
@@ -213,7 +218,7 @@ impl RouteManager {
                 Err(e) => {
                     give_back(&mut inner, fresh);
                     tracing::warn!("failed to bind WAF route listener {}: {e}", spec.address);
-                    return Err("failed to bind WAF route listener".into());
+                    return Err(BIND_ERROR.into());
                 }
             }
         }
@@ -233,7 +238,7 @@ impl RouteManager {
                 Err(e) => {
                     give_back(&mut inner, fresh);
                     tracing::warn!("failed to start WAF route listener {}: {e}", spec.address);
-                    return Err("failed to bind WAF route listener".into());
+                    return Err(BIND_ERROR.into());
                 }
             }
         }
@@ -317,6 +322,7 @@ impl RouteManager {
     /// Starts the accept loop of a new listener.
     fn launch(&self, (listener, dup): Opened, served: Served) -> Live {
         let (stop, rx) = watch::channel(false);
+        let (ended, accepting) = oneshot::channel();
         let done = tokio::spawn(accept_loop(
             listener,
             served.clone(),
@@ -324,11 +330,13 @@ impl RouteManager {
             self.drain,
             self.connection_limit,
             self.handshake_timeout,
+            ended,
         ));
         Live {
             served,
             stop,
             sock: dup,
+            accepting: Some(accepting),
             done,
         }
     }
@@ -342,25 +350,38 @@ impl RouteManager {
             .collect()
     }
 
-    /// Stops accepting on every listener and waits until their connections drained (or the
-    /// drain timeout passed). `handed_over`: a successor serves the same sockets, so they are
-    /// closed but not shut down. Later `apply` calls fail.
-    pub async fn shutdown(&self, handed_over: bool) {
-        let lives: Vec<Live> = {
+    /// Stops accepting on every listener and returns once no accept loop of this process accepts
+    /// any more; connections already accepted go on until `shutdown`. `handed_over`: a successor
+    /// serves the same sockets, so they are closed but not shut down. Later `apply` calls fail.
+    pub async fn stop_accepting(&self, handed_over: bool) {
+        let receivers: Vec<_> = {
             let mut inner = self.lock();
             inner.closed = true;
-            inner.live.drain().map(|(_, l)| l).collect()
+            inner
+                .live
+                .values_mut()
+                .filter_map(|live| {
+                    if !handed_over {
+                        close_listeners(&live.sock);
+                    }
+                    let _ = live.stop.send(true);
+                    live.accepting.take()
+                })
+                .collect()
         };
-        let mut waits = Vec::new();
-        for live in lives {
-            if !handed_over {
-                close_listeners(&live.sock);
-            }
-            let _ = live.stop.send(true);
-            waits.push(live.done);
+        for accepting in receivers {
+            // An error is a loop that ended another way: it accepts no more either.
+            let _ = accepting.await;
         }
-        for w in waits {
-            let _ = w.await;
+    }
+
+    /// Stops accepting on every listener and waits until their connections drained (or the
+    /// drain timeout passed). `handed_over`: as for `stop_accepting`. Later `apply` calls fail.
+    pub async fn shutdown(&self, handed_over: bool) {
+        self.stop_accepting(handed_over).await;
+        let lives: Vec<Live> = self.lock().live.drain().map(|(_, l)| l).collect();
+        for live in lives {
+            let _ = live.done.await;
         }
     }
 }
@@ -422,6 +443,7 @@ async fn accept_loop(
     drain: Duration,
     connection_limit: usize,
     handshake_timeout: Duration,
+    ended: oneshot::Sender<()>,
 ) {
     let listener = L4Listener::from(listener);
     let mut conns = JoinSet::new();
@@ -480,6 +502,7 @@ async fn accept_loop(
         }
     }
     drop(listener);
+    let _ = ended.send(());
     let _ = tokio::time::timeout(drain, async { while conns.join_next().await.is_some() {} }).await;
     if !conns.is_empty() {
         tracing::info!(

@@ -800,10 +800,7 @@ mod tests {
             tls: edge.then(|| TlsSite {
                 listen: "0.0.0.0:443".into(),
                 hosts: vec!["shop.test".into()],
-                cert: crate::cert_store::CertFiles {
-                    certificate: "shop.crt".into(),
-                    key: "shop.key".into(),
-                },
+                certificate: None,
                 redirect_listen: None,
             }),
         })
