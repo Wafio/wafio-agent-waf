@@ -7,7 +7,11 @@ use super::*;
 use crate::executor::startup_executor;
 use crate::ready::ReadyActions;
 use crate::tls::dir::tests::{Scratch, my_uid};
+use crate::tls::install::tests::{Made, fixture};
+use crate::tls::pacer::{Offer, Offers, Statuses};
+use crate::tls::status::REFUSED_SETTINGS;
 use crate::tls::tests::make_pem;
+use std::time::Duration;
 
 /// Records what the proxy would get; fails when told to.
 #[derive(Default)]
@@ -16,6 +20,9 @@ struct FakeProxy {
     /// The HTTPS site of each app of each apply.
     tls: Mutex<Vec<Vec<Option<wafio_proxy::TlsSite>>>>,
     fail: Mutex<Option<String>>,
+    /// What an apply that fails with `BIND_ERROR` says it could not bind.
+    unbound: Mutex<Option<(String, std::io::ErrorKind)>>,
+    book: Arc<CertBook>,
 }
 
 impl RouteSink for FakeProxy {
@@ -32,7 +39,21 @@ impl RouteSink for FakeProxy {
             .lock()
             .unwrap()
             .push(apps.iter().map(|a| a.tls.clone()).collect());
+        // The book follows the bundle, as the proxy's does.
+        self.book.follow(
+            apps.iter()
+                .filter_map(|a| Some((a.app_id.clone(), a.tls.as_ref()?.certificate.clone())))
+                .collect(),
+        );
         Ok(())
+    }
+
+    fn certificates(&self) -> Arc<CertBook> {
+        self.book.clone()
+    }
+
+    fn bind_failure(&self) -> Option<(String, std::io::ErrorKind)> {
+        self.unbound.lock().unwrap().clone()
     }
 }
 
@@ -660,11 +681,446 @@ fn rate_limit_unblock_and_login_scope() {
     );
 }
 
+const ACME_APP: &str = "1a2b3c4d-0000-4000-8000-000000000002";
+const BARE_APP: &str = "1a2b3c4d-0000-4000-8000-000000000003";
+const NO_CERT_APP: &str = "1a2b3c4d-0000-4000-8000-000000000004";
+
+/// An agent with a key directory and the statuses it offers, which the test reads.
+fn agent_with_statuses() -> (Arc<Agent>, Arc<FakeProxy>, Scratch, Offers) {
+    let scratch = Scratch::new();
+    let stores = Stores::new();
+    let base = startup_executor(&stores, "", None).unwrap();
+    let proxy = Arc::new(FakeProxy::default());
+    let (statuses, offers) = Statuses::channel();
+    let a = Agent::new(
+        base,
+        stores,
+        proxy.clone(),
+        Arc::new(VerifiedBotChecker::new()),
+        Arc::new(Ready::new(ReadyActions::default())),
+    )
+    .with_statuses(statuses)
+    .with_key_dir(KeyDir::open(&scratch.dir(), my_uid()).unwrap());
+    (Arc::new(a), proxy, scratch, offers)
+}
+
+fn install_of(made: &Made, app: &str, cert: &str) -> CertificateInstall {
+    CertificateInstall {
+        command_id: "c1".into(),
+        app_id: app.into(),
+        certificate_id: cert.into(),
+        chain_pem: made.cert.clone(),
+        key_pem: made.key.clone(),
+        leaf_sha256: made.leaf.clone(),
+    }
+}
+
+/// The offer a call made, which must be the only one.
+fn only(offers: &mut Offers) -> Offer {
+    let mut all = offers.drain();
+    assert_eq!(all.len(), 1, "one offer");
+    all.remove(0)
+}
+
+fn states(offer: &Offer) -> Vec<(String, String, String)> {
+    offer
+        .statuses
+        .iter()
+        .map(|s| (s.app_id.clone(), s.source.clone(), s.state.clone()))
+        .collect()
+}
+
 #[test]
-fn every_install_is_answered_not_in_bundle_while_the_agent_keeps_no_certificates() {
-    let mut install = CertificateInstall::default();
+fn an_uploaded_certificate_is_installed_served_from_the_next_handshake_and_reported_active() {
+    let (a, proxy, dir, mut offers) = agent_with_statuses();
+    let f = fixture();
+    let shop = app_json(
+        SHOP,
+        18080,
+        Some(&tls_object("shop.example.com", CERT, &f.ec.leaf)),
+    );
+    apply(&a, &bundle_of(std::slice::from_ref(&shop)), 1).unwrap();
+
+    // The bundle names a certificate the agent does not hold: it asks for it.
+    a.report_bundle();
+    let first = only(&mut offers);
+    assert!(first.forced && first.whole);
     assert_eq!(
-        Certificates.install(&mut install),
+        states(&first),
+        [(SHOP.into(), "uploaded".into(), "missing".into())]
+    );
+    let missing = &first.statuses[0];
+    assert_eq!(missing.certificate_id, CERT);
+    assert!(missing.chain_pem.is_empty() && missing.leaf_sha256.is_empty());
+    assert_eq!((missing.error.as_str(), missing.next_attempt_unix), ("", 0));
+    assert!(proxy.certificates().get(SHOP).is_none());
+
+    let mut install = install_of(&f.ec, SHOP, CERT);
+    assert_eq!(Certificates(a.clone()).install(&mut install), Ok(()));
+    let held = proxy.certificates().get(SHOP).expect("the book serves it");
+    assert_eq!(wafio_proxy::cert_store::leaf_sha256(&held.key), f.ec.leaf);
+    assert!(dir.dir().join(format!("{CERT}.pem")).exists());
+
+    // `active` with the chain as DER gives it, and with the certificate named.
+    let second = only(&mut offers);
+    assert!(!second.forced && !second.whole);
+    let active = &second.statuses[0];
+    assert_eq!(
+        (active.state.as_str(), active.certificate_id.as_str()),
+        ("active", CERT)
+    );
+    assert_eq!(active.leaf_sha256, f.ec.leaf);
+    assert_eq!(active.chain_pem, f.ec.cert);
+    assert_eq!(active.request_id, "");
+
+    // The next bundle that names it hands the proxy the key that is in the book, and reports it.
+    apply(&a, &bundle_of(&[shop]), 2).unwrap();
+    let site = proxy.tls.lock().unwrap().last().unwrap()[0]
+        .clone()
+        .unwrap();
+    let BookChange::Set(entry) = site.certificate else {
+        panic!("the proxy gets the certificate");
+    };
+    assert!(Arc::ptr_eq(&entry.key, &held.key));
+    a.report_bundle();
+    assert_eq!(
+        states(&only(&mut offers)),
+        [(SHOP.into(), "uploaded".into(), "active".into())]
+    );
+}
+
+#[test]
+fn an_install_for_what_the_bundle_does_not_name_is_not_in_bundle_and_nothing_is_kept() {
+    let (a, proxy, dir, mut offers) = agent_with_statuses();
+    let f = fixture();
+    let tls = tls_object("shop.example.com", CERT, &f.ec.leaf);
+    apply(&a, &bundle_of(&[app_json(SHOP, 18080, Some(&tls))]), 1).unwrap();
+    let sink = Certificates(a.clone());
+    for (what, mut install) in [
+        (
+            "an app that is not in the bundle",
+            install_of(&f.ec, BLOG, CERT),
+        ),
+        (
+            "a certificate id the bundle does not name",
+            install_of(&f.ec, SHOP, ORPHAN),
+        ),
+        (
+            "a leaf the bundle does not name",
+            install_of(&f.rsa, SHOP, CERT),
+        ),
+    ] {
+        assert_eq!(
+            sink.install(&mut install),
+            Err(AckCode::NotInBundle),
+            "{what}"
+        );
+    }
+    assert!(offers.drain().is_empty(), "a refusal reports nothing");
+    assert!(proxy.certificates().get(SHOP).is_none());
+    assert!(!dir.dir().join(format!("{CERT}.pem")).exists());
+
+    // An app that was in the bundle and left it.
+    apply(&a, &bundle_of(&[app_json(BLOG, 18081, None)]), 2).unwrap();
+    let mut install = install_of(&f.ec, SHOP, CERT);
+    assert_eq!(sink.install(&mut install), Err(AckCode::NotInBundle));
+    assert!(proxy.certificates().get(SHOP).is_none());
+
+    // An agent with no key directory takes no certificate either.
+    let (plain, _, _) = agent();
+    let mut install = install_of(&f.ec, SHOP, CERT);
+    assert_eq!(
+        Certificates(plain).install(&mut install),
         Err(AckCode::NotInBundle)
     );
+}
+
+const ORPHAN: &str = "7e1f3a90-2c1d-4b8e-9a55-1d3c4f6a8b02";
+
+#[test]
+fn only_an_app_with_a_certificate_to_report_gets_a_status_after_a_bundle() {
+    let (a, _proxy, _dir, mut offers) = agent_with_statuses();
+    let f = fixture();
+    let listen =
+        |port: u16| format!(r#""listen":"0.0.0.0:{port}","hosts":["h{port}.example.com"]"#);
+    let shop = app_json(
+        SHOP,
+        18080,
+        Some(&tls_object("shop.example.com", CERT, &f.ec.leaf)),
+    );
+    let acme = app_json(
+        ACME_APP,
+        18081,
+        Some(&format!(
+            "{{{},\"source\":\"acme\",\"acme_request_id\":\"r1\"}}",
+            listen(444)
+        )),
+    );
+    let empty = app_json(
+        BARE_APP,
+        18082,
+        Some(&format!("{{{},\"source\":\"\"}}", listen(445))),
+    );
+    let none = app_json(
+        NO_CERT_APP,
+        18083,
+        Some(&format!("{{{},\"source\":\"uploaded\"}}", listen(446))),
+    );
+    let plain = app_json(BLOG, 18084, None);
+    apply(&a, &bundle_of(&[shop, acme, empty, none, plain]), 1).unwrap();
+    a.report_bundle();
+    let offer = only(&mut offers);
+    assert!(offer.forced && offer.whole);
+    assert_eq!(
+        states(&offer),
+        [(SHOP.into(), "uploaded".into(), "missing".into())],
+        "no status for source empty, for uploaded without a certificate, or for an app without a tls entry; an ordered certificate reports through its order"
+    );
+}
+
+#[test]
+fn a_bundle_refused_for_its_tls_settings_gives_each_gateway_app_in_it_failed_with_a_fixed_phrase() {
+    let (a, _proxy, _dir, mut offers) = agent_with_statuses();
+    let f = fixture();
+    let tls = tls_object("shop.example.com", CERT, &f.ec.leaf);
+    let shop = app_json(SHOP, 18080, Some(&tls));
+    apply(&a, &bundle_of(std::slice::from_ref(&shop)), 1).unwrap();
+    assert_eq!(
+        a.install_certificate(&install_of(&f.ec, SHOP, CERT)),
+        Ok(())
+    );
+    offers.drain();
+
+    let bad = r#"{"listen":"0.0.0.0:443","hosts":["*.example.com"],"source":"uploaded","certificate_id":"7e1f3a90-2c1d-4b8e-9a55-1d3c4f6a8b02","leaf_sha256":"abababababababababababababababababababababababababababababababab"}"#;
+    let acme = r#"{"listen":"0.0.0.0:444","hosts":["acme.example.com"],"source":"acme","acme_request_id":"r1"}"#;
+    let empty = r#"{"listen":"0.0.0.0:445","hosts":["bare.example.com"],"source":""}"#;
+    let refused = apply(
+        &a,
+        &bundle_of(&[
+            shop.clone(),
+            app_json(BLOG, 18081, Some(bad)),
+            app_json(ACME_APP, 18082, Some(acme)),
+            app_json(BARE_APP, 18083, Some(empty)),
+            app_json(NO_CERT_APP, 18084, None),
+        ]),
+        2,
+    );
+    assert_eq!(
+        refused,
+        Err(BundleError::Apply("invalid TLS site settings".into()))
+    );
+    a.report_bundle();
+    let offer = only(&mut offers);
+    assert!(
+        offer.forced && !offer.whole,
+        "the apps that are not named keep what they have"
+    );
+    assert_eq!(
+        states(&offer),
+        [
+            (SHOP.into(), "uploaded".into(), "failed".into()),
+            (ACME_APP.into(), "acme".into(), "failed".into()),
+            (BLOG.into(), "uploaded".into(), "failed".into()),
+        ]
+    );
+    for s in &offer.statuses {
+        assert_eq!(s.error, REFUSED_SETTINGS);
+        assert_eq!(s.next_attempt_unix, 0);
+    }
+    let [shop_status, acme_status, blog_status] = &offer.statuses[..] else {
+        panic!("three statuses");
+    };
+    // The uploaded one names its certificate, the ordered one the request its bundle carries.
+    assert_eq!(blog_status.certificate_id, ORPHAN);
+    assert_eq!(acme_status.request_id, "r1");
+    // The certificate an app is served meanwhile stays described.
+    assert_eq!(shop_status.leaf_sha256, f.ec.leaf);
+    assert_eq!(shop_status.chain_pem, f.ec.cert);
+    assert!(blog_status.chain_pem.is_empty() && acme_status.chain_pem.is_empty());
+}
+
+#[test]
+fn a_bundle_refused_for_an_address_it_cannot_bind_says_which_and_why_for_an_https_address_only() {
+    let (a, proxy, _dir, mut offers) = agent_with_statuses();
+    let f = fixture();
+    let tls = |listen: &str, redirect: &str| {
+        format!(
+            r#"{{"listen":"{listen}","hosts":["shop.example.com"],"redirect_listen":"{redirect}","source":"uploaded","certificate_id":"{CERT}","leaf_sha256":"{}"}}"#,
+            f.ec.leaf
+        )
+    };
+    let acme = r#"{"listen":"127.0.0.1:18444","hosts":["acme.example.com"],"source":"acme","acme_request_id":"r1"}"#;
+    let bundle = |listen: &str, redirect: &str| {
+        bundle_of(&[
+            app_json(SHOP, 18080, Some(&tls(listen, redirect))),
+            app_json(ACME_APP, 18081, Some(acme)),
+            app_json(BLOG, 18082, None),
+        ])
+    };
+    let fail = |address: &str| {
+        *proxy.fail.lock().unwrap() = Some(wafio_proxy::listeners::BIND_ERROR.into());
+        *proxy.unbound.lock().unwrap() = Some((address.into(), std::io::ErrorKind::AddrInUse));
+    };
+
+    // The HTTPS address, and then the redirect address: every gateway app of the bundle fails.
+    for address in ["127.0.0.1:18443", "127.0.0.1:18080"] {
+        fail(address);
+        let got = apply(&a, &bundle("127.0.0.1:18443", "127.0.0.1:18080"), 1);
+        assert_eq!(
+            got,
+            Err(BundleError::Bind(wafio_proxy::listeners::BIND_ERROR.into()))
+        );
+        a.report_bundle();
+        let offer = only(&mut offers);
+        assert!(offer.forced && !offer.whole);
+        assert_eq!(offer.statuses.len(), 2);
+        for s in &offer.statuses {
+            assert_eq!(s.state, "failed");
+            assert_eq!(
+                s.error,
+                format!("cannot listen on {address}: address in use")
+            );
+        }
+    }
+
+    // An address of a plain app that cannot be bound is none of the HTTPS settings: the apps
+    // keep reporting the state they are in.
+    fail("127.0.0.1:18082");
+    assert!(apply(&a, &bundle("127.0.0.1:18443", "127.0.0.1:18080"), 1).is_err());
+    a.report_bundle();
+    let offer = only(&mut offers);
+    assert!(offer.whole, "nothing was applied, so no app is in force");
+    assert!(offer.statuses.is_empty());
+
+    // A refusal that has nothing to do with HTTPS is not reported as a failure of it either.
+    *proxy.fail.lock().unwrap() = Some("duplicate listener in WAF bundle".into());
+    assert!(apply(&a, &bundle("127.0.0.1:18443", "127.0.0.1:18080"), 1).is_err());
+    a.report_bundle();
+    assert!(only(&mut offers).statuses.is_empty());
+
+    // The same bundle once the address is free: the state of each app, and the old failure is not
+    // reported again.
+    *proxy.fail.lock().unwrap() = None;
+    apply(&a, &bundle("127.0.0.1:18443", "127.0.0.1:18080"), 1).unwrap();
+    a.report_bundle();
+    let offer = only(&mut offers);
+    assert_eq!(
+        states(&offer),
+        [(SHOP.into(), "uploaded".into(), "missing".into())]
+    );
+    a.report_bundle();
+    assert_eq!(states(&only(&mut offers)), states(&offer));
+}
+
+#[test]
+fn a_refusal_that_was_not_reported_is_not_reported_for_a_later_bundle_that_cannot_be_read() {
+    let (a, proxy, _dir, mut offers) = agent_with_statuses();
+    let f = fixture();
+    let tls = tls_object("shop.example.com", CERT, &f.ec.leaf);
+    let bundle = bundle_of(&[app_json(
+        SHOP,
+        18443,
+        Some(&tls.replace("0.0.0.0:443", "127.0.0.1:18443")),
+    )]);
+
+    // A bundle the proxy cannot bind, applied without anyone asking for a report, as the cached
+    // bundle of a start is.
+    *proxy.fail.lock().unwrap() = Some(wafio_proxy::listeners::BIND_ERROR.into());
+    *proxy.unbound.lock().unwrap() =
+        Some(("127.0.0.1:18443".into(), std::io::ErrorKind::AddrInUse));
+    let sink = Sink(a.clone());
+    assert!(sink.apply(bundle.as_bytes(), 1).is_err());
+
+    // A live bundle that does not decode never reaches the agent's apply: the control plane hears
+    // the state in force, not the failure of the bundle before it.
+    assert!(sink.apply(b"{", 2).is_err());
+    a.report_bundle();
+    let offer = only(&mut offers);
+    assert!(
+        offer.whole && offer.statuses.is_empty(),
+        "{:?}",
+        offer.statuses
+    );
+}
+
+#[test]
+fn an_agent_without_a_key_directory_reports_nothing() {
+    let stores = Stores::new();
+    let base = startup_executor(&stores, "", None).unwrap();
+    let (statuses, mut offers) = Statuses::channel();
+    let a = Agent::new(
+        base,
+        stores,
+        Arc::new(FakeProxy::default()),
+        Arc::new(VerifiedBotChecker::new()),
+        Arc::new(Ready::new(ReadyActions::default())),
+    )
+    .with_statuses(statuses);
+    let tls = tls_object("shop.example.com", CERT, &"ab".repeat(32));
+    apply(&a, &bundle_of(&[app_json(SHOP, 18080, Some(&tls))]), 1).unwrap();
+    a.report_bundle();
+    assert!(offers.drain().is_empty());
+}
+
+static GATE: (Mutex<u8>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// Reads the key as the agent does, but stops in the middle of the check until the test says go.
+fn gated_load(
+    der: &rustls::pki_types::PrivateKeyDer<'_>,
+) -> Result<Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
+    let mut step = GATE.0.lock().unwrap();
+    *step = 1;
+    GATE.1.notify_all();
+    let step = GATE.1.wait_while(step, |s| *s != 2).unwrap();
+    drop(step);
+    crate::tls::install::load_key(der)
+}
+
+#[test]
+fn a_bundle_cannot_be_applied_between_the_check_of_an_install_and_its_commit() {
+    let (a, proxy, dir) = agent_with_keys();
+    let f = fixture();
+    let tls = tls_object("shop.example.com", CERT, &f.ec.leaf);
+    apply(&a, &bundle_of(&[app_json(SHOP, 18080, Some(&tls))]), 1).unwrap();
+
+    let installer = {
+        let a = a.clone();
+        let install = install_of(&f.ec, SHOP, CERT);
+        std::thread::spawn(move || a.install_certificate_with(&install, gated_load))
+    };
+    // The install has read the bundle in force and is in the middle of its check.
+    let mut step = GATE.0.lock().unwrap();
+    while *step != 1 {
+        step = GATE
+            .1
+            .wait_timeout(step, Duration::from_secs(10))
+            .unwrap()
+            .0;
+    }
+    drop(step);
+
+    // A bundle that takes the app out waits for the lock.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let applier = {
+        let a = a.clone();
+        std::thread::spawn(move || {
+            let r = apply(&a, &bundle_of(&[app_json(BLOG, 18081, None)]), 2);
+            done_tx.send(()).unwrap();
+            r
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the bundle applied while an install was between its check and its commit"
+    );
+    *GATE.0.lock().unwrap() = 2;
+    GATE.1.notify_all();
+
+    // The install commits against the bundle it checked, and then the bundle takes the app out:
+    // nothing is served for it, and its file goes.
+    assert_eq!(installer.join().unwrap(), Ok(()));
+    applier.join().unwrap().unwrap();
+    assert!(proxy.certificates().get(SHOP).is_none());
+    assert!(!dir.dir().join(format!("{CERT}.pem")).exists());
+    assert_eq!(a.generation().0, 2);
 }

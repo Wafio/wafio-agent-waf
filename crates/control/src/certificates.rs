@@ -47,6 +47,11 @@ impl AckCode {
 /// reallocation frees the old block unzeroed. It parses the key from the slice.
 pub trait CertificateSink: Send + Sync + 'static {
     fn install(&self, install: &mut CertificateInstall) -> Result<(), AckCode>;
+
+    /// A live configuration bundle has just been handled: applied, or refused on the first try or
+    /// on a retry. Not called for the cached bundle of the start, nor for a management command.
+    /// Runs on the blocking thread that applied it, so it must not wait for anything slow.
+    fn bundle_finished(&self) {}
 }
 
 /// Hands the install to the sink on a blocking thread. A panic in the sink is a refusal that may

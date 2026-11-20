@@ -45,13 +45,17 @@ libc.workspace = true
 nix.workspace = true
 mimalloc.workspace = true
 pingora.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 sha2.workspace = true
+# start_paused: the status pacing is seconds and minutes long.
+tokio = { workspace = true, features = ["test-util"] }
 tonic.workspace = true
 wafio-proto.workspace = true

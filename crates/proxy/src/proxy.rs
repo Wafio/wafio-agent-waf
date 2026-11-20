@@ -193,6 +193,12 @@ impl Proxy {
         self.manager.certificates()
     }
 
+    /// The address and the error kind behind the last `apply` that failed with
+    /// `listeners::BIND_ERROR`. Read it before the next apply.
+    pub fn bind_failure(&self) -> Option<(String, std::io::ErrorKind)> {
+        self.manager.bind_failure()
+    }
+
     /// Live listen addresses.
     pub fn addresses(&self) -> Vec<String> {
         self.manager.addresses()

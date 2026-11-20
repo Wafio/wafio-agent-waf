@@ -58,6 +58,8 @@ prost = "0.14"
 protox = "0.10"
 regex = "1.12"
 regex-syntax = "0.8"
+# The TLS library the proxy already links, with the ring provider only (no aws-lc-rs). Direct here for the signing keys of uploaded certificates.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # PEM files of the TLS listeners' certificates; already in the tree through rustls, and the maintained successor of rustls-pemfile.
 rustls-pki-types = "1.16"
 sd-notify = "0.5"
@@ -71,6 +73,8 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tracing = "0.1"
 unicode-normalization = "0.1"
+# Wipes the key of an uploaded certificate from the buffers the agent made for it; already in the tree through rustls-pki-types.
+zeroize = "1"
 
 [profile.release]
 lto = "fat"

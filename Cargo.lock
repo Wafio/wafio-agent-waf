@@ -3262,6 +3262,7 @@ dependencies = [
  "mimalloc",
  "nix",
  "pingora",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -3283,6 +3284,7 @@ dependencies = [
  "wafio-malware",
  "wafio-proto",
  "wafio-proxy",
+ "zeroize",
 ]
 
 [[package]]

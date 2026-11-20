@@ -176,7 +176,10 @@ impl KeyDir {
         if !meta.is_file() {
             return Err(ReadError::Other(io::Error::other("not a regular file")));
         }
-        let mut data = Vec::new();
+        // Room for the whole file from the start: a file with a key in it must not be copied by a
+        // growing buffer that leaves the old copies unwiped.
+        let size = usize::try_from(meta.len()).unwrap_or(limit);
+        let mut data = Vec::with_capacity(size.min(limit) + 1);
         file.take(limit as u64 + 1)
             .read_to_end(&mut data)
             .map_err(ReadError::Other)?;

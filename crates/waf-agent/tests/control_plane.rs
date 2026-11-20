@@ -1,6 +1,6 @@
 //! Black-box test with the real binary: an in-test fake control plane (tonic, mTLS with the
 //! control crate's fixture CA) checks what `wafio-waf-agent` sends — Hello (kind, version,
-//! the features `script_rules`, `maintenance_mode` and `no_semantic_engine`), the first heartbeat with host info and
+//! the features `script_rules`, `maintenance_mode`, `tls_certificates` and `no_semantic_engine`), the first heartbeat with host info and
 //! counters, the malware sync
 //! into the security-data dir given by `--security-data-dir`, the bundle ack, READY after the
 //! live bundle, the bundle cache, a block decision with its credentials redacted, the refusal of a
@@ -251,8 +251,13 @@ async fn agent_talks_to_the_control_plane() {
     assert_eq!(h.agent_version, "wafio-waf-agent/dev");
     assert_eq!(
         h.features,
-        vec!["script_rules", "maintenance_mode", "no_semantic_engine"],
-        "the agent runs script rules and serves the maintenance page itself, and this binary has no engine"
+        vec![
+            "script_rules",
+            "maintenance_mode",
+            "tls_certificates",
+            "no_semantic_engine"
+        ],
+        "the agent runs script rules, serves the maintenance page itself and has a key directory it can use, and this binary has no engine"
     );
 
     // The stream: Hello, then the first heartbeat with host info and the agent's counters.
@@ -364,8 +369,8 @@ async fn agent_talks_to_the_control_plane() {
     }
     assert_eq!(std::fs::read(&installed).unwrap(), malware);
 
-    // An install is refused as not named by the bundle (the agent keeps no uploaded certificate
-    // yet), and the key reaches neither the ack nor the log.
+    // An install for an app the bundle does not have is refused as not named by it, and the key
+    // reaches neither the ack nor the log.
     c.out
         .send(Ok(ServerMessage {
             kind: Some(In::CertificateInstall(CertificateInstall {

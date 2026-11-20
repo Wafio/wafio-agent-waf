@@ -14,6 +14,8 @@ use std::fmt;
 use std::hash::Hash;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use pingora::tls::sign::CertifiedKey;
 use pingora::tls::{CryptoProvider, ResolvesServerCert, RusTlsError, ServerConfig, version};
 use rustls_pki_types::pem::{Error as PemError, PemObject};
@@ -286,10 +288,57 @@ pub fn certified_key_from_pem(pem: &[u8]) -> Result<CertifiedKey, PairFault> {
 /// Lower case hex SHA-256 of the DER of the leaf of the chain of `key`, which is how the control
 /// plane names a certificate.
 pub fn leaf_sha256(key: &CertifiedKey) -> String {
-    Sha256::digest(key.cert[0].as_ref())
+    sha256_hex(key.cert[0].as_ref())
+}
+
+/// Lower case hex SHA-256 of `der`.
+pub fn sha256_hex(der: &[u8]) -> String {
+    Sha256::digest(der)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The characters of one line of base64 in a PEM block.
+const PEM_LINE: usize = 64;
+
+/// The length of the text `push_pem_block` appends for `der_len` bytes under `label`, so a caller
+/// that holds a key can reserve it first and no growth leaves a copy of the key behind.
+pub fn pem_block_len(label: &str, der_len: usize) -> usize {
+    let body = der_len.div_ceil(3) * 4;
+    (label.len() + 17) + (label.len() + 15) + body + body.div_ceil(PEM_LINE)
+}
+
+/// Appends `der` as one PEM block, lines of 64 characters. The base64 of each line passes through
+/// a buffer that is cleared again, as `der` may be a key.
+pub fn push_pem_block(label: &str, der: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(format!("-----BEGIN {label}-----\n").as_bytes());
+    let mut line = [0u8; PEM_LINE];
+    for chunk in der.chunks(PEM_LINE / 4 * 3) {
+        let n = STANDARD
+            .encode_slice(chunk, &mut line)
+            .expect("a line has room for 48 bytes in base64");
+        out.extend_from_slice(&line[..n]);
+        out.push(b'\n');
+    }
+    line.fill(0);
+    // Without this the compiler may drop the writes: the buffer is not read again.
+    std::hint::black_box(&line);
+    out.extend_from_slice(format!("-----END {label}-----\n").as_bytes());
+}
+
+/// The certificates of a chain as PEM text, in order. This is what a chain reads back as when its
+/// DER is all that is held.
+pub fn chain_pem(chain: &[CertificateDer<'_>]) -> Vec<u8> {
+    let len = chain
+        .iter()
+        .map(|c| pem_block_len("CERTIFICATE", c.as_ref().len()))
+        .sum();
+    let mut out = Vec::with_capacity(len);
+    for cert in chain {
+        push_pem_block("CERTIFICATE", cert.as_ref(), &mut out);
+    }
+    out
 }
 
 /// The rustls config of a TLS listener: TLS 1.2 and 1.3, certificates from `resolver`. ALPN lists
@@ -314,6 +363,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use pingora::tls::SignatureScheme;
+    use rustls_pki_types::pem;
 
     /// A certificate chain (leaf first) and its private key, both PEM files.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -430,6 +480,36 @@ pub(crate) mod tests {
         assert_eq!(fault(&torn), PairFault::NotPem);
         for f in [PairFault::NotPem, PairFault::KeyMismatch, PairFault::NoKey] {
             assert!(!f.to_string().contains("PRIVATE"), "{f}");
+        }
+    }
+
+    #[test]
+    fn blocks_are_written_as_openssl_writes_them_and_read_back_the_same() {
+        let dir = Scratch::new();
+        let files = dir.pair("live");
+        let (cert, key_text) = (
+            fs::read(&files.certificate).unwrap(),
+            fs::read(&files.key).unwrap(),
+        );
+        // The same text as the tool wrote: 64 characters a line, the newline at the end.
+        assert_eq!(chain_pem(&chain_of(&files)), cert);
+        let key = PrivateKeyDer::from_pem_slice(&key_text).unwrap();
+        let mut out = Vec::new();
+        push_pem_block("PRIVATE KEY", key.secret_der(), &mut out);
+        assert_eq!(out, key_text);
+
+        // The size is exact at every length around a line and a group of three bytes, and what is
+        // written decodes to the bytes that went in.
+        for len in 1..200 {
+            let der: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let mut out = Vec::with_capacity(pem_block_len("CERTIFICATE", len));
+            push_pem_block("CERTIFICATE", &der, &mut out);
+            assert_eq!(out.len(), pem_block_len("CERTIFICATE", len), "{len}");
+            assert_eq!(out.capacity(), out.len(), "no growth at {len}");
+            let sections: Vec<_> = <(pem::SectionKind, Vec<u8>)>::pem_slice_iter(&out)
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(sections, [(pem::SectionKind::Certificate, der)], "{len}");
         }
     }
 
