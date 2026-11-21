@@ -17,7 +17,10 @@ use wafio_agent_pages::iprep::{
     AddressRange, FIREHOL_LEVEL1_LIST_URL, FIREHOL_LEVEL2_LIST_URL, IPREP_USER_AGENT,
     ReputationChecker, parse_netset_partial,
 };
-use wafio_control::{AgentStats, ControlConfig, ControlLink, HeartbeatCounters, Hooks};
+use wafio_control::{
+    AckCode, AgentStats, CertificateInstall, CertificateSink, ControlConfig, ControlLink,
+    HeartbeatCounters, Hooks,
+};
 
 use crate::agent::{Agent, Certificates, Sink};
 use crate::executor::{Stores, startup_executor};
@@ -25,6 +28,7 @@ use crate::flags::{AgentArgs, OsEnv};
 use crate::ready::{Ready, ReadyActions};
 use crate::reload::{UpgradeState, spawn_successor};
 use crate::tls::dir::KeyDir;
+use crate::tls::pacer::{self, Statuses};
 
 /// The control link, once created (the proxy's decision sink exists before it).
 static LINK: OnceLock<Arc<ControlLink>> = OnceLock::new();
@@ -39,6 +43,9 @@ const KEY_LOCK_POLL: Duration = Duration::from_millis(200);
 const IPREP_REFRESH: Duration = Duration::from_secs(24 * 3600);
 /// The `Hello.features` entry of an agent that serves the maintenance page.
 const FEATURE_MAINTENANCE_MODE: &str = "maintenance_mode";
+/// The `Hello.features` entry of an agent that serves apps over HTTPS from its key directory: it
+/// takes `CertificateInstall` and sends `CertificateStatus`.
+pub const FEATURE_TLS_CERTIFICATES: &str = "tls_certificates";
 
 struct Stats;
 
@@ -94,9 +101,15 @@ pub fn test_hooks() -> Hooks {
             Ok(())
         }
     }
+    struct NoCertificates;
+    impl CertificateSink for NoCertificates {
+        fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
+            Err(AckCode::NotInBundle)
+        }
+    }
     Hooks {
         bundles: Arc::new(AcceptAll),
-        certificates: Arc::new(Certificates),
+        certificates: Arc::new(NoCertificates),
         stats: Arc::new(Stats),
         security_data: Arc::new(crate::security_data::AgentSecurityData),
         redact: crate::redact::mask_decision_event,
@@ -283,6 +296,11 @@ pub async fn run_waf_agent(
         crate::script_rules::FEATURE_SCRIPT_RULES.into(),
         FEATURE_MAINTENANCE_MODE.into(),
     ];
+    // Only an agent that could use its key directory at start takes certificates: without one the
+    // `tls` objects of its bundles are ignored, and the control plane must not send a key.
+    if keys.is_some() {
+        cfg.features.push(FEATURE_TLS_CERTIFICATES.into());
+    }
     if !wafio_engine_api::engine().info().installed {
         cfg.features
             .push(crate::gaps::FEATURE_NO_SEMANTIC_ENGINE.into());
@@ -386,13 +404,15 @@ pub async fn run_waf_agent(
     }));
     opts.inherited = inherited;
     let proxy = Arc::new(wafio_proxy::Proxy::new(opts));
+    let (statuses, offers) = Statuses::channel();
     let mut agent = Agent::new(
         base,
         stores,
         proxy.clone(),
         good_bots.clone(),
         ready.clone(),
-    );
+    )
+    .with_statuses(statuses);
     if let Some(dir) = keys {
         agent = agent.with_key_dir(dir);
     }
@@ -402,7 +422,7 @@ pub async fn run_waf_agent(
         cfg,
         Hooks {
             bundles: Arc::new(Sink(agent.clone())),
-            certificates: Arc::new(Certificates),
+            certificates: Arc::new(Certificates(agent.clone())),
             stats: Arc::new(Stats),
             security_data: Arc::new(crate::security_data::AgentSecurityData),
             redact: crate::redact::mask_decision_event,
@@ -410,6 +430,10 @@ pub async fn run_waf_agent(
         },
     );
     let _ = LINK.set(link.clone());
+    let status_link = link.clone();
+    tokio::spawn(pacer::run(offers, move |status| {
+        status_link.report_certificate_status(status)
+    }));
 
     // Probe the control plane: credential errors exit; an outage starts from the cache.
     if let Err(e) = link.exchange_hello().await {

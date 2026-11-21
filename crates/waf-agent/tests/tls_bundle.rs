@@ -6,6 +6,7 @@
 //! the whole bundle. Keys are made by `openssl` at test time into a scratch directory that is
 //! removed when the test ends.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::net::TcpListener;
@@ -33,8 +34,8 @@ use wafio_proto::v1::agent_control_server::{AgentControl, AgentControlServer};
 use wafio_proto::v1::agent_message::Kind as Out;
 use wafio_proto::v1::server_message::Kind as In;
 use wafio_proto::v1::{
-    AgentMessage, BundleUpdate, MalwareDatabaseChunk, MalwareDatabaseRequest, ServerMessage,
-    Welcome,
+    AgentMessage, BundleUpdate, CertificateInstall, CertificateStatus, MalwareDatabaseChunk,
+    MalwareDatabaseRequest, ServerMessage, Welcome,
 };
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../control/tests/fixtures");
@@ -122,6 +123,13 @@ fn answer_requests(
             }
         }
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn openssl(args: &[&str]) {
@@ -216,6 +224,9 @@ fn client_config(authority: Vec<u8>) -> Arc<ClientConfig> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // A resumed session skips the server's certificate, so a test that asks which one a new
+    // handshake gets must not resume.
+    config.resumption = rustls::client::Resumption::disabled();
     Arc::new(config)
 }
 
@@ -319,6 +330,15 @@ impl Https {
         self.read().await
     }
 
+    /// The SHA-256 of the leaf the server presented in the handshake.
+    fn peer_leaf(&self) -> String {
+        let (_, session) = self.0.get_ref().get_ref();
+        let chain = session
+            .peer_certificates()
+            .expect("the server sent a chain");
+        sha256_hex(chain[0].as_ref())
+    }
+
     fn alpn(&self) -> Option<Vec<u8>> {
         let (_, session) = self.0.get_ref().get_ref();
         session.alpn_protocol().map(<[u8]>::to_vec)
@@ -408,6 +428,9 @@ struct Setup {
     client: Arc<ClientConfig>,
     /// The key and the certificate, as one key file holds them.
     pem: String,
+    /// The chain and the key as the control plane sends them.
+    chain: String,
+    key: String,
     /// A line of the key's own body: if any output holds this, it holds the key.
     key_body: String,
     leaf: String,
@@ -440,11 +463,10 @@ impl Setup {
             upstream: Upstream::start(),
             client: client_config(authority),
             key_body: key_text.lines().nth(1).unwrap().to_owned(),
-            pem: key_text + &fs::read_to_string(certificate).unwrap(),
-            leaf: Sha256::digest(der)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
+            pem: key_text.clone() + &fs::read_to_string(&certificate).unwrap(),
+            chain: fs::read_to_string(&certificate).unwrap(),
+            key: key_text,
+            leaf: sha256_hex(&der),
             dir,
             plain,
             https,
@@ -889,15 +911,81 @@ async fn a_process_that_finds_the_key_directory_locked_serves_what_it_reads_and_
 struct Conn {
     inbound: Streaming<AgentMessage>,
     out: mpsc::Sender<Result<ServerMessage, Status>>,
+    /// Messages read while waiting for another one, in the order they came.
+    backlog: VecDeque<AgentMessage>,
+    /// Every message the agent sent on this connection, as Rust prints it: a byte field is a list
+    /// of numbers, a text field is text.
+    received: Vec<String>,
 }
 
 impl Conn {
-    async fn next(&mut self) -> AgentMessage {
-        tokio::time::timeout(Duration::from_secs(30), self.inbound.message())
+    fn new(
+        inbound: Streaming<AgentMessage>,
+        out: mpsc::Sender<Result<ServerMessage, Status>>,
+    ) -> Conn {
+        Conn {
+            inbound,
+            out,
+            backlog: VecDeque::new(),
+            received: Vec::new(),
+        }
+    }
+
+    async fn read(&mut self) -> AgentMessage {
+        let message = tokio::time::timeout(Duration::from_secs(30), self.inbound.message())
             .await
             .expect("agent message")
             .unwrap()
-            .expect("stream open")
+            .expect("stream open");
+        self.received.push(format!("{message:?}"));
+        message
+    }
+
+    async fn next(&mut self) -> AgentMessage {
+        match self.backlog.pop_front() {
+            Some(message) => message,
+            None => self.read().await,
+        }
+    }
+
+    /// Reads what the agent sends for `wait`, and keeps it.
+    async fn drain_for(&mut self, wait: Duration) {
+        let end = tokio::time::Instant::now() + wait;
+        while let Ok(read) = tokio::time::timeout_at(end, self.inbound.message()).await {
+            let message = read.unwrap().expect("stream open");
+            self.received.push(format!("{message:?}"));
+            self.backlog.push_back(message);
+        }
+    }
+
+    /// The first message `pick` takes. What comes before it waits for the next call.
+    async fn wait_for<T>(&mut self, pick: impl Fn(&AgentMessage) -> Option<T>) -> T {
+        if let Some(at) = self.backlog.iter().position(|m| pick(m).is_some()) {
+            let message = self.backlog.remove(at).unwrap();
+            return pick(&message).unwrap();
+        }
+        loop {
+            let message = self.read().await;
+            match pick(&message) {
+                Some(found) => return found,
+                None => self.backlog.push_back(message),
+            }
+        }
+    }
+
+    async fn send(&mut self, kind: In) {
+        self.out
+            .send(Ok(ServerMessage { kind: Some(kind) }))
+            .await
+            .unwrap();
+    }
+
+    async fn ack(&mut self, id: &str) -> (bool, String) {
+        self.wait_for(|m| match &m.kind {
+            Some(Out::Ack(a)) if a.command_id == id => Some((a.ok, a.error.clone())),
+            _ => None,
+        })
+        .await
     }
 
     /// Sends `bundle` and returns the ack the agent answers it with.
@@ -907,19 +995,41 @@ impl Conn {
             generation,
             bundle_json: bundle.into_bytes(),
         };
-        self.out
-            .send(Ok(ServerMessage {
-                kind: Some(In::Bundle(bu)),
-            }))
-            .await
-            .unwrap();
-        loop {
-            if let Some(Out::Ack(a)) = self.next().await.kind
-                && a.command_id == id
-            {
-                return (a.ok, a.error);
+        self.send(In::Bundle(bu)).await;
+        self.ack(id).await
+    }
+
+    /// Sends a `CertificateInstall` and returns the ack the agent answers it with.
+    async fn install(
+        &mut self,
+        id: &str,
+        app: &str,
+        cert: &str,
+        chain: &str,
+        key: &str,
+        leaf: &str,
+    ) -> (bool, String) {
+        let install = CertificateInstall {
+            command_id: id.into(),
+            app_id: app.into(),
+            certificate_id: cert.into(),
+            chain_pem: chain.as_bytes().to_vec(),
+            key_pem: key.as_bytes().to_vec(),
+            leaf_sha256: leaf.into(),
+        };
+        self.send(In::CertificateInstall(install)).await;
+        self.ack(id).await
+    }
+
+    /// The next status of `app` in `state`.
+    async fn status(&mut self, app: &str, state: &str) -> CertificateStatus {
+        self.wait_for(|m| match &m.kind {
+            Some(Out::CertificateStatus(s)) if s.app_id == app && s.state == state => {
+                Some(s.clone())
             }
-        }
+            _ => None,
+        })
+        .await
     }
 }
 
@@ -945,10 +1055,7 @@ impl AgentControl for Fake {
         }))
         .await
         .unwrap();
-        let _ = self.conns.send(Conn {
-            inbound: req.into_inner(),
-            out: tx,
-        });
+        let _ = self.conns.send(Conn::new(req.into_inner(), tx));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -967,12 +1074,12 @@ fn fx(name: &str) -> Vec<u8> {
     fs::read(Path::new(FIXTURES).join(name)).unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_one_serves_on() {
-    let s = Setup::new("refused");
+/// A control plane the agent connects to, with mutual TLS as the real one has. Every connection
+/// the agent makes comes out of the channel.
+async fn serve_fake() -> (String, mpsc::UnboundedReceiver<Conn>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let cp = listener.local_addr().unwrap().to_string();
-    let (tx, mut conns) = mpsc::unbounded_channel();
+    let address = listener.local_addr().unwrap().to_string();
+    let (tx, conns) = mpsc::unbounded_channel();
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(fx("server.crt"), fx("server.key")))
         .client_ca_root(Certificate::from_pem(fx("ca.crt")));
@@ -983,23 +1090,36 @@ async fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_o
             .add_service(AgentControlServer::new(Fake { conns: tx }))
             .serve_with_incoming(TcpIncoming::from(listener)),
     );
-    let agent = Agent::spawn(&s, &cp, |_| {});
+    (address, conns)
+}
 
-    // The start probe, then the stream.
+/// The two connections an agent makes at start, the probe and the stream, each past its Hello.
+/// Returns the features both said and the stream.
+async fn connect_agent(conns: &mut mpsc::UnboundedReceiver<Conn>) -> (Vec<String>, Conn) {
     let mut probe = tokio::time::timeout(Duration::from_secs(30), conns.recv())
         .await
         .unwrap()
         .unwrap();
-    let Some(Out::Hello(_)) = probe.next().await.kind else {
+    let Some(Out::Hello(first)) = probe.next().await.kind else {
         panic!("probe: no Hello")
     };
-    let mut c = tokio::time::timeout(Duration::from_secs(30), conns.recv())
+    let mut stream = tokio::time::timeout(Duration::from_secs(30), conns.recv())
         .await
         .unwrap()
         .unwrap();
-    let Some(Out::Hello(_)) = c.next().await.kind else {
+    let Some(Out::Hello(second)) = stream.next().await.kind else {
         panic!("stream: no Hello")
     };
+    assert_eq!(first.features, second.features);
+    (second.features, stream)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_one_serves_on() {
+    let s = Setup::new("refused");
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |_| {});
+    let (_, mut c) = connect_agent(&mut conns).await;
 
     let shop = s.shop(&s.tls_object());
     let (ok, error) = c
@@ -1034,4 +1154,397 @@ async fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_o
     assert!(ok, "{error}");
     assert_eq!(fresh.send(&get("/four")).await.unwrap().status, 200);
     s.assert_log_has_no_key();
+}
+
+const CERT2: &str = "9c2d4e11-5a7b-4c3d-8e6f-0a1b2c3d4e5f";
+
+/// A second certificate for `HOST` from the authority `make_pki` left in `dir`: the certificate
+/// text, the key text and the SHA-256 of the leaf.
+fn sign_again(dir: &Path, name: &str) -> (String, String, String) {
+    let path = |ext: &str| {
+        dir.join(format!("{name}.{ext}"))
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (key, csr, crt) = (path("key"), path("csr"), path("crt"));
+    let (ca_crt, ca_key, ext) = (
+        dir.join("ca.crt").to_str().unwrap().to_owned(),
+        dir.join("ca.key").to_str().unwrap().to_owned(),
+        dir.join("shop.ext").to_str().unwrap().to_owned(),
+    );
+    openssl(&[
+        "req",
+        "-new",
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:prime256v1",
+        "-nodes",
+        "-subj",
+        &format!("/CN={HOST}"),
+        "-keyout",
+        &key,
+        "-out",
+        &csr,
+    ]);
+    openssl(&[
+        "x509",
+        "-req",
+        "-in",
+        &csr,
+        "-CA",
+        &ca_crt,
+        "-CAkey",
+        &ca_key,
+        "-CAcreateserial",
+        "-days",
+        "2",
+        "-extfile",
+        &ext,
+        "-out",
+        &crt,
+    ]);
+    let der = Command::new("openssl")
+        .args(["x509", "-in", &crt, "-outform", "DER"])
+        .output()
+        .expect("openssl is installed")
+        .stdout;
+    (
+        fs::read_to_string(&crt).unwrap(),
+        fs::read_to_string(&key).unwrap(),
+        sha256_hex(&der),
+    )
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The numbers Rust prints for a byte field.
+fn as_numbers(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What would give a key away: the lines of its base64 and the bytes they encode.
+struct KeyNeedles {
+    lines: Vec<String>,
+    der: Vec<u8>,
+}
+
+impl KeyNeedles {
+    fn of(key_text: &str) -> KeyNeedles {
+        use std::io::Write;
+        let mut child = Command::new("openssl")
+            .args(["pkey", "-outform", "DER"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("openssl is installed");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(key_text.as_bytes())
+            .unwrap();
+        let der = child.wait_with_output().unwrap().stdout;
+        assert!(der.len() > 30, "the key was read");
+        KeyNeedles {
+            lines: key_text
+                .lines()
+                .filter(|l| !l.starts_with("-----") && l.len() >= 16)
+                .map(str::to_owned)
+                .collect(),
+            der,
+        }
+    }
+
+    /// The key is where a key is kept: the lines of its text are in `file`.
+    fn assert_in_file(&self, file: &[u8]) {
+        assert!(self.lines.iter().all(|l| contains(file, l.as_bytes())));
+    }
+
+    fn assert_absent(&self, what: &str, bytes: &[u8]) {
+        for line in &self.lines {
+            assert!(
+                !contains(bytes, line.as_bytes()),
+                "a line of the key is in {what}"
+            );
+        }
+        assert!(
+            !contains(bytes, &self.der),
+            "the DER of the key is in {what}"
+        );
+        assert!(!contains(bytes, b"PRIVATE KEY"), "a key block is in {what}");
+    }
+
+    /// Absent from messages as Rust prints them: as text, or as the numbers of a byte field.
+    fn assert_absent_from_messages(&self, messages: &[String]) {
+        for shown in messages {
+            for line in &self.lines {
+                assert!(
+                    !shown.contains(line.as_str()) && !shown.contains(&as_numbers(line.as_bytes())),
+                    "a line of the key is in a message: {shown}"
+                );
+            }
+            assert!(
+                !shown.contains(&as_numbers(&self.der)),
+                "the DER of the key is in a message: {shown}"
+            );
+            assert!(
+                !shown.contains("PRIVATE KEY") && !shown.contains(&as_numbers(b"PRIVATE KEY")),
+                "a key block is in a message: {shown}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uploaded_certificate_is_installed_acked_reported_and_replaced_without_a_restart() {
+    let s = Setup::new("install");
+    // The directory starts with no certificate: the control plane has to send it.
+    let first_file = s.keys.join(format!("{CERT}.pem"));
+    fs::remove_file(&first_file).unwrap();
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |_| {});
+    let (features, mut c) = connect_agent(&mut conns).await;
+    assert!(
+        features.iter().any(|f| f == "tls_certificates"),
+        "an agent with a key directory takes certificates: {features:?}"
+    );
+
+    // A bundle that names a certificate the agent does not hold: it says so, asking for it, and
+    // serves nothing for the app.
+    let (ok, error) = c
+        .bundle("b1", 1, s.bundle(&[s.shop(&s.tls_object())]))
+        .await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    let missing = c.status(SHOP, "missing").await;
+    assert_eq!(
+        (
+            missing.source.as_str(),
+            missing.certificate_id.as_str(),
+            missing.request_id.as_str()
+        ),
+        ("uploaded", CERT, "")
+    );
+    assert!(
+        missing.chain_pem.is_empty() && missing.leaf_sha256.is_empty() && missing.unix_time > 0
+    );
+    assert!(Https::connect(s.https, &s.client, HOST).await.is_err());
+
+    // What the bundle does not name is not installed, and nothing is written for it.
+    let refused = c
+        .install("i0", SHOP, ORPHAN, &s.chain, &s.key, &s.leaf)
+        .await;
+    assert_eq!(refused, (false, "not_in_bundle".to_owned()));
+    let wrong_leaf = "ab".repeat(32);
+    let refused = c
+        .install("i0b", SHOP, CERT, &s.chain, &s.key, &wrong_leaf)
+        .await;
+    assert_eq!(refused, (false, "not_in_bundle".to_owned()));
+    assert!(!first_file.exists());
+
+    // The pair the bundle names: acked ok, then `active` with the chain in use.
+    let acked = c.install("i1", SHOP, CERT, &s.chain, &s.key, &s.leaf).await;
+    assert_eq!(acked, (true, String::new()));
+    let active = c.status(SHOP, "active").await;
+    assert_eq!(
+        (active.certificate_id.as_str(), active.leaf_sha256.as_str()),
+        (CERT, s.leaf.as_str())
+    );
+    assert_eq!(
+        active.chain_pem,
+        s.chain.as_bytes(),
+        "the chain as the certificate is served"
+    );
+    let mut open = Https::connect(s.https, &s.client, HOST).await.unwrap();
+    assert_eq!(open.peer_leaf(), s.leaf);
+    assert_eq!(open.send(&get("/one")).await.unwrap().status, 200);
+    let needles = KeyNeedles::of(&s.key);
+    needles.assert_in_file(&fs::read(&first_file).unwrap());
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&first_file).unwrap().permissions())
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        files(&s.keys),
+        [
+            format!("{CERT}.pem"),
+            "state.json".into(),
+            "tls.lock".into()
+        ]
+    );
+
+    // A replace: the bundle names another certificate. The one in use is served until it arrives,
+    // the status says so with the chain in use, and the install changes what the next handshake
+    // gets, with no restart and an open connection going on.
+    let (chain2, key2, leaf2) = sign_again(&s.dir, "second");
+    let (ok, error) = c
+        .bundle(
+            "b2",
+            2,
+            s.bundle(&[s.shop(&s.tls_object().replace(CERT, CERT2).replace(&s.leaf, &leaf2))]),
+        )
+        .await;
+    assert!(ok, "{error}");
+    let waiting = c.status(SHOP, "missing").await;
+    assert_eq!(waiting.certificate_id, CERT2);
+    assert_eq!(
+        (waiting.chain_pem.as_slice(), waiting.leaf_sha256.as_str()),
+        (s.chain.as_bytes(), s.leaf.as_str()),
+        "the certificate that is still served"
+    );
+    let mut during = Https::connect(s.https, &s.client, HOST).await.unwrap();
+    assert_eq!(during.peer_leaf(), s.leaf);
+    let acked = c.install("i2", SHOP, CERT2, &chain2, &key2, &leaf2).await;
+    assert_eq!(acked, (true, String::new()));
+    let replaced = c.status(SHOP, "active").await;
+    assert_eq!(
+        (
+            replaced.certificate_id.as_str(),
+            replaced.leaf_sha256.as_str()
+        ),
+        (CERT2, leaf2.as_str())
+    );
+    let mut fresh = Https::connect(s.https, &s.client, HOST).await.unwrap();
+    assert_eq!(
+        fresh.peer_leaf(),
+        leaf2,
+        "a new handshake gets the new certificate"
+    );
+    assert_eq!(fresh.send(&get("/two")).await.unwrap().status, 200);
+    assert_eq!(
+        open.peer_leaf(),
+        s.leaf,
+        "an open connection keeps what it was given"
+    );
+    assert_eq!(open.send(&get("/three")).await.unwrap().status, 200);
+    assert_eq!(during.send(&get("/four")).await.unwrap().status, 200);
+    assert!(alive(agent.first), "the agent did not restart");
+    assert_eq!(
+        files(&s.keys),
+        [
+            format!("{CERT2}.pem"),
+            "state.json".into(),
+            "tls.lock".into()
+        ]
+    );
+
+    // No byte of either key left the process but in its file: not in a message the control plane
+    // got, not in the bundle cache, not in the log.
+    c.drain_for(Duration::from_millis(500)).await;
+    let second = KeyNeedles::of(&key2);
+    // The check sees a key where a message holds bytes: the numbers it looks for are the ones
+    // Rust prints.
+    let leaked = format!(
+        "{:?}",
+        CertificateStatus {
+            chain_pem: needles.der.clone(),
+            ..Default::default()
+        }
+    );
+    assert!(leaked.contains(&as_numbers(&needles.der)));
+    for keys in [&needles, &second] {
+        keys.assert_absent_from_messages(&c.received);
+        keys.assert_absent(
+            "the bundle cache",
+            &fs::read(s.dir.join("state/last-bundle.json")).unwrap(),
+        );
+        keys.assert_absent("the log", s.log_text().as_bytes());
+    }
+    second.assert_in_file(&fs::read(s.keys.join(format!("{CERT2}.pem"))).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_that_cannot_bind_its_https_address_is_refused_and_its_gateway_apps_are_failed() {
+    let s = Setup::new("unbound");
+    let (cp, mut conns) = serve_fake().await;
+    let _agent = Agent::spawn(&s, &cp, |_| {});
+    let (_, mut c) = connect_agent(&mut conns).await;
+
+    // Something else listens on the HTTPS address.
+    let _taken = TcpListener::bind(("127.0.0.1", s.https)).unwrap();
+    let (ok, error) = c
+        .bundle("b1", 1, s.bundle(&[s.shop(&s.tls_object())]))
+        .await;
+    assert_eq!(
+        (ok, error.as_str()),
+        (false, "failed to bind WAF route listener")
+    );
+    let failed = c.status(SHOP, "failed").await;
+    assert_eq!(
+        failed.error,
+        format!("cannot listen on 127.0.0.1:{}: address in use", s.https)
+    );
+    assert_eq!(
+        (failed.source.as_str(), failed.certificate_id.as_str()),
+        ("uploaded", CERT)
+    );
+    assert!(failed.chain_pem.is_empty(), "no certificate was served");
+    // The bundle is tried again a minute after it was refused, for as long as it takes.
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    assert!(
+        (now + 30..=now + 60).contains(&failed.next_attempt_unix),
+        "{} against {now}",
+        failed.next_attempt_unix
+    );
+    // The plain address of the app was never opened either.
+    assert!(TcpStream::connect(("127.0.0.1", s.plain)).await.is_err());
+    s.assert_log_has_no_key();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_without_a_usable_key_directory_leaves_the_feature_out_and_takes_no_certificate() {
+    let mut s = Setup::new("no-dir-hello");
+    s.keys_env = s.dir.join("missing/tls");
+    let (cp, mut conns) = serve_fake().await;
+    let _agent = Agent::spawn(&s, &cp, |_| {});
+    let (features, mut c) = connect_agent(&mut conns).await;
+    assert!(
+        !features.iter().any(|f| f == "tls_certificates"),
+        "the control plane must not send a key to this agent: {features:?}"
+    );
+    assert!(features.iter().any(|f| f == "script_rules"));
+
+    // The warning names the directory and the cause, once, however often the agent connects.
+    let log = s.log_text();
+    assert_eq!(
+        log.matches("does not serve apps over HTTPS").count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        log.contains("missing/tls") && log.contains("cannot create"),
+        "{log}"
+    );
+
+    // The `tls` object is ignored: the app is served as its bundle says, and no status is sent.
+    let (ok, error) = c
+        .bundle("b1", 1, s.bundle(&[s.shop(&s.tls_object())]))
+        .await;
+    assert!(ok, "{error}");
+    let r = plain(s.plain, HOST, "/").await.unwrap();
+    assert_eq!((r.status, r.body.as_str()), (200, "ok"));
+    let refused = c.install("i1", SHOP, CERT, &s.chain, &s.key, &s.leaf).await;
+    assert_eq!(refused, (false, "not_in_bundle".to_owned()));
+    c.drain_for(Duration::from_secs(1)).await;
+    assert!(
+        !c.received.iter().any(|m| m.contains("CertificateStatus")),
+        "{:?}",
+        c.received
+    );
+    KeyNeedles::of(&s.key).assert_absent_from_messages(&c.received);
 }

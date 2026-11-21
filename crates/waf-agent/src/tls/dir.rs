@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use wafio_control::{TempGuard, create_temp};
+use zeroize::Zeroizing;
 
 /// The directory of a running agent. The unit's `StateDirectory` is its parent.
 pub const KEY_DIR: &str = "/var/lib/wafio-waf-agent/tls";
@@ -176,14 +177,18 @@ impl KeyDir {
         if !meta.is_file() {
             return Err(ReadError::Other(io::Error::other("not a regular file")));
         }
-        let mut data = Vec::new();
+        // Room for the whole file from the start: a file with a key in it must not be copied by a
+        // growing buffer that leaves the old copies unwiped. The buffer is wiped when a read fails
+        // or the file is too large too; only a whole file is handed on, to a caller that wipes it.
+        let size = usize::try_from(meta.len()).unwrap_or(limit);
+        let mut data = Zeroizing::new(Vec::with_capacity(size.min(limit) + 1));
         file.take(limit as u64 + 1)
             .read_to_end(&mut data)
             .map_err(ReadError::Other)?;
         if data.len() > limit {
             return Err(ReadError::TooLarge);
         }
-        Ok(data)
+        Ok(std::mem::take(&mut *data))
     }
 
     /// Puts `data` under `name`, whole or not at all: written to a temporary file, synced, renamed

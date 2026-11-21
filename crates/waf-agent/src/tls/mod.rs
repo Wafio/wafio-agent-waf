@@ -7,17 +7,23 @@
 
 pub mod dir;
 pub mod entry;
+pub(crate) mod install;
+pub mod pacer;
 pub mod state_file;
+pub mod status;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pingora::tls::sign::CertifiedKey;
-use wafio_proxy::cert_store::{BookEntry, certified_key_from_pem, leaf_sha256};
+use wafio_control::{AckCode, CertificateInstall};
+use wafio_proxy::cert_store::{BookEntry, CertBook, leaf_sha256};
+use zeroize::Zeroizing;
 
 use crate::bundle::BundleApp;
 use dir::{KeyDir, MAX_KEY_FILE, ReadError};
-use entry::{Refusal, Settings, check, is_known_source};
+use entry::{Refusal, Settings, Source, check, is_known_source};
+use install::{LoadKey, Secrets, load_key, pair_from_file, verify_and_store};
 use state_file::{AppRecord, STATE_FILE, StateFile, is_key_file};
 
 /// The certificate an app is served with, and where it came from.
@@ -162,8 +168,10 @@ impl Keys {
 
     /// Reads `file` and builds its key. With `leaf` the certificate must be that one.
     fn load(&self, file: &str, leaf: Option<&str>) -> Result<Served, Fault> {
-        let pem = self.dir.read(file, MAX_KEY_FILE).map_err(Fault::Read)?;
-        let key = certified_key_from_pem(&pem).map_err(Fault::Pem)?;
+        // The file holds the key, so the text is wiped once the key is read from it, and so is
+        // the DER of the key.
+        let pem = Zeroizing::new(self.dir.read(file, MAX_KEY_FILE).map_err(Fault::Read)?);
+        let key = pair_from_file(&pem, &mut Secrets::default(), load_key).map_err(Fault::Pem)?;
         let leaf_sha256 = leaf_sha256(&key);
         if leaf.is_some_and(|want| want != leaf_sha256) {
             return Err(Fault::OtherLeaf);
@@ -173,6 +181,82 @@ impl Keys {
             leaf_sha256,
             key: Arc::new(key),
         })
+    }
+
+    /// Installs an uploaded certificate for an app of the bundle in force: checks it, writes its
+    /// file, serves it from the next handshake on and drops the file it replaces. The caller holds
+    /// the apply lock for all of it, so the bundle the checks read is the one in force when the
+    /// certificate is switched in.
+    ///
+    /// The checks, first failure wins: the bundle names this app, certificate and leaf for an
+    /// uploaded source; the certificate is not held already (then there is nothing to do); then
+    /// those of `install::verify_and_store`; then the write.
+    pub(crate) fn install(
+        &mut self,
+        install: &CertificateInstall,
+        book: &CertBook,
+        secrets: &mut Secrets,
+        load: LoadKey,
+    ) -> Result<(), AckCode> {
+        let app = self
+            .applied
+            .get(&install.app_id)
+            .ok_or(AckCode::NotInBundle)?;
+        let named = app
+            .settings
+            .certificate
+            .as_ref()
+            .filter(|c| {
+                app.settings.source == Source::Uploaded
+                    && c.id == install.certificate_id
+                    && c.leaf_sha256 == install.leaf_sha256
+            })
+            .ok_or(AckCode::NotInBundle)?;
+        let file = format!("{}.pem", named.id);
+        if app
+            .served
+            .as_ref()
+            .is_some_and(|s| s.file == file && s.leaf_sha256 == named.leaf_sha256)
+        {
+            return Ok(());
+        }
+        let leaf = named.leaf_sha256.clone();
+        let mut written = None;
+        verify_and_store(install, secrets, load, |key, text| {
+            self.dir.write(&file, text).map_err(|e| {
+                tracing::info!("[tls] cannot write {file}: {}", e.kind());
+                AckCode::WriteFailed
+            })?;
+            written = Some(Served {
+                file: file.clone(),
+                leaf_sha256: leaf,
+                key,
+            });
+            Ok(())
+        })?;
+        let served = written.expect("the write ran");
+        if !book.set(&install.app_id, served.key.clone(), false) {
+            // The book does not hold the app: it is not in the bundle that is in force.
+            let _ = self.dir.remove(&file);
+            return Err(AckCode::NotInBundle);
+        }
+        self.serve(&install.app_id, served);
+        Ok(())
+    }
+
+    /// Records that `app_id` is served `served` now, in the state file too, and drops the files
+    /// that nothing needs any more: the certificate it replaced.
+    fn serve(&mut self, app_id: &str, served: Served) {
+        self.state.apps.insert(
+            app_id.to_owned(),
+            AppRecord {
+                served: Some(served.file.clone()),
+            },
+        );
+        if let Some(app) = self.applied.get_mut(app_id) {
+            app.served = Some(served);
+        }
+        self.settle(&HashSet::new());
     }
 
     /// The bundle is in force: `next` is what is applied now. The state and the directory follow,
@@ -308,11 +392,13 @@ impl std::fmt::Display for Fault {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::install::tests::{Made, fixture, install_for};
     use super::*;
     use crate::bundle::decode_bundle;
     use dir::tests::{Scratch, my_uid};
     use std::path::Path;
     use std::process::Command;
+    use wafio_proxy::cert_store::{BookChange, certified_key_from_pem};
 
     const APP: &str = "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11";
     const OTHER_APP: &str = "6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90";
@@ -712,5 +798,182 @@ pub(crate) mod tests {
             .prepare(&apps(&[("shop", uploaded(X, &"ab".repeat(32)))]))
             .unwrap_err();
         assert_eq!(rejected.refusal.field, "app_id");
+    }
+
+    /// The book of an agent whose bundle has these apps and no certificate in it yet.
+    fn book_of(apps: &[&str]) -> CertBook {
+        let book = CertBook::default();
+        book.follow(
+            apps.iter()
+                .map(|a| ((*a).to_owned(), BookChange::Keep))
+                .collect(),
+        );
+        book
+    }
+
+    fn install_pair(
+        k: &mut Keys,
+        book: &CertBook,
+        made: &Made,
+        cert_id: &str,
+    ) -> Result<(), AckCode> {
+        let mut install = install_for(made);
+        install.app_id = APP.to_owned();
+        install.certificate_id = cert_id.to_owned();
+        k.install(&install, book, &mut Secrets::default(), load_key)
+    }
+
+    fn held_leaf(book: &CertBook, app: &str) -> Option<String> {
+        Some(leaf_sha256(&book.get(app)?.key))
+    }
+
+    #[test]
+    fn an_installed_certificate_is_written_served_and_the_one_it_replaces_goes() {
+        let s = Scratch::new();
+        let mut k = keys(&s);
+        let book = book_of(&[APP]);
+        let f = fixture();
+        let (x_file, y_file) = (format!("{X}.pem"), format!("{Y}.pem"));
+
+        apply(&mut k, &[(APP, uploaded(X, &f.ec.leaf))]);
+        assert_eq!(served(k.applied(), APP), None);
+        assert_eq!(install_pair(&mut k, &book, &f.ec, X), Ok(()));
+        assert_eq!(served(k.applied(), APP), Some(x_file.clone()));
+        assert_eq!(held_leaf(&book, APP), Some(f.ec.leaf.clone()));
+        assert_eq!(files(&s.dir()), [x_file.as_str(), STATE_FILE, "tls.lock"]);
+        let mode = std::fs::metadata(s.dir().join(&x_file)).unwrap();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
+            0o600
+        );
+        assert_eq!(
+            state_on_disk(&s.dir()).apps[APP].served.as_deref(),
+            Some(x_file.as_str())
+        );
+
+        // The bundle names Y: X stays served until Y is installed, and then X.pem goes.
+        apply(&mut k, &[(APP, uploaded(Y, &f.rsa.leaf))]);
+        assert_eq!(held_leaf(&book, APP), Some(f.ec.leaf.clone()));
+        assert_eq!(install_pair(&mut k, &book, &f.rsa, Y), Ok(()));
+        assert_eq!(held_leaf(&book, APP), Some(f.rsa.leaf.clone()));
+        assert_eq!(served(k.applied(), APP), Some(y_file.clone()));
+        assert_eq!(files(&s.dir()), [y_file.as_str(), STATE_FILE, "tls.lock"]);
+        assert_eq!(
+            state_on_disk(&s.dir()).apps[APP].served.as_deref(),
+            Some(y_file.as_str())
+        );
+        // What is on disk reads back as the pair that was installed.
+        let on_disk = std::fs::read(s.dir().join(&y_file)).unwrap();
+        assert_eq!(
+            leaf_sha256(&certified_key_from_pem(&on_disk).unwrap()),
+            f.rsa.leaf
+        );
+    }
+
+    fn install_with(made: &Made, app: &str, cert_id: &str) -> CertificateInstall {
+        let mut install = install_for(made);
+        install.app_id = app.to_owned();
+        install.certificate_id = cert_id.to_owned();
+        install
+    }
+
+    #[test]
+    fn an_install_the_bundle_does_not_name_is_refused_and_changes_nothing() {
+        let s = Scratch::new();
+        let mut k = keys(&s);
+        let book = book_of(&[APP]);
+        let f = fixture();
+        apply(&mut k, &[(APP, uploaded(X, &f.ec.leaf))]);
+        let before = files(&s.dir());
+        assert!(!before.iter().any(|f| f.ends_with(".pem")));
+
+        for (what, install) in [
+            (
+                "an app the bundle does not have",
+                install_with(&f.ec, OTHER_APP, X),
+            ),
+            (
+                "a leaf the bundle does not name",
+                install_with(&f.rsa, APP, X),
+            ),
+            (
+                "a certificate id the bundle does not name",
+                install_with(&f.ec, APP, Y),
+            ),
+        ] {
+            let got = k.install(&install, &book, &mut Secrets::default(), load_key);
+            assert_eq!(got, Err(AckCode::NotInBundle), "{what}");
+            assert_eq!(files(&s.dir()), before, "{what}");
+        }
+
+        // A source that is not uploaded, and one with no certificate named.
+        let acme = r#"{"listen":"0.0.0.0:443","hosts":["shop.example.com"],"source":"acme"}"#;
+        let bare = r#"{"listen":"0.0.0.0:443","hosts":["shop.example.com"],"source":"uploaded"}"#;
+        for (what, tls) in [("acme", acme), ("no certificate", bare)] {
+            apply(&mut k, &[(APP, tls.to_owned())]);
+            let got = install_pair(&mut k, &book, &f.ec, X);
+            assert_eq!(got, Err(AckCode::NotInBundle), "{what}");
+            assert!(
+                !files(&s.dir()).iter().any(|f| f.ends_with(".pem")),
+                "{what}"
+            );
+        }
+
+        // An app that left the bundle: the install that was sent for it is refused, and the app
+        // is not put back into the book.
+        apply(&mut k, &[(APP, uploaded(X, &f.ec.leaf))]);
+        let none = k.prepare(&[]).unwrap();
+        k.commit(none);
+        book.follow(HashMap::new());
+        assert_eq!(
+            install_pair(&mut k, &book, &f.ec, X),
+            Err(AckCode::NotInBundle)
+        );
+        assert!(book.get(APP).is_none());
+        assert!(!files(&s.dir()).iter().any(|f| f.ends_with(".pem")));
+    }
+
+    #[test]
+    fn a_certificate_that_is_held_is_acked_without_a_write_and_a_refused_one_leaves_no_trace() {
+        let s = Scratch::new();
+        let mut first = keys(&s);
+        let book = book_of(&[APP]);
+        let f = fixture();
+        apply(&mut first, &[(APP, uploaded(X, &f.ec.leaf))]);
+        assert_eq!(install_pair(&mut first, &book, &f.ec, X), Ok(()));
+
+        // A process that holds no lock cannot write: for what it holds the install is still
+        // acked, and for anything else it is the retryable refusal, with nothing left behind.
+        let mut second = keys(&s);
+        assert!(!second.holds_lock());
+        let book2 = book_of(&[APP]);
+        apply(&mut second, &[(APP, uploaded(X, &f.ec.leaf))]);
+        let before = files(&s.dir());
+        assert_eq!(install_pair(&mut second, &book2, &f.ec, X), Ok(()), "held");
+        assert_eq!(files(&s.dir()), before);
+
+        apply(&mut second, &[(APP, uploaded(Y, &f.rsa.leaf))]);
+        assert_eq!(
+            install_pair(&mut second, &book2, &f.rsa, Y),
+            Err(AckCode::WriteFailed)
+        );
+        assert_eq!(files(&s.dir()), before, "no file and no temporary file");
+        assert_eq!(served(second.applied(), APP), Some(format!("{X}.pem")));
+        assert_eq!(
+            held_leaf(&book2, APP),
+            None,
+            "and the book is as the bundle left it"
+        );
+
+        // A pair the checks refuse leaves the directory and the book as they were.
+        apply(&mut first, &[(APP, uploaded(Y, &f.rsa.leaf))]);
+        let before = files(&s.dir());
+        let mut bad = install_with(&f.rsa, APP, Y);
+        bad.key_pem = f.ec.key.clone();
+        let got = first.install(&bad, &book, &mut Secrets::default(), load_key);
+        assert_eq!(got, Err(AckCode::KeyMismatch));
+        assert_eq!(files(&s.dir()), before);
+        assert_eq!(held_leaf(&book, APP), Some(f.ec.leaf.clone()));
+        assert_eq!(served(first.applied(), APP), Some(format!("{X}.pem")));
     }
 }

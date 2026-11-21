@@ -8,10 +8,13 @@ use std::time::{Instant, SystemTime};
 use wafio_agent_pages::goodbot::VerifiedBotChecker;
 use wafio_application::RateLimitStore;
 use wafio_application::blocklist::BlockStore;
-use wafio_control::{AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink};
+use wafio_control::{
+    AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink, CertificateStatus,
+    WAF_BUNDLE_RETRY_MAX,
+};
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
-use wafio_proxy::cert_store::BookChange;
+use wafio_proxy::cert_store::{BookChange, CertBook};
 use wafio_proxy::{AppAnalysisSetup, AppSpec, TlsSite};
 
 use crate::bundle::{Bundle, BundleApp, UnblockEntry, decode_bundle};
@@ -19,17 +22,37 @@ use crate::executor::{BaseExecutor, Stores, executor_for_rules};
 use crate::ready::Ready;
 use crate::tls::dir::KeyDir;
 use crate::tls::entry::Settings;
+use crate::tls::install::{LoadKey, Secrets, load_key};
+use crate::tls::pacer::Statuses;
+use crate::tls::status;
 use crate::tls::{Applied, Keys, book_entry};
+
+/// What `Proxy::apply` says of a bundle whose `tls` settings it refuses.
+const TLS_SETTINGS_REFUSED: &str = "invalid TLS site settings";
 
 /// The proxy side (`wafio_proxy::Proxy::apply`): builds every route, binds every new
 /// address, then switches; any error changes nothing. A trait so tests can fake it.
 pub trait RouteSink: Send + Sync + 'static {
     fn apply(&self, apps: Vec<AppSpec>) -> Result<(), String>;
+
+    /// The certificates the TLS listeners serve.
+    fn certificates(&self) -> Arc<CertBook>;
+
+    /// The address and the error kind of the bind that failed the last `apply`.
+    fn bind_failure(&self) -> Option<(String, std::io::ErrorKind)>;
 }
 
 impl RouteSink for wafio_proxy::Proxy {
     fn apply(&self, apps: Vec<AppSpec>) -> Result<(), String> {
         wafio_proxy::Proxy::apply(self, apps)
+    }
+
+    fn certificates(&self) -> Arc<CertBook> {
+        wafio_proxy::Proxy::certificates(self)
+    }
+
+    fn bind_failure(&self) -> Option<(String, std::io::ErrorKind)> {
+        wafio_proxy::Proxy::bind_failure(self)
     }
 }
 
@@ -46,6 +69,9 @@ struct State {
     /// The key directory and what the apps with a `tls` object are served with; `None` when the
     /// agent has no usable key directory, which leaves the `tls` objects unread.
     tls: Option<Keys>,
+    /// The statuses of the apps of a bundle that was refused for a reason that concerns their
+    /// HTTPS settings; taken by `bundle_finished`, and cleared by the next apply.
+    refusal: Option<Vec<CertificateStatus>>,
 }
 
 /// The agent state minus the request path (the proxy crate's).
@@ -57,6 +83,8 @@ pub struct Agent {
     routes: Arc<dyn RouteSink>,
     good_bots: Arc<VerifiedBotChecker>,
     ready: Arc<Ready>,
+    /// Where the certificate statuses go; without it none is made.
+    statuses: Option<Statuses>,
 }
 
 fn apply_error(s: &str) -> BundleError {
@@ -86,7 +114,14 @@ impl Agent {
             routes,
             good_bots,
             ready,
+            statuses: None,
         }
+    }
+
+    /// The certificate statuses of the apps served over HTTPS are offered to `statuses`.
+    pub fn with_statuses(mut self, statuses: Statuses) -> Agent {
+        self.statuses = Some(statuses);
+        self
     }
 
     /// The agent serves the apps whose bundle entry has a `tls` object over HTTPS, from the
@@ -252,6 +287,7 @@ impl Agent {
         }
         // One apply at a time; the proxy call happens under it too.
         let mut st = self.lock();
+        st.refusal = None;
         // Generations are ordered only within one agent identity.
         if b.generation > 0 && b.generation < st.generation && b.agent_id == st.agent_id {
             return Err(apply_error("stale WAF bundle generation"));
@@ -267,16 +303,23 @@ impl Agent {
         let shared = Arc::new(shared);
         // The `tls` objects are checked and their certificates read before the first app is built;
         // an object that fails a check refuses the whole bundle, as an invalid route does.
-        let tls = match &st.tls {
+        let prepared = match &st.tls {
             Some(keys) => keys.prepare(&b.apps).map_err(|rejected| {
                 tracing::warn!(
                     "[waf-bundle] app {:?}: invalid TLS entry, {}",
                     rejected.app_id.chars().take(64).collect::<String>(),
                     rejected.refusal
                 );
-                apply_error("invalid TLS site settings")
-            })?,
-            None => HashMap::new(),
+                status::refused(&b.apps, keys.applied(), status::REFUSED_SETTINGS, 0)
+            }),
+            None => Ok(HashMap::new()),
+        };
+        let tls = match prepared {
+            Ok(tls) => tls,
+            Err(failed) => {
+                st.refusal = Some(failed);
+                return Err(apply_error(TLS_SETTINGS_REFUSED));
+            }
         };
         let mut executors: HashMap<String, (Arc<AppAnalysisSetup>, Stores)> = HashMap::new();
         let mut specs: Vec<AppSpec> = Vec::new();
@@ -345,13 +388,9 @@ impl Agent {
             // Binding refuses the port when the sockets are reserved.
             return Err(apply_error("failed to bind WAF route listener"));
         }
-        self.routes.apply(specs).map_err(|e| {
-            if e == wafio_proxy::listeners::BIND_ERROR {
-                BundleError::Bind(e)
-            } else {
-                BundleError::Apply(e)
-            }
-        })?;
+        if let Err(e) = self.routes.apply(specs) {
+            return Err(self.refused_by_proxy(&mut st, &b.apps, &tls, e));
+        }
         crate::script_rules::set_apps_with_script_rules(with_scripts);
         st.shared = Some(shared);
         st.per_app = executors;
@@ -369,6 +408,87 @@ impl Agent {
         self.release_unblocked_entries(&b.unblock_entries);
         self.ready.signal();
         Ok(())
+    }
+}
+
+impl Agent {
+    /// The error of a bundle the proxy refused. When the cause is one of the HTTPS settings, the
+    /// apps with a `tls` entry get a `failed` status that says what, for the control plane to show.
+    fn refused_by_proxy(
+        &self,
+        st: &mut State,
+        apps: &[BundleApp],
+        tls: &HashMap<String, Applied>,
+        error: String,
+    ) -> BundleError {
+        if error == wafio_proxy::listeners::BIND_ERROR {
+            // Only an address of an HTTPS or redirect listener tells of a failed HTTPS setting.
+            let failure = self.routes.bind_failure().filter(|(address, _)| {
+                tls.values().any(|a| {
+                    a.settings.listen == *address
+                        || a.settings.redirect_listen.as_deref() == Some(address.as_str())
+                })
+            });
+            if let (Some((address, kind)), Some(keys)) = (failure, &st.tls) {
+                let why = format!("cannot listen on {address}: {kind}");
+                // The bundle is tried again after the longest wait, for as long as it takes.
+                let retry_at =
+                    status::unix_now().saturating_add_unsigned(WAF_BUNDLE_RETRY_MAX.as_secs());
+                st.refusal = Some(status::refused(apps, keys.applied(), &why, retry_at));
+            }
+            BundleError::Bind(error)
+        } else {
+            if error == TLS_SETTINGS_REFUSED
+                && let Some(keys) = &st.tls
+            {
+                st.refusal = Some(status::refused(
+                    apps,
+                    keys.applied(),
+                    status::REFUSED_SETTINGS,
+                    0,
+                ));
+            }
+            BundleError::Apply(error)
+        }
+    }
+
+    /// Checks an uploaded certificate against the bundle in force and, if it holds, serves it from
+    /// the next handshake on. The apply lock is held for all of it. The buffers that hold the key
+    /// are wiped on every way out, a panic included.
+    pub fn install_certificate(&self, install: &CertificateInstall) -> Result<(), AckCode> {
+        self.install_certificate_with(install, load_key)
+    }
+
+    /// `install_certificate` with the function that reads the key, which a test replaces to stop
+    /// an install between its check and its commit.
+    pub(crate) fn install_certificate_with(
+        &self,
+        install: &CertificateInstall,
+        load: LoadKey,
+    ) -> Result<(), AckCode> {
+        let mut secrets = Secrets::default();
+        let mut guard = self.lock();
+        let st = &mut *guard;
+        let keys = st.tls.as_mut().ok_or(AckCode::NotInBundle)?;
+        keys.install(install, &self.routes.certificates(), &mut secrets, load)?;
+        if let Some(out) = &self.statuses {
+            out.changed(status::current(keys.applied(), Some(&install.app_id)));
+        }
+        Ok(())
+    }
+
+    /// A live bundle was handled: the control plane hears the state of the apps it names, or that
+    /// the bundle was refused because of its HTTPS settings. A refusal leaves the bundle in force
+    /// as it was, so an app of it that still asks for a certificate goes on asking.
+    pub fn report_bundle(&self) {
+        let Some(out) = &self.statuses else { return };
+        let mut guard = self.lock();
+        let st = &mut *guard;
+        let Some(keys) = &st.tls else { return };
+        match st.refusal.take() {
+            Some(failed) => out.after_refusal(failed, status::current(keys.applied(), None)),
+            None => out.after_bundle(status::current(keys.applied(), None), true),
+        }
     }
 }
 
@@ -463,6 +583,8 @@ pub struct Sink(pub Arc<Agent>);
 
 impl BundleSink for Sink {
     fn apply(&self, bundle_json: &[u8], generation: i64) -> Result<(), BundleError> {
+        // What an earlier bundle left for the control plane is not about this one.
+        self.0.lock().refusal = None;
         let mut b = decode_bundle(bundle_json).map_err(BundleError::Decode)?;
         b.generation = generation;
         self.0.install_bundle(&b)
@@ -473,13 +595,16 @@ impl BundleSink for Sink {
     }
 }
 
-/// The `CertificateSink` the control link calls (on a blocking thread). The agent keeps no
-/// uploaded certificate yet, so every install is answered as one its bundle does not name.
-pub struct Certificates;
+/// The `CertificateSink` the control link calls (on a blocking thread).
+pub struct Certificates(pub Arc<Agent>);
 
 impl CertificateSink for Certificates {
-    fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
-        Err(AckCode::NotInBundle)
+    fn install(&self, install: &mut CertificateInstall) -> Result<(), AckCode> {
+        self.0.install_certificate(install)
+    }
+
+    fn bundle_finished(&self) {
+        self.0.report_bundle();
     }
 }
 

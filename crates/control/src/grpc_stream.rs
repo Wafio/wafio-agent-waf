@@ -39,9 +39,10 @@ const STREAM_SEND_BUFFER: usize = 16;
 /// Default security-data base directory.
 pub const DEFAULT_SECURITY_DATA_DIR: &str = "/etc/wafio/security-data";
 
-/// Retry bounds for a WAF configuration bundle whose apply failed.
+/// Retry bounds for a WAF configuration bundle whose apply failed. The longest wait is also the
+/// fixed wait of a bundle whose address cannot be bound.
 pub(crate) const WAF_BUNDLE_RETRY_MIN: Duration = Duration::from_secs(2);
-pub(crate) const WAF_BUNDLE_RETRY_MAX: Duration = Duration::from_secs(60);
+pub const WAF_BUNDLE_RETRY_MAX: Duration = Duration::from_secs(60);
 /// About 8 minutes of retries; a bundle refused for good must not cost a rebuild forever. A bundle
 /// refused because an address is taken is another case: it retries without a limit.
 pub(crate) const WAF_BUNDLE_RETRY_ATTEMPTS: u32 = 10;
@@ -648,7 +649,11 @@ impl ControlLink {
         } else {
             probe.generation
         };
-        match self.hand_bundle_to_sink(&bu.bundle_json, generation, &probe) {
+        let handed = self.hand_bundle_to_sink(&bu.bundle_json, generation, &probe);
+        if !probe.management_only {
+            self.hooks.certificates.bundle_finished();
+        }
+        match handed {
             Ok(()) => {}
             Err(BundleError::Decode(e)) => {
                 info!("[agent-grpc] decode bundle: {e}");
@@ -1760,11 +1765,85 @@ mod tests {
         assert_eq!(hb.decisions_total, 0);
     }
 
+    /// Answers the bundles it is given from a script, and counts the bundles the link reports.
+    struct Scripted(Mutex<Vec<Result<(), BundleError>>>);
+    impl BundleSink for Scripted {
+        fn apply(&self, _: &[u8], _: i64) -> Result<(), BundleError> {
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+    impl CertificateSink for Counting {
+        fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
+            Err(AckCode::NotInBundle)
+        }
+        fn bundle_finished(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    // The certificate sink hears of each live configuration bundle however it ended, on the first
+    // try and on a retry, and of nothing else.
+    #[tokio::test]
+    async fn the_certificate_sink_hears_of_every_live_configuration_bundle_and_of_no_other() {
+        let script = vec![
+            Ok(()),
+            Err(BundleError::Apply("invalid app route in WAF bundle".into())),
+            Err(BundleError::Bind(
+                "failed to bind WAF route listener".into(),
+            )),
+            Err(BundleError::Decode("bad".into())),
+            Ok(()),
+            Ok(()),
+            Ok(()),
+        ];
+        let certs = Arc::new(Counting::default());
+        let l = bare_link_with_certificates(Arc::new(Scripted(Mutex::new(script))), certs.clone());
+        let heard = || certs.0.load(std::sync::atomic::Ordering::Relaxed);
+
+        let cases = [
+            ("ok", Retry::No, true),
+            ("refused", Retry::Backoff, false),
+            ("unbound", Retry::UntilBound, false),
+            ("undecodable", Retry::No, false),
+        ];
+        for (n, (id, want_retry, want_ok)) in cases.into_iter().enumerate() {
+            let (retry, res) = l.apply_bundle_update(&bu(id, n as i64 + 1, "{}"));
+            assert_eq!((retry, res.is_ok()), (want_retry, want_ok), "{id}");
+            assert_eq!(heard(), n + 1, "{id}");
+        }
+        // A retry is another call of the same function, so it is heard too.
+        let (_, res) = l.apply_bundle_update(&bu("retry", 4, "{}"));
+        assert!(res.is_ok());
+        assert_eq!(heard(), 5);
+
+        // Not a management command, not a document the probe cannot read, not the cached bundle.
+        let (_, res) = l.apply_bundle_update(&bu("m", 0, r#"{"management_only":true}"#));
+        assert!(res.is_ok());
+        let (_, res) = l.apply_bundle_update(&bu("bad", 1, "{"));
+        assert!(res.is_err());
+        let cached = CachedBundle {
+            bundle: b"{}".to_vec(),
+            generation: 9,
+            saved_at: Timestamp::from_system(SystemTime::now()),
+        };
+        l.apply_cached_bundle(&cached).unwrap();
+        assert_eq!(heard(), 5);
+    }
+
     fn bare_link() -> Arc<ControlLink> {
         bare_link_with(Arc::new(FailSink))
     }
 
     fn bare_link_with(bundles: Arc<dyn BundleSink>) -> Arc<ControlLink> {
+        bare_link_with_certificates(bundles, Arc::new(NoCerts))
+    }
+
+    fn bare_link_with_certificates(
+        bundles: Arc<dyn BundleSink>,
+        certificates: Arc<dyn CertificateSink>,
+    ) -> Arc<ControlLink> {
         ControlLink::new(
             ControlConfig {
                 server_address: "127.0.0.1:1".into(),
@@ -1784,7 +1863,7 @@ mod tests {
             },
             Hooks {
                 bundles,
-                certificates: Arc::new(NoCerts),
+                certificates,
                 stats: Arc::new(ZeroStats),
                 security_data: Arc::new(NoSec),
                 redact: |_| {},

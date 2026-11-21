@@ -11,9 +11,9 @@ plane. It builds without a detection engine. The workspace needs a checkout of u
 
 ## Commands
 
-    cargo build --release -p wafio-waf-agent   # the agent, as wafio-waf-agent-open
-    cargo test --locked --workspace            # the tests
-    scripts/ci-local.sh                        # the gate: must pass before a pull request
+    cargo build --release -p wafio-waf-agent                              # the agent, as wafio-waf-agent-open
+    cargo test --locked --workspace --features wafio-waf-agent/test-tls   # the tests
+    scripts/ci-local.sh                                                   # the gate: must pass before a pull request
 
 The gate runs the secret scan, the notices and advisory checks, `cargo fmt --check`, `cargo clippy` with
 `-D warnings` and the tests. Fix what it reports; do not disable a check.

@@ -18,9 +18,14 @@ test-owner = ["wafio-engine-loader/test-owner"]
 # build never enables it.
 test-tls = []
 
-# Starts the binary with a key directory of its own, which only a build with test-tls reads from the environment.
+# These start the binary with a key directory of its own, which only a build with test-tls reads from the environment; the
+# control plane test also expects the Hello of an agent that has one.
 [[test]]
 name = "tls_bundle"
+required-features = ["test-tls"]
+
+[[test]]
+name = "control_plane"
 required-features = ["test-tls"]
 
 [dependencies]
@@ -45,13 +50,17 @@ libc.workspace = true
 nix.workspace = true
 mimalloc.workspace = true
 pingora.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 sha2.workspace = true
+# start_paused: the status pacing is seconds and minutes long.
+tokio = { workspace = true, features = ["test-util"] }
 tonic.workspace = true
 wafio-proto.workspace = true

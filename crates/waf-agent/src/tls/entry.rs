@@ -314,7 +314,7 @@ fn overlap(a: (IpAddr, u16), b: (IpAddr, u16)) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const APP: &str = "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11";
@@ -766,17 +766,17 @@ mod tests {
         assert!(r.to_string().starts_with("hosts: \""), "{r}");
         assert!(r.to_string().len() < 200, "{r}");
     }
-    struct XorShift(u64);
+    pub(crate) struct XorShift(pub u64);
 
     impl XorShift {
-        fn next(&mut self) -> u64 {
+        pub(crate) fn next(&mut self) -> u64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             self.0
         }
 
-        fn below(&mut self, n: usize) -> usize {
+        pub(crate) fn below(&mut self, n: usize) -> usize {
             (self.next() % n.max(1) as u64) as usize
         }
     }

@@ -110,6 +110,8 @@ struct Inner {
     inherited: HashMap<String, StdListener>,
     first_applied: bool,
     closed: bool,
+    /// The address and the error of the bind or socket setup that failed the last apply.
+    bind_failure: Option<(String, io::ErrorKind)>,
 }
 
 pub struct RouteManager {
@@ -141,6 +143,7 @@ impl RouteManager {
                 inherited,
                 first_applied: false,
                 closed: false,
+                bind_failure: None,
             }),
         }
     }
@@ -155,6 +158,13 @@ impl RouteManager {
 
     pub(crate) fn certificates(&self) -> Arc<CertBook> {
         self.shared.book.clone()
+    }
+
+    /// The address and the error kind that made the last `apply` fail with `BIND_ERROR`, for the
+    /// caller that holds off other applies until it has read them. `None` after an apply that
+    /// failed for another reason or succeeded.
+    pub fn bind_failure(&self) -> Option<(String, io::ErrorKind)> {
+        self.lock().bind_failure.clone()
     }
 
     /// The route of the app on the plain listener at `addr`.
@@ -173,6 +183,7 @@ impl RouteManager {
     /// runtime. The cause of an error is logged.
     pub fn apply(&self, specs: Vec<RouteSpec>) -> Result<(), String> {
         let mut inner = self.lock();
+        inner.bind_failure = None;
         if inner.closed {
             return Err("agent is shutting down".into());
         }
@@ -218,6 +229,7 @@ impl RouteManager {
                 Err(e) => {
                     give_back(&mut inner, fresh);
                     tracing::warn!("failed to bind WAF route listener {}: {e}", spec.address);
+                    inner.bind_failure = Some((spec.address.clone(), e.kind()));
                     return Err(BIND_ERROR.into());
                 }
             }
@@ -238,6 +250,7 @@ impl RouteManager {
                 Err(e) => {
                     give_back(&mut inner, fresh);
                     tracing::warn!("failed to start WAF route listener {}: {e}", spec.address);
+                    inner.bind_failure = Some((spec.address.clone(), e.kind()));
                     return Err(BIND_ERROR.into());
                 }
             }
