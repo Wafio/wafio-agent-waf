@@ -44,17 +44,32 @@ pub enum Plan {
     Wait { until: i64 },
 }
 
+/// The record of the last order when it failed and still counts: it answered the bundle's request
+/// id and, for an app with a whole certificate, asked for no host the app has dropped since.
+pub fn failed<'a>(
+    settings: &Settings,
+    record: Option<&'a AppRecord>,
+    own: Own,
+) -> Option<&'a AppRecord> {
+    record.filter(|r| {
+        r.request_id == settings.request_id
+            && r.failures > 0
+            && (own != Own::Whole || r.tried_only(&settings.hosts))
+    })
+}
+
 /// The plan of an app with the source `acme`. An order is due when the app has no certificate of
 /// its own, when a host is not covered by it, or when the bundle asks for one with an id that no
 /// order has answered. An order that failed under the current id is tried again, whatever the app
-/// is served meanwhile: the certificate it asked for is not there yet. Every case but a new id
-/// waits for the next attempt that the failed order set.
+/// is served meanwhile: the certificate it asked for is not there yet (but not once a whole
+/// certificate is there and the failed order was for a host the app has dropped). Every case but a
+/// new id waits for the next attempt that the failed order set.
 pub fn plan(settings: &Settings, record: Option<&AppRecord>, own: Own, now: i64) -> Plan {
     let answered = record.map_or("", |r| r.request_id.as_str());
     if settings.request_id != answered {
         return Plan::Due { since: now };
     }
-    if own == Own::Whole && record.is_none_or(|r| r.failures == 0) {
+    if own == Own::Whole && failed(settings, record, own).is_none() {
         return Plan::Idle;
     }
     match record.map_or(0, |r| r.next_attempt_unix) {
@@ -230,6 +245,60 @@ mod tests {
             plan(&s, Some(&record("r2", 0)), Own::Whole, NOW),
             Plan::Idle
         );
+    }
+
+    #[test]
+    fn a_failed_order_for_a_host_the_app_has_dropped_leaves_a_whole_certificate_alone() {
+        let s = settings("0.0.0.0:443", None, "r1");
+        let failing = |hosts: &[&str]| AppRecord {
+            failures: 1,
+            tried_hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+            ..record("r1", NOW + 600)
+        };
+        let dropped = failing(&["shop.example.com", "www.example.com"]);
+        // The certificate covers the hosts the app has now: nothing to order, and no attempt to
+        // report, at the time of the attempt or later.
+        for now in [NOW, NOW + 700, NOW + 100_000] {
+            assert_eq!(plan(&s, Some(&dropped), Own::Whole, now), Plan::Idle);
+        }
+        assert_eq!(retry_at(&s, Some(&dropped), Own::Whole), 0);
+        assert!(failed_of(&s, &dropped, Own::Whole).is_none());
+        // A certificate that does not cover them is ordered, and after the wait the failure set:
+        // dropping a host and adding it again is no way round it.
+        assert_eq!(
+            plan(&s, Some(&dropped), Own::Gaps, NOW),
+            Plan::Wait { until: NOW + 600 }
+        );
+        assert_eq!(
+            plan(&s, Some(&dropped), Own::Missing, NOW + 700),
+            Plan::Due { since: NOW + 600 }
+        );
+        assert!(failed_of(&s, &dropped, Own::Gaps).is_some());
+        // An order for hosts the app still has is tried again, whatever else the app has now.
+        for hosts in [&["shop.example.com"][..], &[]] {
+            assert_eq!(
+                plan(&s, Some(&failing(hosts)), Own::Whole, NOW),
+                Plan::Wait { until: NOW + 600 },
+                "{hosts:?}"
+            );
+        }
+        let more = Settings {
+            hosts: vec!["shop.example.com".into(), "blog.example.com".into()],
+            ..s.clone()
+        };
+        assert_eq!(
+            plan(
+                &more,
+                Some(&failing(&["shop.example.com"])),
+                Own::Whole,
+                NOW
+            ),
+            Plan::Wait { until: NOW + 600 }
+        );
+    }
+
+    fn failed_of<'a>(s: &Settings, r: &'a AppRecord, own: Own) -> Option<&'a AppRecord> {
+        failed(s, Some(r), own)
     }
 
     #[test]

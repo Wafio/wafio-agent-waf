@@ -523,13 +523,15 @@ exactly as before.
   with no contact address, the terms of service agreed to (the request button of the dashboard is the acceptance), in `acme-account.json` of
   the key directory, 0600, and made again when the directory is not the one the file names. It is in no log line, no status and not
   in `state.json`. One worker orders, in the process that holds the key directory lock, one order at a time, the app that has been
-  due the longest first; the process that a reload replaces stops its worker when it lets the lock go, and keeps an order that ends before
-  that. The requests to the authority go through the agent's own HTTP client, so they use the platform's root certificates and `HTTPS_PROXY`
+  due the longest first; the process that a reload replaces starts no new order once the successor is being started (the authority's check
+  of a name may reach the successor, which has no answer for it), lets one that is running go on, and stops its worker when it lets the lock
+  go, keeping an order that ends before that. The requests to the authority go through the agent's own HTTP client, so they use the platform's root certificates and `HTTPS_PROXY`
   like its other downloads, and only to https addresses: the directory is one, and so must be every address it names. An order is due when
   the app has no certificate of its own (`acme-<app id>.pem`), when a host of its entry is not among the names of that certificate, and when
   the entry has an `acme_request_id` that no order has answered, at once and also while the last order waits for its next try. An order that
-  failed is tried again at its next try even when the app has a certificate of its own, as a new `acme_request_id` asked for another. An
-  order has 3 minutes. The authority is not trusted with which names to prove: an order whose authorizations are more than its names, or
+  failed is tried again at its next try even when the app has a certificate of its own, as a new `acme_request_id` asked for another, unless
+  that certificate covers every host the app has now and the failed order was for a host the app has dropped since: nothing is then
+  asked for that the certificate does not give, and the app is `active`. An order has 3 minutes. The authority is not trusted with which names to prove: an order whose authorizations are more than its names, or
   for a name that is not one of them, fails before anything is answered. The agent answers the challenge of the authority with its own listeners: TLS-ALPN-01 on the HTTPS listener and HTTP-01 on the
   redirect listener and on the HTTPS listener, and takes the answers down however the order ends. It chooses the challenge that last worked,
   else TLS-ALPN-01 for a `listen` on port 443 and HTTP-01 for a `redirect_listen` on port 80, else TLS-ALPN-01; after a failed order it
@@ -540,8 +542,8 @@ exactly as before.
   after its app left the bundle, left gateway mode, changed its source or its hosts is dropped and writes nothing; a new request id
   with the same hosts and source does not drop it. After a failed order the next one waits 10 minutes, with the other challenge, and
   a change to the hosts does not shorten that wait; a new request id does;
-  `state.json` keeps the id the last order answered, the challenge that worked, the failures, the time of the next try and the text
-  of the last error, so a restart does not order sooner.
+  `state.json` keeps the id the last order answered, the challenge that worked, the failures and the hosts of the failed order, the time
+  of the next try and the text of the last error, so a restart does not order sooner.
 - An ordered certificate reports `pending` (an order is running or due, also before the first one; `chain_pem` is the certificate in use
   meanwhile, if any), `active` (the ordered certificate is served and covers every host) or `failed` (the last order failed: `error` is a
   fixed phrase with the problem type and detail the authority gave or the kind of the I/O error, and `next_attempt_unix` the time of the

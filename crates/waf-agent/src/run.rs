@@ -581,6 +581,7 @@ pub async fn run_waf_agent(
                 if crate::engine_lib::loaded().is_some() {
                     env.push((crate::engine_lib::ENV_REQUIRED.to_string(), "1".to_string()));
                 }
+                agent.pause_orders();
                 match spawn_successor(fds, &crate::reload::run_dir(), crate::reload::HANDOVER_TIMEOUT, env).await {
                     Ok(pid) => {
                         upgrade.finish(true);
@@ -589,6 +590,7 @@ pub async fn run_waf_agent(
                     }
                     Err(e) => {
                         upgrade.finish(false);
+                        agent.resume_orders();
                         info!("[tableflip] upgrade failed: {e}");
                     }
                 }

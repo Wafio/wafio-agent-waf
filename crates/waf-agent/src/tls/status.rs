@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wafio_control::CertificateStatus;
 use wafio_proxy::cert_store::chain_pem;
 
-use super::acme::schedule::{Own, own, retry_at};
+use super::acme::schedule::{Own, failed, own, retry_at};
 use super::entry::{Certificate, Settings, Source};
 use super::state_file::AppRecord;
 use super::{Applied, Served};
@@ -100,21 +100,19 @@ pub fn ordered(
     let answered = record.map_or(settings.request_id.is_empty(), |r| {
         r.request_id == settings.request_id
     });
-    let failed = record.filter(|r| answered && r.failures > 0);
+    let own = own(app_id, settings, served);
+    let failure = failed(settings, record, own);
     let state = if running || !answered {
         State::Pending
-    } else if failed.is_some() {
+    } else if failure.is_some() {
         State::Failed
-    } else if own(app_id, settings, served) == Own::Whole {
+    } else if own == Own::Whole {
         State::Active
     } else {
         State::Pending
     };
-    let (error, next_attempt_unix) = match (state, failed) {
-        (State::Failed, Some(r)) => (
-            r.error.clone(),
-            retry_at(settings, record, own(app_id, settings, served)),
-        ),
+    let (error, next_attempt_unix) = match (state, failure) {
+        (State::Failed, Some(r)) => (r.error.clone(), retry_at(settings, record, own)),
         _ => (String::new(), 0),
     };
     CertificateStatus {
@@ -377,6 +375,20 @@ mod tests {
         assert_eq!(
             status(&new_id, None, Some(&acme_record("r1", 3)), false),
             show("pending", "r2", "", 0, true)
+        );
+        // A failure for a host the app has dropped since, with a certificate that covers the rest:
+        // the certificate in use is all the app asks for, so it is active. With a gap it is failed.
+        let dropped = AppRecord {
+            tried_hosts: vec!["shop.example.com".into(), "gone.example.com".into()],
+            ..acme_record("r1", 1)
+        };
+        assert_eq!(
+            status(&whole, Some(&own), Some(&dropped), false),
+            show("active", "r1", "", 0, false)
+        );
+        assert_eq!(
+            status(&wider, Some(&own), Some(&dropped), false),
+            show("failed", "r1", "it failed", 1_800_000_600, false)
         );
         // The source is `acme` and the certificate id is empty.
         let s = ordered(APP, &whole, None, None, false);

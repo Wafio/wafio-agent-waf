@@ -355,6 +355,8 @@ impl Keys {
     /// from the next handshake on in place of the placeholder or the certificate it replaces, and
     /// remembered in `state.json`. A new request id in the bundle does not drop it: the same hosts
     /// and source still ask for it, and the new id orders next.
+    ///
+    /// The app counts as ordering until this is done, so `stop_order` can note an error in it.
     pub fn finish_order(
         &mut self,
         job: &Job,
@@ -363,9 +365,28 @@ impl Keys {
         directory: &str,
         now: i64,
     ) {
-        if self.running.as_ref() == Some(&job.app_id) {
-            self.running = None;
+        self.take_in(job, outcome, book, directory, now);
+        self.abandon_order(&job.app_id);
+    }
+
+    /// The order of `job` ended on an internal error that nothing took in: a failure with its
+    /// wait, so the authority is not asked again at once. One taken in before the error is no
+    /// failure.
+    pub fn stop_order(&mut self, job: &Job, book: &CertBook, now: i64) {
+        if self.running.as_deref() == Some(job.app_id.as_str()) {
+            let stopped = Err(CaError::new("the order stopped on an internal error"));
+            self.finish_order(job, stopped, book, "", now);
         }
+    }
+
+    fn take_in(
+        &mut self,
+        job: &Job,
+        outcome: Result<Issued, CaError>,
+        book: &CertBook,
+        directory: &str,
+        now: i64,
+    ) {
         let ordered = self
             .applied
             .get(&job.app_id)
@@ -426,6 +447,7 @@ impl Keys {
         let record = self.state.apps.entry(job.app_id.clone()).or_default();
         record.request_id.clone_from(&job.request_id);
         record.tried = job.kind.as_str().to_owned();
+        record.tried_hosts.clone_from(&job.hosts);
         record.failures = record.failures.saturating_add(1);
         record.next_attempt_unix = now.saturating_add(acme::RETRY_AFTER_FAILURE);
         record.error = status::error_text(&text);

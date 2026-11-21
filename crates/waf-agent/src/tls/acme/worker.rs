@@ -85,13 +85,26 @@ impl Worker {
             self.accounts.lock().await.forget().await;
         }
         let (agent, directory, now) = (self.agent.clone(), self.directory.clone(), (self.clock)());
-        let stopped = job.clone();
+        let ended = job.clone();
         let done =
             tokio::task::spawn_blocking(move || agent.order_done(&job, result, &directory, now))
                 .await;
         if done.is_err() {
-            // The order is over and the next one must not wait for it, nor start at once.
-            self.agent.order_stopped(&stopped, (self.clock)());
+            self.stopped(&ended).await;
+        }
+    }
+
+    /// An order that panicked while it was taken in is noted as failed, so the next one waits. It
+    /// writes the key directory, so it runs under `spawn_blocking`; a second panic only lets go.
+    async fn stopped(&self, job: &Job) {
+        let (agent, ended, now) = (self.agent.clone(), job.clone(), (self.clock)());
+        let noted = tokio::task::spawn_blocking(move || agent.order_stopped(&ended, now)).await;
+        if noted.is_err() {
+            tracing::info!(
+                "[acme] app {}: the order could not be noted as failed; it is let go of",
+                job.app_id
+            );
+            self.agent.abandon_order(&job.app_id);
         }
     }
 

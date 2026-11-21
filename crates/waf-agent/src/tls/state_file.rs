@@ -36,6 +36,9 @@ pub struct AppRecord {
     /// The challenge type of the last order, while it failed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tried: String,
+    /// The hosts the last order asked for, while it failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tried_hosts: Vec<String>,
     /// Orders that failed in a row.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub failures: u32,
@@ -69,9 +72,16 @@ impl AppRecord {
         };
     }
 
+    /// Whether every host the failed order asked for is among `hosts`, the ones the app has now.
+    /// An order for a host the app has dropped since asks for nothing the app wants.
+    pub fn tried_only(&self, hosts: &[String]) -> bool {
+        self.tried_hosts.iter().all(|h| hosts.contains(h))
+    }
+
     /// Forgets the failures, so the next order is not held back by them.
     pub fn forget_failures(&mut self) {
         self.tried.clear();
+        self.tried_hosts.clear();
         self.failures = 0;
         self.next_attempt_unix = 0;
         self.error.clear();
@@ -185,6 +195,7 @@ mod tests {
             request_id: "r1".into(),
             worked: "http-01".into(),
             tried: "tls-alpn-01".into(),
+            tried_hosts: vec!["shop.example.com".into(), "www.example.com".into()],
             failures: 2,
             next_attempt_unix: 1_800_000_600,
             error: "the CA said no".into(),
@@ -218,7 +229,25 @@ mod tests {
             ),
             (0, 0, "", "")
         );
+        assert!(forgotten.tried_hosts.is_empty());
         assert_eq!(forgotten.request_id, "r1", "what the CA answered is kept");
+    }
+
+    #[test]
+    fn a_failed_order_is_only_for_the_hosts_the_app_still_has_when_every_one_it_asked_for_is_among_them()
+     {
+        let hosts =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+        let record = AppRecord {
+            tried_hosts: hosts(&["a.example.com", "b.example.com"]),
+            ..AppRecord::default()
+        };
+        assert!(record.tried_only(&hosts(&["b.example.com", "a.example.com"])));
+        assert!(record.tried_only(&hosts(&["a.example.com", "b.example.com", "c.example.com"])));
+        assert!(!record.tried_only(&hosts(&["a.example.com"])));
+        assert!(!record.tried_only(&[]));
+        // Nothing asked for, nothing dropped.
+        assert!(AppRecord::default().tried_only(&hosts(&["a.example.com"])));
     }
 
     #[test]

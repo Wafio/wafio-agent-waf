@@ -110,6 +110,9 @@ impl Agent {
         if st.closed {
             return None;
         }
+        if st.orders_paused {
+            return Some(NextOrder::Wait(None));
+        }
         let keys = st.tls.as_mut()?;
         let next = keys.next_order(now);
         if let (NextOrder::Order(job), Some(out)) = (&next, &self.statuses) {
@@ -118,18 +121,35 @@ impl Agent {
         Some(next)
     }
 
-    /// Taking in what an order came to stopped on an internal error. The order is noted as failed,
-    /// so that the next one waits for its time as after any failure, and does not start at once and
-    /// stop the same way over and over against the authority.
+    /// An order ended on an internal error while it was taken in; see `Keys::stop_order`.
+    /// Blocking: it may write.
     pub(crate) fn order_stopped(&self, job: &Job, now: i64) {
         let mut guard = self.lock();
         let st = &mut *guard;
         let Some(keys) = st.tls.as_mut() else { return };
-        let outcome = Err(CaError::new("the order stopped on an internal error"));
-        keys.finish_order(job, outcome, &self.routes.certificates(), "", now);
+        keys.stop_order(job, &self.routes.certificates(), now);
         if let Some(out) = &self.statuses {
             out.changed(keys.statuses(Some(&job.app_id)));
         }
+    }
+
+    /// Lets go of an order that nothing could take in, so that the worker goes on.
+    pub(crate) fn abandon_order(&self, app_id: &str) {
+        if let Some(keys) = self.lock().tls.as_mut() {
+            keys.abandon_order(app_id);
+        }
+    }
+
+    /// No new order starts until `resume_orders`: the authority's check of a name could reach the
+    /// successor being started, which has no answer for it. A running order goes on.
+    pub fn pause_orders(&self) {
+        self.lock().orders_paused = true;
+    }
+
+    /// The take-over failed: orders start again.
+    pub fn resume_orders(&self) {
+        self.lock().orders_paused = false;
+        self.orders.wake();
     }
 
     /// Takes in what an order came to, and reports the state it leaves. Blocking: it may write.

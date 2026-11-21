@@ -29,6 +29,10 @@ thread_local! {
 /// Everything the process logs while the tests run, which `capture_logs` starts to keep.
 static LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+/// Texts that make the next log line holding one of them panic, once for each. It stands for an
+/// error in the middle of the code that logs, which a test cannot cause any other way.
+static PANIC_AT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 struct Capture;
 
 impl tracing::Subscriber for Capture {
@@ -56,6 +60,15 @@ impl tracing::Subscriber for Capture {
         LOG.lock()
             .unwrap_or_else(|e| e.into_inner())
             .push_str(&format!("{}\n", text.0));
+        let hit = {
+            let mut at = PANIC_AT.lock().unwrap_or_else(|e| e.into_inner());
+            at.iter()
+                .position(|needle| text.0.contains(needle.as_str()))
+                .map(|i| at.remove(i))
+        };
+        if let Some(needle) = hit {
+            panic!("a log line with {needle:?}");
+        }
     }
 
     fn enter(&self, _: &tracing::span::Id) {}
@@ -432,6 +445,8 @@ async fn the_account_is_taken_from_its_file_after_a_restart_and_made_again_for_a
 const A: &str = "1a2b3c4d-0000-4000-8000-00000000000a";
 const B: &str = "1a2b3c4d-0000-4000-8000-00000000000b";
 const C: &str = "1a2b3c4d-0000-4000-8000-00000000000c";
+/// The app of the tests that make the code panic through the log: no other test logs about it.
+const PANICKY: &str = "1a2b3c4d-0000-4000-8000-00000000000d";
 
 #[tokio::test]
 async fn orders_run_one_at_a_time_and_the_app_that_has_been_due_the_longest_goes_first() {
@@ -1354,6 +1369,96 @@ async fn an_order_that_stops_while_it_is_taken_in_is_noted_as_failed_and_waits_f
     assert_eq!(r.state().apps[SHOP].failures, 1);
 }
 
+#[tokio::test]
+async fn an_error_that_comes_after_an_order_was_taken_in_is_no_failure_of_it() {
+    let r = rig();
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the certificate is served", || r.issued(SHOP)).await;
+    until("it is taken in", || !r.ordering()).await;
+    let leaf = r.leaf(SHOP);
+    let job = Job {
+        app_id: SHOP.into(),
+        hosts: vec![HOST.into()],
+        request_id: "r1".into(),
+        kind: Kind::TlsAlpn01,
+        missing_listener: None,
+    };
+    // The error was in what reports the order, after its certificate was kept.
+    r.agent.order_stopped(&job, clock());
+    let status = r.status(SHOP);
+    assert_eq!(
+        (
+            status.state.as_str(),
+            status.error.as_str(),
+            status.next_attempt_unix
+        ),
+        ("active", "", 0)
+    );
+    assert_eq!(r.state().apps[SHOP].failures, 0);
+    assert_eq!(r.leaf(SHOP), leaf);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(r.ca.script().orders.len(), 1, "no other order");
+}
+
+#[tokio::test]
+async fn an_error_while_an_order_is_taken_in_is_noted_as_its_failure_and_the_worker_goes_on() {
+    capture_logs();
+    let r = rig();
+    PANIC_AT
+        .lock()
+        .unwrap()
+        .push(format!("app {PANICKY}: issued"));
+    r.start();
+    r.apply(&[(PANICKY, &[HOST], "r1")], 1);
+    until("the failure is noted", || {
+        r.status(PANICKY).state == "failed"
+    })
+    .await;
+    until("the order is over", || !r.ordering()).await;
+    let status = r.status(PANICKY);
+    assert_eq!(
+        status.error,
+        "the order failed (tls-alpn-01): the order stopped on an internal error"
+    );
+    assert!((BASE + 600..BASE + 620).contains(&status.next_attempt_unix));
+    assert_eq!(r.ca.script().orders.len(), 1, "it waits for its time");
+
+    // The worker is alive: a new request id orders at once.
+    r.apply(&[(PANICKY, &[HOST], "r2")], 2);
+    until("the next order is taken in", || {
+        r.status(PANICKY).state == "active"
+    })
+    .await;
+    assert_eq!(r.ca.script().orders.len(), 2);
+}
+
+#[tokio::test]
+async fn an_error_that_comes_again_in_noting_the_failure_lets_go_of_the_order_and_the_worker_goes_on()
+ {
+    capture_logs();
+    let r = rig();
+    {
+        let mut at = PANIC_AT.lock().unwrap();
+        at.push(format!("app {PANICKY}: issued"));
+        at.push(format!("app {PANICKY}: the order failed"));
+    }
+    r.start();
+    r.apply(&[(PANICKY, &[HOST], "r1")], 1);
+    // Nothing could note the failure, so the app is ordered again as soon as the order is let go
+    // of, and this one goes through.
+    until("the next order is taken in", || {
+        r.ca.script().orders.len() == 2 && r.status(PANICKY).state == "active"
+    })
+    .await;
+    assert!(
+        LOG.lock().unwrap().contains(&format!(
+            "app {PANICKY}: the order could not be noted as failed"
+        )),
+        "the log says so"
+    );
+}
+
 // ── retries and what a bundle does not change ───────────────────────────────────────────────
 
 #[tokio::test(start_paused = true)]
@@ -1398,6 +1503,8 @@ async fn a_failed_order_for_a_new_request_id_is_tried_again_while_the_old_certif
         ("active", "r2")
     );
     assert_eq!(status.next_attempt_unix, 0);
+    let record = r.state().apps[SHOP].clone();
+    assert!(record.tried_hosts.is_empty() && record.failures == 0 && record.tried.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1426,6 +1533,74 @@ async fn adding_a_host_does_not_skip_the_wait_a_failed_order_set() {
     assert_eq!(r.ca.script().orders[1], [HOST, "www.example.com"]);
     until("its failure is taken in", || !r.ordering()).await;
     assert_eq!(r.state().apps[SHOP].failures, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn removing_the_host_an_order_failed_for_leaves_the_app_active_and_orders_nothing() {
+    let r = rig();
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the certificate is served", || r.issued(SHOP)).await;
+    until("it is taken in", || !r.ordering()).await;
+    let first = r.leaf(SHOP);
+
+    // A host is added whose name does not point here, and the order for it fails.
+    r.ca.script().fail = Some((Step::Finalize, CaError::new("no address for www")));
+    let both = [HOST, "www.example.com"];
+    r.apply(&[(SHOP, &both, "r1")], 2);
+    until("the order failed", || r.status(SHOP).state == "failed").await;
+    until("the failure is taken in", || !r.ordering()).await;
+    let at = r.status(SHOP).next_attempt_unix;
+    assert_eq!(r.state().apps[SHOP].tried_hosts, both);
+
+    // The host is removed: the certificate in use covers every host again. The app is active, with
+    // no error and no attempt planned, and the order for a name it no longer has is not made.
+    r.apply(&[(SHOP, &[HOST], "r1")], 3);
+    let status = r.status(SHOP);
+    assert_eq!(
+        (
+            status.state.as_str(),
+            status.error.as_str(),
+            status.next_attempt_unix
+        ),
+        ("active", "", 0)
+    );
+    tokio::time::advance(Duration::from_secs(7200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(r.ca.script().orders.len(), 2, "no duplicate order");
+    assert_eq!(r.leaf(SHOP), first);
+
+    // Putting the host back is no way round the wait the failure set.
+    r.apply(&[(SHOP, &both, "r1")], 4);
+    let status = r.status(SHOP);
+    assert_eq!(
+        (status.state.as_str(), status.next_attempt_unix),
+        ("failed", at)
+    );
+}
+
+#[tokio::test]
+async fn no_order_starts_while_a_successor_is_being_started_and_one_that_is_running_goes_on() {
+    let (r, go) = mid_order().await;
+    r.agent.pause_orders();
+    r.apply(
+        &[(SHOP, &[HOST], "r1"), (BLOG, &["blog.example.com"], "r1")],
+        2,
+    );
+    r.ca.script().pause = None;
+    go.notify_one();
+    until("the running order is taken in", || {
+        r.issued(SHOP) && !r.ordering()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(r.ca.script().orders.len(), 1, "the other app waits");
+    assert_eq!(r.status(BLOG).state, "pending");
+
+    // The take-over failed: the order that waited starts.
+    r.agent.resume_orders();
+    until("the other app is served", || r.issued(BLOG)).await;
+    assert_eq!(r.ca.script().orders.len(), 2);
 }
 
 #[tokio::test]

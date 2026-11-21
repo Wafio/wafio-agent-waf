@@ -67,6 +67,8 @@ struct State {
     generation: i64,
     agent_id: String,
     closed: bool,
+    /// A successor is being started: no new order begins.
+    orders_paused: bool,
     /// The key directory and what the apps with a `tls` object are served with; `None` when the
     /// agent has no usable key directory, which leaves the `tls` objects unread.
     tls: Option<Keys>,
