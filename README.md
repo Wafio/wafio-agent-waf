@@ -499,7 +499,7 @@ exactly as before.
   HTTPS or redirect address cannot be bound, gives each uploaded app in it `failed` with a fixed phrase: `the bundle was refused: its
   TLS settings are not valid`, or `cannot listen on 0.0.0.0:443: address in use` (the address and the kind of the error). For an
   address that cannot be bound `next_attempt_unix` is a minute ahead, when the bundle is tried again; for a refused `tls` object it is
-  0, as the control plane sends the bundle again. The refusal changes nothing in force, so an app whose bundle in force still names
+  0, as a retry of the same bundle fails the same check. The refusal changes nothing in force, so an app whose bundle in force still names
   a certificate the agent does not hold asks for it again (`missing`) once its `failed` has gone, and then every minute. A bundle
   refused for any other reason (a plain app on the address of an HTTPS listener, say) says nothing of the certificates: each app
   reports the state it is in. An error text has its control characters

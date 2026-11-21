@@ -930,7 +930,7 @@ fn a_bundle_refused_for_its_tls_settings_gives_each_gateway_app_in_it_failed_wit
         assert_eq!(s.error, REFUSED_SETTINGS);
         assert_eq!(
             s.next_attempt_unix, 0,
-            "the control plane sends the bundle again"
+            "a retry of the same bundle fails the same check"
         );
     }
     let [shop_status, blog_status] = &offer.statuses[..] else {
