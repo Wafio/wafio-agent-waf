@@ -30,10 +30,12 @@ use wafio_bytetext::base64::STANDARD;
 use wafio_bytetext::url::{self, unescape_path_segment};
 use wafio_control::proxy_env::{self, ProxyConfig, ProxyUrl, TunnelError};
 
-/// A response: status and the (possibly capped) body.
+/// A response: status, the headers of the answer and the (possibly capped) body. After a
+/// followed redirect they are those of the last answer.
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
+    pub headers: http::HeaderMap,
     pub body: Vec<u8>,
 }
 
@@ -604,7 +606,7 @@ async fn once(
     proxies: &ProxyConfig,
     deadline: tokio::time::Instant,
     in_body: &std::sync::atomic::AtomicBool,
-) -> Result<(u16, Option<String>, Vec<u8>), String> {
+) -> Result<(u16, http::HeaderMap, Vec<u8>), String> {
     let (body, headers, cap) = (o.body, o.headers, o.cap);
     let t = parse(url)?;
     let plan = plan(&t, ua, proxies).await?;
@@ -655,15 +657,9 @@ async fn once(
     }
     s.finish_request_body().await.map_err(|e| e.to_string())?;
     s.read_response_header().await.map_err(|e| e.to_string())?;
-    let (status, location) = {
+    let (status, headers) = {
         let h = s.response_header().ok_or("no response header")?;
-        (
-            h.status.as_u16(),
-            h.headers
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from),
-        )
+        (h.status.as_u16(), h.headers.clone())
     };
     in_body.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut body = Vec::new();
@@ -680,7 +676,7 @@ async fn once(
         }
     }
     s.shutdown().await;
-    Ok((status, location, body))
+    Ok((status, headers, body))
 }
 
 /// `method` on `url`, following redirects (at most 10 requests; 301/302/303 turn any method
@@ -748,7 +744,7 @@ pub async fn request_via(
             Ok(r) => Ok(r),
             Err(_) => Err(()),
         };
-        let (status, location, body) = match outcome {
+        let (status, headers, body) = match outcome {
             Ok(r) => r?,
             // The body read reports the bare cause; before that the error names the method and URL.
             Err(()) if in_body.load(std::sync::atomic::Ordering::Relaxed) => {
@@ -765,6 +761,10 @@ pub async fn request_via(
             }
         };
         last.clone_from(&url);
+        let location = headers
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
         match (status, location) {
             // A 3xx without a Location (or an empty one) is returned as it is.
             (301 | 302 | 303 | 307 | 308, Some(loc)) if o.follow && !loc.is_empty() => {
@@ -777,7 +777,13 @@ pub async fn request_via(
                     o.body = None;
                 }
             }
-            _ => return Ok(Response { status, body }),
+            _ => {
+                return Ok(Response {
+                    status,
+                    headers,
+                    body,
+                });
+            }
         }
     }
     Err(format!(
@@ -1223,6 +1229,92 @@ mod tests {
             "a 303 keeps HEAD: {}",
             heads[1]
         );
+    }
+
+    /// What an ACME client needs: its headers and body go out as they are, and the headers of the
+    /// answer come back (a nonce, a location, the links), also those of a redirect that is not
+    /// followed.
+    #[test]
+    fn request_headers_and_a_body_go_out_and_the_headers_of_the_answer_come_back() {
+        let (port, seen) = serve(|i, _| {
+            match i {
+            0 => "HTTP/1.1 201 Created\r\nReplay-Nonce: n1\r\nLink: <https://ca/up>;rel=\"up\"\r\nLink: <https://ca/alt>;rel=\"alternate\"\r\nContent-Length: 2\r\n\r\nok".into(),
+            _ => "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nReplay-Nonce: n2\r\nContent-Length: 0\r\n\r\n".into(),
+        }
+        });
+        let url = format!("http://127.0.0.1:{port}/new-order");
+        let send = |url: &str| {
+            block_on(request_with(
+                "POST",
+                url,
+                "t/1",
+                &RequestOptions {
+                    body: Some(("application/jose+json", b"{}")),
+                    headers: &[("X-Thing", "1"), ("Accept", "application/json")],
+                    follow: false,
+                    cap: 1 << 20,
+                    truncate: false,
+                    timeout: Duration::from_secs(10),
+                },
+            ))
+            .unwrap()
+        };
+        let r = send(&url);
+        let h = seen.recv().unwrap();
+        assert!(h.starts_with("POST /new-order HTTP/1.1\r\n"), "{h}");
+        assert_eq!(header(&h, "content-type"), ["application/jose+json"]);
+        assert_eq!(header(&h, "content-length"), ["2"]);
+        assert_eq!(header(&h, "x-thing"), ["1"]);
+        assert_eq!(header(&h, "accept"), ["application/json"]);
+        assert_eq!(header(&h, "user-agent"), ["t/1"]);
+        assert_eq!((r.status, r.body.as_slice()), (201, &b"ok"[..]));
+        assert_eq!(r.headers["replay-nonce"], "n1");
+        let links: Vec<_> = r.headers.get_all("link").iter().collect();
+        assert_eq!(links.len(), 2, "every header of one name is kept");
+        // A redirect is returned as it is when it is not to be followed, with its headers.
+        let r = send(&url);
+        assert_eq!(
+            (r.status, r.headers["location"].to_str().unwrap()),
+            (302, "/elsewhere")
+        );
+        assert_eq!(r.headers["replay-nonce"], "n2");
+        assert_eq!(seen.try_iter().count(), 1, "one request, not two");
+    }
+
+    /// An answer is read whole up to the cap: past it the read is an error, or, when the caller
+    /// asks to truncate, the body is cut there.
+    #[test]
+    fn an_answer_over_the_cap_is_an_error_unless_the_caller_truncates() {
+        let body = "x".repeat(500);
+        let reply = move |_, _| format!("HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n{body}");
+        let get = |url: &str, cap: usize, truncate: bool| {
+            block_on(request_with(
+                "GET",
+                url,
+                "t/1",
+                &RequestOptions {
+                    body: None,
+                    headers: &[],
+                    follow: true,
+                    cap,
+                    truncate,
+                    timeout: Duration::from_secs(10),
+                },
+            ))
+        };
+        let (port, _) = serve(reply.clone());
+        let url = format!("http://127.0.0.1:{port}/");
+        assert_eq!(
+            get(&url, 500, false).unwrap().body.len(),
+            500,
+            "exactly the cap is fine"
+        );
+        let (port, _) = serve(reply.clone());
+        let e = get(&format!("http://127.0.0.1:{port}/"), 499, false).unwrap_err();
+        assert_eq!(e, "response body larger than 499 bytes");
+        let (port, _) = serve(reply);
+        let r = get(&format!("http://127.0.0.1:{port}/"), 100, true).unwrap();
+        assert_eq!((r.status, r.body.len()), (200, 100));
     }
 
     /// The timeout is one deadline for the whole exchange, redirects included, and its text

@@ -94,28 +94,50 @@ pub(crate) fn verify_and_store(
     load: LoadKey,
     store: impl FnOnce(Arc<CertifiedKey>, &[u8]) -> Result<(), AckCode>,
 ) -> Result<(), AckCode> {
-    let wipe = WipeOnExit(secrets);
-    run(install, &mut *wipe.0, load, store)
+    check_and_store(
+        &install.chain_pem,
+        &install.key_pem,
+        Some(&install.leaf_sha256),
+        secrets,
+        load,
+        store,
+    )
 }
 
-fn run(
-    install: &CertificateInstall,
+/// The checks of `verify_and_store` for a chain and key that did not come in an install: the
+/// certificate an order was issued. With a `leaf` the first certificate must have that digest.
+pub(crate) fn check_and_store(
+    chain_pem: &[u8],
+    key_pem: &[u8],
+    leaf: Option<&str>,
     secrets: &mut Secrets,
     load: LoadKey,
     store: impl FnOnce(Arc<CertifiedKey>, &[u8]) -> Result<(), AckCode>,
 ) -> Result<(), AckCode> {
-    if install.chain_pem.len() > MAX_CHAIN_PEM || install.key_pem.len() > MAX_KEY_PEM {
+    let wipe = WipeOnExit(secrets);
+    run(chain_pem, key_pem, leaf, &mut *wipe.0, load, store)
+}
+
+fn run(
+    chain_pem: &[u8],
+    key_pem: &[u8],
+    leaf: Option<&str>,
+    secrets: &mut Secrets,
+    load: LoadKey,
+    store: impl FnOnce(Arc<CertifiedKey>, &[u8]) -> Result<(), AckCode>,
+) -> Result<(), AckCode> {
+    if chain_pem.len() > MAX_CHAIN_PEM || key_pem.len() > MAX_KEY_PEM {
         return Err(AckCode::TooLarge);
     }
-    let chain = chain_of(&install.chain_pem)?;
-    secrets.der = Some(key_of(&install.key_pem)?);
+    let chain = chain_of(chain_pem)?;
+    secrets.der = Some(key_of(key_pem)?);
     // The chain is written again with lines of 64 characters, which can make it longer than the
     // text it came in. The control plane drops a status whose chain is over the limit, so a chain
     // that would be is refused here.
     if chain.len() > MAX_CERTIFICATES || written_len(&chain) > MAX_CHAIN_PEM {
         return Err(AckCode::TooLarge);
     }
-    if sha256_hex(chain[0].as_ref()) != install.leaf_sha256 {
+    if leaf.is_some_and(|leaf| sha256_hex(chain[0].as_ref()) != leaf) {
         return Err(AckCode::LeafMismatch);
     }
     let der = secrets.der.as_ref().expect("set above");

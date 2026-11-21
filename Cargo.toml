@@ -43,6 +43,12 @@ bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 crc32fast = "1.5"
 flate2 = "1.1"
+# Already in the tree through pingora and the ACME client; the request and response types of the ACME client's HTTP trait.
+http = "1"
+# The body type of the ACME client's HTTP trait. Already in the tree through the ACME client.
+http-body = "1"
+# The ACME client (orders, challenges, account), with the ring provider only: no aws-lc-rs and none of its hyper client, the agent's own HTTP client carries its requests.
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring"] }
 libc = "0.2"
 # Loads the engine library. 0.9.0 and not the 0.9.1 of 2026-11-13, which was three days old at the review of 2026-11-16; OSV listed no advisory for any version.
 libloading = "0.9"
@@ -58,6 +64,8 @@ prost = "0.14"
 protox = "0.10"
 regex = "1.12"
 regex-syntax = "0.8"
+# Makes the keys and requests of ACME orders, the TLS-ALPN-01 certificate and the placeholder certificate, with the ring provider only.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "zeroize"] }
 # The TLS library the proxy already links, with the ring provider only (no aws-lc-rs). Direct here for the signing keys of uploaded certificates.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # PEM files of the TLS listeners' certificates; already in the tree through rustls, and the maintained successor of rustls-pemfile.
@@ -73,6 +81,8 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tracing = "0.1"
 unicode-normalization = "0.1"
+# Reads the names of a certificate. Already in the tree through pingora-core, at 0.16, without its verify feature.
+x509-parser = "0.16"
 # Wipes the key of an uploaded certificate from the buffers the agent made for it; already in the tree through rustls-pki-types.
 zeroize = "1"
 

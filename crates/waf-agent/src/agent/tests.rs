@@ -876,8 +876,11 @@ fn only_an_app_with_a_certificate_to_report_gets_a_status_after_a_bundle() {
     assert!(offer.forced && offer.whole);
     assert_eq!(
         states(&offer),
-        [(SHOP.into(), "uploaded".into(), "missing".into())],
-        "no status for source empty, for uploaded without a certificate, or for an app without a tls entry; an ordered certificate reports through its order"
+        [
+            (SHOP.into(), "uploaded".into(), "missing".into()),
+            (ACME_APP.into(), "acme".into(), "pending".into())
+        ],
+        "no status for source empty, for uploaded without a certificate, or for an app without a tls entry; an ordered certificate reports through its order, pending before the first"
     );
 }
 
@@ -1026,7 +1029,11 @@ fn a_bundle_refused_for_an_address_it_cannot_bind_says_which_and_why_for_an_http
     let offer = only(&mut offers);
     assert_eq!(
         states(&offer),
-        [(SHOP.into(), "uploaded".into(), "missing".into())]
+        [
+            (SHOP.into(), "uploaded".into(), "missing".into()),
+            (ACME_APP.into(), "acme".into(), "pending".into())
+        ],
+        "an ordered certificate had no `failed` from the refusals: it reports through its order"
     );
     a.report_bundle();
     assert_eq!(states(&only(&mut offers)), states(&offer));
@@ -1274,3 +1281,5 @@ fn a_bundle_cannot_be_applied_between_the_check_of_an_install_and_its_commit() {
     assert!(!dir.dir().join(format!("{CERT}.pem")).exists());
     assert_eq!(a.generation().0, 2);
 }
+
+mod orders;

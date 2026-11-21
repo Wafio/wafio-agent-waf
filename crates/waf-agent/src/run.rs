@@ -413,10 +413,21 @@ pub async fn run_waf_agent(
         ready.clone(),
     )
     .with_statuses(statuses);
+    let ordering = keys.is_some();
     if let Some(dir) = keys {
         agent = agent.with_key_dir(dir);
     }
     let agent = Arc::new(agent);
+    if ordering {
+        let directory = f.resolved_acme_directory()?;
+        info!("[acme] certificates are ordered from {directory}");
+        agent.start_acme(
+            Arc::new(crate::tls::acme::instant::InstantAcme::new(
+                crate::tls::acme::http::Http::new(),
+            )),
+            directory,
+        );
+    }
 
     let link = ControlLink::new(
         cfg,
@@ -570,6 +581,7 @@ pub async fn run_waf_agent(
                 if crate::engine_lib::loaded().is_some() {
                     env.push((crate::engine_lib::ENV_REQUIRED.to_string(), "1".to_string()));
                 }
+                agent.pause_orders();
                 match spawn_successor(fds, &crate::reload::run_dir(), crate::reload::HANDOVER_TIMEOUT, env).await {
                     Ok(pid) => {
                         upgrade.finish(true);
@@ -578,6 +590,7 @@ pub async fn run_waf_agent(
                     }
                     Err(e) => {
                         upgrade.finish(false);
+                        agent.resume_orders();
                         info!("[tableflip] upgrade failed: {e}");
                     }
                 }

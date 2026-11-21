@@ -14,14 +14,15 @@ use wafio_control::{
 };
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
-use wafio_proxy::cert_store::{BookChange, CertBook};
+use wafio_proxy::cert_store::{BookChange, BookEntry, CertBook};
 use wafio_proxy::{AppAnalysisSetup, AppSpec, TlsSite};
 
 use crate::bundle::{Bundle, BundleApp, UnblockEntry, decode_bundle};
 use crate::executor::{BaseExecutor, Stores, executor_for_rules};
 use crate::ready::Ready;
+use crate::tls::acme::placeholder;
 use crate::tls::dir::KeyDir;
-use crate::tls::entry::Settings;
+use crate::tls::entry::{Settings, Source};
 use crate::tls::install::{LoadKey, Secrets, load_key};
 use crate::tls::pacer::Statuses;
 use crate::tls::status;
@@ -66,6 +67,8 @@ struct State {
     generation: i64,
     agent_id: String,
     closed: bool,
+    /// A successor is being started: no new order begins.
+    orders_paused: bool,
     /// The key directory and what the apps with a `tls` object are served with; `None` when the
     /// agent has no usable key directory, which leaves the `tls` objects unread.
     tls: Option<Keys>,
@@ -85,6 +88,8 @@ pub struct Agent {
     ready: Arc<Ready>,
     /// Where the certificate statuses go; without it none is made.
     statuses: Option<Statuses>,
+    /// The worker that orders certificates, and what wakes it.
+    orders: orders::Orders,
 }
 
 fn apply_error(s: &str) -> BundleError {
@@ -115,6 +120,7 @@ impl Agent {
             good_bots,
             ready,
             statuses: None,
+            orders: orders::Orders::default(),
         }
     }
 
@@ -167,9 +173,10 @@ impl Agent {
         (st.generation, st.agent_id.clone())
     }
 
-    /// Later bundles are refused.
+    /// Later bundles are refused, and no order is taken in.
     pub fn close(&self) {
         self.lock().closed = true;
+        self.orders.wake();
     }
 
     /// Whether the agent has a key directory and this process is the one that writes in it.
@@ -189,15 +196,34 @@ impl Agent {
     pub fn take_over_keys(&self) -> bool {
         let mut st = self.lock();
         let closed = st.closed;
-        match st.tls.as_mut() {
-            Some(keys) if !closed => keys.take_over(),
+        let held = match st.tls.as_mut() {
+            Some(keys) if !closed => {
+                let had = keys.holds_lock();
+                let held = keys.take_over(&self.routes.certificates());
+                if held
+                    && !had
+                    && let Some(out) = &self.statuses
+                {
+                    // What the process that let go ordered may change what an app reports.
+                    out.changed(keys.statuses(None));
+                }
+                held
+            }
             _ => true,
+        };
+        drop(st);
+        if held {
+            // The orders that waited for the lock are due now.
+            self.orders.wake();
         }
+        held
     }
 
-    /// Lets go of the key directory lock for the process that takes over. Call it after `close`:
-    /// from then on this process applies nothing and so writes nothing.
+    /// Lets go of the key directory lock for the process that takes over, and stops the worker that
+    /// orders certificates: the process that takes over orders from then on. Call it after
+    /// `close`: from then on this process applies nothing and so writes nothing.
     pub fn release_keys(&self) {
+        self.orders.stop();
         if let Some(keys) = self.lock().tls.as_mut() {
             keys.release();
         }
@@ -321,6 +347,7 @@ impl Agent {
                 return Err(apply_error(TLS_SETTINGS_REFUSED));
             }
         };
+        let book = self.routes.certificates();
         let mut executors: HashMap<String, (Arc<AppAnalysisSetup>, Stores)> = HashMap::new();
         let mut specs: Vec<AppSpec> = Vec::new();
         let mut addresses: HashSet<String> = HashSet::new();
@@ -359,7 +386,7 @@ impl Agent {
                 app,
                 exec,
                 tls.get(&app.app_id)
-                    .map(|applied| tls_site(&app.app_id, applied)),
+                    .map(|applied| tls_site(&app.app_id, applied, &book)),
             );
             // The route is built here, so a bad route fails before later apps are built.
             if let Err(e) = wafio_proxy::config::build_route(&spec) {
@@ -400,6 +427,8 @@ impl Agent {
             keys.commit(tls);
         }
         drop(st);
+        // An app that asks for a certificate may be due.
+        self.orders.wake();
         if !b.good_bot_cidrs.is_empty()
             && let Some(msg) = self.good_bots.load_ranges_from_cidrs(&b.good_bot_cidrs)
         {
@@ -472,7 +501,7 @@ impl Agent {
         let keys = st.tls.as_mut().ok_or(AckCode::NotInBundle)?;
         keys.install(install, &self.routes.certificates(), &mut secrets, load)?;
         if let Some(out) = &self.statuses {
-            out.changed(status::current(keys.applied(), Some(&install.app_id)));
+            out.changed(keys.statuses(Some(&install.app_id)));
         }
         Ok(())
     }
@@ -486,8 +515,8 @@ impl Agent {
         let st = &mut *guard;
         let Some(keys) = &st.tls else { return };
         match st.refusal.take() {
-            Some(failed) => out.after_refusal(failed, status::current(keys.applied(), None)),
-            None => out.after_bundle(status::current(keys.applied(), None), true),
+            Some(failed) => out.after_refusal(failed, keys.statuses(None)),
+            None => out.after_bundle(keys.statuses(None), true),
         }
     }
 }
@@ -505,10 +534,36 @@ impl ApplyLock<'_> {
     }
 }
 
+/// Whether the book serves `app_id` the placeholder, and it names exactly `hosts`.
+fn has_placeholder_for(book: &CertBook, app_id: &str, hosts: &[String]) -> bool {
+    book.get(app_id).is_some_and(|entry| {
+        entry.placeholder && crate::tls::acme::names::dns_names(entry.key.cert[0].as_ref()) == hosts
+    })
+}
+
 /// The proxy's view of an app's `tls` object: where it listens and which certificate it brings.
-fn tls_site(app_id: &str, applied: &Applied) -> TlsSite {
+fn tls_site(app_id: &str, applied: &Applied, book: &CertBook) -> TlsSite {
     let certificate = match (&applied.served, applied.settings.wanted_file(app_id)) {
         (Some(served), _) => BookChange::Set(book_entry(served)),
+        // The placeholder the book holds for these hosts stays: a new one would show a browser that
+        // clicked through the warning another certificate each time a bundle comes in.
+        (None, Some(_)) if has_placeholder_for(book, app_id, &applied.settings.hosts) => {
+            BookChange::Keep
+        }
+        // An app that is ordered a certificate has nothing to serve before the first one: a
+        // placeholder, so that a handshake succeeds and the app is answered `503` until then.
+        (None, Some(_)) if applied.settings.source == Source::Acme => {
+            match placeholder::certificate(&applied.settings.hosts) {
+                Ok(key) => BookChange::Set(BookEntry {
+                    key,
+                    placeholder: true,
+                }),
+                Err(e) => {
+                    tracing::info!("[acme] app {app_id}: no placeholder certificate: {e}");
+                    BookChange::Keep
+                }
+            }
+        }
         // The bundle names a file that cannot be served yet: what the book holds stays.
         (None, Some(_)) => BookChange::Keep,
         // The bundle names none: whatever the book holds is not served on.
@@ -607,6 +662,8 @@ impl CertificateSink for Certificates {
         self.0.report_bundle();
     }
 }
+
+mod orders;
 
 #[cfg(test)]
 mod tests;

@@ -46,15 +46,20 @@ uddin-waf.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
+http.workspace = true
+http-body.workspace = true
+instant-acme.workspace = true
 libc.workspace = true
 nix.workspace = true
 mimalloc.workspace = true
 pingora.workspace = true
+rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+x509-parser.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

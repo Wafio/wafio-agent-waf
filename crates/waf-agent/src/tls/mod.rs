@@ -5,6 +5,7 @@
 //! change of what is served and every write in the directory happens under the apply lock, one at
 //! a time, in the order the bundles and installs arrive.
 
+pub mod acme;
 pub mod dir;
 pub mod entry;
 pub(crate) mod install;
@@ -16,11 +17,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pingora::tls::sign::CertifiedKey;
-use wafio_control::{AckCode, CertificateInstall};
+use wafio_control::{AckCode, CertificateInstall, CertificateStatus};
 use wafio_proxy::cert_store::{BookEntry, CertBook, leaf_sha256};
 use zeroize::Zeroizing;
 
 use crate::bundle::BundleApp;
+use acme::ca::CaError;
+use acme::order::{Issued, Job};
+use acme::schedule::{self, Plan};
 use dir::{KeyDir, MAX_KEY_FILE, ReadError};
 use entry::{Refusal, Settings, Source, check, is_known_source};
 use install::{LoadKey, Secrets, load_key, pair_from_file, verify_and_store};
@@ -72,6 +76,17 @@ pub struct Keys {
     /// A bundle has been applied. Before that the directory says nothing about which files are
     /// wanted, so none is removed.
     bundle_seen: bool,
+    /// The app whose certificate is being ordered, if one is. One order runs at a time.
+    running: Option<String>,
+}
+
+/// What the worker that orders certificates does next.
+pub enum NextOrder {
+    /// An order is due; it counts as running until `finish_order`.
+    Order(Job),
+    /// Nothing is due. The earliest time something is, if it is known; else until the bundle or
+    /// the key directory lock changes.
+    Wait(Option<i64>),
 }
 
 impl Keys {
@@ -83,6 +98,7 @@ impl Keys {
             state,
             applied: HashMap::new(),
             bundle_seen: false,
+            running: None,
         }
     }
 
@@ -247,12 +263,7 @@ impl Keys {
     /// Records that `app_id` is served `served` now, in the state file too, and drops the files
     /// that nothing needs any more: the certificate it replaced.
     fn serve(&mut self, app_id: &str, served: Served) {
-        self.state.apps.insert(
-            app_id.to_owned(),
-            AppRecord {
-                served: Some(served.file.clone()),
-            },
-        );
+        self.state.apps.entry(app_id.to_owned()).or_default().served = Some(served.file.clone());
         if let Some(app) = self.applied.get_mut(app_id) {
             app.served = Some(served);
         }
@@ -261,30 +272,225 @@ impl Keys {
 
     /// The bundle is in force: `next` is what is applied now. The state and the directory follow,
     /// if this process holds the lock; if not, they follow when it takes the lock over.
+    ///
+    /// What the state knows of the orders of an app is kept while the app is ordered still, the
+    /// failures and the wait they set included: only a success or a new request id lets an app
+    /// order before its time, so editing the hosts of an app cannot be a way round it.
     pub fn commit(&mut self, next: HashMap<String, Applied>) {
         self.applied = next;
         self.bundle_seen = true;
-        self.state = StateFile {
-            apps: self
-                .applied
-                .iter()
-                .filter_map(|(id, a)| {
-                    let served = a.served.as_ref()?.file.clone();
-                    Some((
-                        id.clone(),
-                        AppRecord {
-                            served: Some(served),
-                        },
-                    ))
-                })
-                .collect(),
-        };
+        let mut apps = std::collections::BTreeMap::new();
+        for (id, app) in &self.applied {
+            let mut record = self.state.apps.get(id).cloned().unwrap_or_default();
+            record.served = app.served.as_ref().map(|s| s.file.clone());
+            if app.settings.source != Source::Acme {
+                record = AppRecord {
+                    served: record.served,
+                    ..AppRecord::default()
+                };
+            }
+            if record.served.is_some() || record.has_orders() {
+                apps.insert(id.clone(), record);
+            }
+        }
+        self.state = StateFile { apps };
         self.settle(&HashSet::new());
     }
 
+    /// The order to start next, if one is due: the app that has been due the longest. Only the
+    /// process that holds the key directory lock orders. The app counts as running until
+    /// `finish_order`.
+    pub fn next_order(&mut self, now: i64) -> NextOrder {
+        if !self.dir.holds_lock() || self.running.is_some() {
+            return NextOrder::Wait(None);
+        }
+        let mut first: Option<(i64, &String)> = None;
+        let mut wake: Option<i64> = None;
+        for (id, app) in &self.applied {
+            if app.settings.source != Source::Acme {
+                continue;
+            }
+            let own = schedule::own(id, &app.settings, app.served.as_ref());
+            match schedule::plan(&app.settings, self.state.apps.get(id), own, now) {
+                Plan::Due { since } if first.is_none_or(|(s, i)| (since, id) < (s, i)) => {
+                    first = Some((since, id));
+                }
+                Plan::Wait { until } => wake = Some(wake.map_or(until, |w| w.min(until))),
+                Plan::Due { .. } | Plan::Idle => {}
+            }
+        }
+        let Some((_, id)) = first else {
+            return NextOrder::Wait(wake);
+        };
+        let id = id.clone();
+        let settings = &self.applied[&id].settings;
+        let kind = schedule::choose(settings, self.state.apps.get(&id));
+        let job = Job {
+            hosts: settings.hosts.clone(),
+            request_id: settings.request_id.clone(),
+            kind,
+            missing_listener: schedule::missing_listener(settings, kind),
+            app_id: id.clone(),
+        };
+        self.running = Some(id);
+        NextOrder::Order(job)
+    }
+
+    /// The app whose certificate is being ordered, if one is.
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> Option<&str> {
+        self.running.as_deref()
+    }
+
+    /// The order of `app_id` is over and nothing of it is kept.
+    pub fn abandon_order(&mut self, app_id: &str) {
+        if self.running.as_deref() == Some(app_id) {
+            self.running = None;
+        }
+    }
+
+    /// Takes in what the order of `job` came to, under the apply lock. If the app is no longer
+    /// served by order, or its hosts changed meanwhile, the order is dropped and nothing is
+    /// written: the book follows the bundle. A certificate is kept as `acme-<app_id>.pem`, served
+    /// from the next handshake on in place of the placeholder or the certificate it replaces, and
+    /// remembered in `state.json`. A new request id in the bundle does not drop it: the same hosts
+    /// and source still ask for it, and the new id orders next.
+    ///
+    /// The app counts as ordering until this is done, so `stop_order` can note an error in it.
+    pub fn finish_order(
+        &mut self,
+        job: &Job,
+        outcome: Result<Issued, CaError>,
+        book: &CertBook,
+        directory: &str,
+        now: i64,
+    ) {
+        self.take_in(job, outcome, book, directory, now);
+        self.abandon_order(&job.app_id);
+    }
+
+    /// The order of `job` ended on an internal error that nothing took in: a failure with its
+    /// wait, so the authority is not asked again at once. One taken in before the error is no
+    /// failure.
+    pub fn stop_order(&mut self, job: &Job, book: &CertBook, now: i64) {
+        if self.running.as_deref() == Some(job.app_id.as_str()) {
+            let stopped = Err(CaError::new("the order stopped on an internal error"));
+            self.finish_order(job, stopped, book, "", now);
+        }
+    }
+
+    fn take_in(
+        &mut self,
+        job: &Job,
+        outcome: Result<Issued, CaError>,
+        book: &CertBook,
+        directory: &str,
+        now: i64,
+    ) {
+        let ordered = self
+            .applied
+            .get(&job.app_id)
+            .is_some_and(|a| a.settings.source == Source::Acme && a.settings.hosts == job.hosts);
+        if !ordered {
+            tracing::info!(
+                "[acme] app {}: the order is dropped, the app is no longer served by order for these hosts",
+                job.app_id
+            );
+            return;
+        }
+        let issued = match outcome {
+            Ok(issued) => issued,
+            Err(e) => return self.order_failed(job, &e.line(), now),
+        };
+        let file = format!("acme-{}.pem", job.app_id);
+        if let Err(e) = self.dir.write(&file, &issued.file) {
+            tracing::info!(
+                "[acme] app {}: cannot write {file}: {}",
+                job.app_id,
+                e.kind()
+            );
+            return self.order_failed(
+                job,
+                &format!("cannot keep the certificate ({})", e.kind()),
+                now,
+            );
+        }
+        if !book.set(&job.app_id, issued.key.clone(), false) {
+            // The listeners do not hold the app: nothing can serve the certificate, and an order
+            // that left no trace would be made again at once.
+            let _ = self.dir.remove(&file);
+            return self.order_failed(job, "the certificate cannot be served", now);
+        }
+        let served = Served {
+            file: file.clone(),
+            leaf_sha256: leaf_sha256(&issued.key),
+            key: issued.key,
+        };
+        let record = self.state.apps.entry(job.app_id.clone()).or_default();
+        record.request_id.clone_from(&job.request_id);
+        record.directory = directory.to_owned();
+        record.worked = job.kind.as_str().to_owned();
+        record.forget_failures();
+        tracing::info!("[acme] app {}: issued, served from {file}", job.app_id);
+        self.serve(&job.app_id, served);
+    }
+
+    /// Notes that the order of `job` failed: no new order before the wait is over, and the other
+    /// challenge next time.
+    fn order_failed(&mut self, job: &Job, error: &str, now: i64) {
+        let mut text = format!("the order failed ({}): {error}", job.kind.as_str());
+        if let Some(note) = job.missing_listener {
+            text.push_str("; ");
+            text.push_str(note);
+        }
+        tracing::info!("[acme] app {}: {}", job.app_id, status::error_text(&text));
+        let record = self.state.apps.entry(job.app_id.clone()).or_default();
+        record.request_id.clone_from(&job.request_id);
+        record.tried = job.kind.as_str().to_owned();
+        record.tried_hosts.clone_from(&job.hosts);
+        record.failures = record.failures.saturating_add(1);
+        record.next_attempt_unix = now.saturating_add(acme::RETRY_AFTER_FAILURE);
+        record.error = status::error_text(&text);
+        self.settle(&HashSet::new());
+    }
+
+    /// The statuses of the apps of the bundle in force that have one to report; `only` narrows it
+    /// to one app.
+    pub fn statuses(&self, only: Option<&str>) -> Vec<CertificateStatus> {
+        let mut all = status::current(&self.applied, only);
+        for (id, app) in &self.applied {
+            if app.settings.source == Source::Acme && only.is_none_or(|only| only == id) {
+                all.push(status::ordered(
+                    id,
+                    &app.settings,
+                    app.served.as_ref(),
+                    self.state.apps.get(id),
+                    self.running.as_deref() == Some(id),
+                ));
+            }
+        }
+        all.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+        all
+    }
+
+    /// Reads a file of the key directory that is none of an app's: the account.
+    pub fn read_file(&self, name: &str, limit: usize) -> Result<Vec<u8>, ReadError> {
+        self.dir.read(name, limit)
+    }
+
+    /// Writes such a file, if this process holds the lock.
+    pub fn write_file(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
+        self.dir.write(name, data)
+    }
+
+    pub fn remove_file(&self, name: &str) -> std::io::Result<()> {
+        self.dir.remove(name)
+    }
+
     /// Takes the lock if the process that held it let go, and then does what it could not do
-    /// before. Returns whether this process holds it.
-    pub fn take_over(&mut self) -> bool {
+    /// before: it takes in what that process did after this one applied its bundle, and writes.
+    /// Returns whether this process holds the lock.
+    pub fn take_over(&mut self, book: &CertBook) -> bool {
         if self.dir.holds_lock() {
             return true;
         }
@@ -294,19 +500,77 @@ impl Keys {
         tracing::info!("[tls] this process writes in the key directory now");
         // The process that let go may have got a newer bundle than the one this process applied
         // and written its certificates since: those are files this process does not know about.
+        let (theirs, _) = StateFile::load(&self.dir);
         let known: HashSet<&str> = self
             .written
             .iter()
             .flat_map(StateFile::served_files)
             .collect();
-        let newer: HashSet<String> = StateFile::load(&self.dir)
-            .0
+        let newer: HashSet<String> = theirs
             .served_files()
             .filter(|file| !known.contains(file))
             .map(str::to_owned)
             .collect();
+        self.adopt(&theirs, book);
         self.settle(&newer);
         true
+    }
+
+    /// Takes in the orders the process that let go ended after this one applied its bundle, for
+    /// the apps this one orders for: the certificate it kept, and the failure it noted with the
+    /// time of the next attempt. Without them this process would order again at once, a second
+    /// issuance for the same names, and write its own state over theirs.
+    fn adopt(&mut self, theirs: &StateFile, book: &CertBook) {
+        let ordered: Vec<String> = self
+            .applied
+            .iter()
+            .filter(|(_, a)| a.settings.source == Source::Acme)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ordered {
+            let before = self.written.as_ref().and_then(|w| w.apps.get(&id));
+            if let Some(record) = theirs.apps.get(&id).filter(|r| Some(*r) != before) {
+                self.state
+                    .apps
+                    .entry(id.clone())
+                    .or_default()
+                    .take_orders_from(record);
+            }
+            self.serve_ordered(&id, book);
+        }
+    }
+
+    /// Serves the app from its own certificate file when that holds another certificate than the
+    /// one it is served with: a process that let go of the directory wrote it.
+    fn serve_ordered(&mut self, app_id: &str, book: &CertBook) {
+        let Some(file) = self
+            .applied
+            .get(app_id)
+            .and_then(|a| a.settings.wanted_file(app_id))
+        else {
+            return;
+        };
+        let served = match self.load(&file, None) {
+            Ok(served) => served,
+            Err(Fault::Read(ReadError::Missing)) => return,
+            Err(e) => return tracing::info!("[tls] app {app_id}: {file}: {e}"),
+        };
+        let held = self.applied.get(app_id).and_then(|a| a.served.as_ref());
+        if held.is_some_and(|h| h.file == file && h.leaf_sha256 == served.leaf_sha256) {
+            return;
+        }
+        if !book.set(app_id, served.key.clone(), false) {
+            return;
+        }
+        tracing::info!(
+            "[acme] app {app_id}: serves {file}, which the process that handed over ordered"
+        );
+        // Not `serve`: it would clean the directory before the files of that process are known to
+        // be kept.
+        self.state.apps.entry(app_id.to_owned()).or_default().served = Some(file);
+        if let Some(app) = self.applied.get_mut(app_id) {
+            app.served = Some(served);
+        }
     }
 
     /// Lets go of the lock for the process that takes over.
@@ -692,7 +956,7 @@ pub(crate) mod tests {
 
         // The successor: it reads X and serves it, and the bundle that names Y changes nothing on disk.
         let mut second = keys(&s);
-        assert!(!second.holds_lock() && !second.take_over());
+        assert!(!second.holds_lock() && !second.take_over(&CertBook::default()));
         let applied = apply(&mut second, &[(APP, uploaded(X, &x_leaf))]);
         assert_eq!(served(&applied, APP), Some(x_file.clone()));
         std::fs::write(s.dir().join(&y_file), &y_pem).unwrap();
@@ -716,7 +980,7 @@ pub(crate) mod tests {
 
         // The first lets go: the second takes the lock and does what it put off.
         first.release();
-        assert!(second.take_over() && second.holds_lock());
+        assert!(second.take_over(&CertBook::default()) && second.holds_lock());
         assert_eq!(files(&s.dir()), [y_file.as_str(), STATE_FILE, "tls.lock"]);
         assert_eq!(
             state_on_disk(&s.dir()).apps[APP].served.as_deref(),
@@ -742,7 +1006,7 @@ pub(crate) mod tests {
         assert_eq!(files(&s.dir()), [y_file.as_str(), STATE_FILE, "tls.lock"]);
 
         first.release();
-        assert!(second.take_over());
+        assert!(second.take_over(&CertBook::default()));
         assert_eq!(
             files(&s.dir()),
             [y_file.as_str(), STATE_FILE, "tls.lock"],
@@ -760,11 +1024,50 @@ pub(crate) mod tests {
         first.dir.write(&format!("{X}.pem"), &x_pem).unwrap();
         let mut second = keys(&s);
         first.release();
-        assert!(second.take_over());
+        assert!(second.take_over(&CertBook::default()));
         assert!(files(&s.dir()).contains(&format!("{X}.pem")));
         let none = second.prepare(&[]).unwrap();
         second.commit(none);
         assert!(!files(&s.dir()).contains(&format!("{X}.pem")));
+    }
+
+    #[test]
+    fn a_certificate_the_listeners_cannot_take_is_a_failure_with_a_wait_and_leaves_no_file() {
+        let s = Scratch::new();
+        let mut k = keys(&s);
+        let acme = r#"{"listen":"0.0.0.0:443","hosts":["shop.example.com"],"source":"acme","acme_request_id":"r1"}"#;
+        apply(&mut k, &[(APP, acme.to_owned())]);
+        let NextOrder::Order(job) = k.next_order(1_800_000_000) else {
+            panic!("an order is due");
+        };
+        let (pem, _) = make_pem(&s.0, "x");
+        let issued = Issued {
+            key: Arc::new(certified_key_from_pem(&pem).unwrap()),
+            file: Zeroizing::new(pem),
+        };
+        // The book holds no app, as when the proxy has dropped it.
+        k.finish_order(
+            &job,
+            Ok(issued),
+            &CertBook::default(),
+            "https://ca.test/dir",
+            1_800_000_000,
+        );
+        assert!(!files(&s.dir()).contains(&format!("acme-{APP}.pem")));
+        let record = &state_on_disk(&s.dir()).apps[APP];
+        assert_eq!(
+            (
+                record.failures,
+                record.next_attempt_unix,
+                record.request_id.as_str()
+            ),
+            (1, 1_800_000_000 + acme::RETRY_AFTER_FAILURE, "r1"),
+            "an order that left no trace would be made again at once"
+        );
+        assert!(matches!(
+            k.next_order(1_800_000_001),
+            NextOrder::Wait(Some(_))
+        ));
     }
 
     #[test]
