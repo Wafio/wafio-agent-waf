@@ -413,10 +413,21 @@ pub async fn run_waf_agent(
         ready.clone(),
     )
     .with_statuses(statuses);
+    let ordering = keys.is_some();
     if let Some(dir) = keys {
         agent = agent.with_key_dir(dir);
     }
     let agent = Arc::new(agent);
+    if ordering {
+        let directory = f.resolved_acme_directory()?;
+        info!("[acme] certificates are ordered from {directory}");
+        agent.start_acme(
+            Arc::new(crate::tls::acme::instant::InstantAcme::new(
+                crate::tls::acme::http::Http::new(),
+            )),
+            directory,
+        );
+    }
 
     let link = ControlLink::new(
         cfg,

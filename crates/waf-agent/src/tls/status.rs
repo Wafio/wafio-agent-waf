@@ -11,7 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wafio_control::CertificateStatus;
 use wafio_proxy::cert_store::chain_pem;
 
-use super::entry::{Certificate, Source};
+use super::acme::schedule::{Own, own};
+use super::entry::{Certificate, Settings, Source};
+use super::state_file::AppRecord;
 use super::{Applied, Served};
 use crate::bundle::BundleApp;
 
@@ -79,6 +81,43 @@ fn uploaded(app_id: &str, wanted: &Certificate, served: Option<&Served>) -> Cert
     CertificateStatus {
         certificate_id: wanted.id.clone(),
         ..base(app_id, SOURCE_UPLOADED, state, served)
+    }
+}
+
+/// The status of an app whose certificate is ordered. `pending`: an order is running, or none has
+/// answered the request id of the bundle yet (so one is due, and the chain in use, if any, is
+/// still the previous one); `failed`: the order that answered the id failed, with the time of the
+/// next one; `active`: the certificate in use is the ordered one and covers every host. A finished
+/// order reports only while the id it started under is the bundle's.
+pub fn ordered(
+    app_id: &str,
+    settings: &Settings,
+    served: Option<&Served>,
+    record: Option<&AppRecord>,
+    running: bool,
+) -> CertificateStatus {
+    let answered = record.map_or(settings.request_id.is_empty(), |r| {
+        r.request_id == settings.request_id
+    });
+    let failed = record.filter(|r| answered && r.failures > 0);
+    let state = if running || !answered {
+        State::Pending
+    } else if failed.is_some() {
+        State::Failed
+    } else if own(app_id, settings, served) == Own::Whole {
+        State::Active
+    } else {
+        State::Pending
+    };
+    let (error, next_attempt_unix) = match (state, failed) {
+        (State::Failed, Some(r)) => (r.error.clone(), r.next_attempt_unix),
+        _ => (String::new(), 0),
+    };
+    CertificateStatus {
+        request_id: settings.request_id.clone(),
+        error,
+        next_attempt_unix,
+        ..base(app_id, SOURCE_ACME, state, served)
     }
 }
 
@@ -224,6 +263,127 @@ mod tests {
         // `only` narrows to an app, and an app that is not there has no status.
         assert!(current(&waiting, Some("other")).is_empty());
         assert_eq!(current(&waiting, Some(APP)).len(), 1);
+    }
+
+    fn acme_settings(hosts: &[&str], request_id: &str) -> Settings {
+        Settings {
+            listen: "0.0.0.0:443".into(),
+            redirect_listen: None,
+            hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+            source: Source::Acme,
+            certificate: None,
+            request_id: request_id.into(),
+        }
+    }
+
+    fn acme_record(request_id: &str, failures: u32) -> AppRecord {
+        AppRecord {
+            request_id: request_id.into(),
+            failures,
+            next_attempt_unix: if failures > 0 { 1_800_000_600 } else { 0 },
+            error: if failures > 0 {
+                "it failed".into()
+            } else {
+                String::new()
+            },
+            ..AppRecord::default()
+        }
+    }
+
+    #[test]
+    fn an_ordered_certificate_is_pending_active_or_failed_for_the_request_id_of_the_bundle() {
+        let file = format!("acme-{APP}.pem");
+        let chain =
+            crate::tls::acme::placeholder::certificate(&["shop.example.com".to_owned()]).unwrap();
+        let served = |file: &str| Served {
+            file: file.to_owned(),
+            leaf_sha256: leaf_sha256(&chain),
+            key: chain.clone(),
+        };
+        let whole = acme_settings(&["shop.example.com"], "r1");
+        let status =
+            |settings: &Settings, served: Option<&Served>, record: Option<&AppRecord>, running| {
+                let s = ordered(APP, settings, served, record, running);
+                (
+                    s.state,
+                    s.request_id,
+                    s.error,
+                    s.next_attempt_unix,
+                    s.leaf_sha256.is_empty(),
+                )
+            };
+        let show = |state: &str, id: &str, error: &str, at: i64, no_leaf: bool| {
+            (
+                state.to_owned(),
+                id.to_owned(),
+                error.to_owned(),
+                at,
+                no_leaf,
+            )
+        };
+        let own = served(&file);
+
+        // Nothing ordered yet: pending, before the first order and while it runs.
+        assert_eq!(
+            status(&whole, None, None, false),
+            show("pending", "r1", "", 0, true)
+        );
+        assert_eq!(
+            status(&whole, None, Some(&acme_record("r1", 0)), true),
+            show("pending", "r1", "", 0, true)
+        );
+        // The certificate in use is the ordered one and covers the hosts.
+        assert_eq!(
+            status(&whole, Some(&own), Some(&acme_record("r1", 0)), false),
+            show("active", "r1", "", 0, false)
+        );
+        // The one in use is another (the previous source's): pending, with its chain described.
+        let other = served(&format!("{CERT}.pem"));
+        assert_eq!(
+            status(&whole, Some(&other), Some(&acme_record("r1", 0)), false),
+            show("pending", "r1", "", 0, false)
+        );
+        // A host the certificate does not cover: pending.
+        let wider = acme_settings(&["shop.example.com", "more.example.com"], "r1");
+        assert_eq!(
+            status(&wider, Some(&own), Some(&acme_record("r1", 0)), false),
+            show("pending", "r1", "", 0, false)
+        );
+        // The last order failed: failed, with its text and the time of the next, and the chain
+        // in use if there is one.
+        assert_eq!(
+            status(&whole, None, Some(&acme_record("r1", 2)), false),
+            show("failed", "r1", "it failed", 1_800_000_600, true)
+        );
+        assert_eq!(
+            status(&whole, Some(&own), Some(&acme_record("r1", 1)), false),
+            show("failed", "r1", "it failed", 1_800_000_600, false)
+        );
+        // While the next order runs it is pending again, and says nothing of the failure.
+        assert_eq!(
+            status(&whole, None, Some(&acme_record("r1", 1)), true),
+            show("pending", "r1", "", 0, true)
+        );
+        // An order that answered another id reports nothing for this one: pending for the new id.
+        let new_id = acme_settings(&["shop.example.com"], "r2");
+        assert_eq!(
+            status(&new_id, Some(&own), Some(&acme_record("r1", 0)), false),
+            show("pending", "r2", "", 0, false)
+        );
+        assert_eq!(
+            status(&new_id, None, Some(&acme_record("r1", 3)), false),
+            show("pending", "r2", "", 0, true)
+        );
+        // The source is `acme` and the certificate id is empty.
+        let s = ordered(APP, &whole, None, None, false);
+        assert_eq!(
+            (
+                s.source.as_str(),
+                s.certificate_id.as_str(),
+                s.app_id.as_str()
+            ),
+            ("acme", "", APP)
+        );
     }
 
     #[test]

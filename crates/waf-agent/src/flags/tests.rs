@@ -437,3 +437,58 @@ fn engine_env_and_component_paths() {
     assert_eq!(paths["ja3"], "");
     assert_eq!(paths.len(), 8);
 }
+
+#[test]
+fn the_acme_directory_is_the_one_of_lets_encrypt_unless_named_and_must_be_https() {
+    assert_eq!(
+        parse(&[]).resolved_acme_directory().unwrap(),
+        "https://acme-v02.api.letsencrypt.org/directory"
+    );
+    // The flag, and the environment when the flag is not given; the flag wins.
+    let f = parse(&["--acme-directory", "https://acme.test:14000/dir"]);
+    assert_eq!(
+        f.resolved_acme_directory().unwrap(),
+        "https://acme.test:14000/dir"
+    );
+    let mut f = parse(&[]);
+    f.fill_from_env(&env(
+        &[("WAFIO_ACME_DIRECTORY", "https://env.test/dir")],
+        &[],
+    ));
+    assert_eq!(f.resolved_acme_directory().unwrap(), "https://env.test/dir");
+    let mut f = parse(&["--acme-directory=https://flag.test/dir"]);
+    f.fill_from_env(&env(
+        &[("WAFIO_ACME_DIRECTORY", "https://env.test/dir")],
+        &[],
+    ));
+    assert_eq!(
+        f.resolved_acme_directory().unwrap(),
+        "https://flag.test/dir"
+    );
+    // The account key and every request go there: nothing but https is taken, from either.
+    for bad in [
+        "http://acme.test/dir",
+        "HTTP://acme.test/dir",
+        "ftp://acme.test/dir",
+        "acme.test/dir",
+        "https://",
+        "//acme.test",
+    ] {
+        let e = parse(&["--acme-directory", bad])
+            .resolved_acme_directory()
+            .unwrap_err();
+        assert!(
+            e.contains("--acme-directory") && e.contains("https"),
+            "{bad}: {e}"
+        );
+        let mut f = parse(&[]);
+        f.fill_from_env(&env(&[("WAFIO_ACME_DIRECTORY", bad)], &[]));
+        assert!(f.resolved_acme_directory().is_err(), "{bad}");
+    }
+    assert!(
+        parse(&["--acme-directory", "HTTPS://acme.test/dir"])
+            .resolved_acme_directory()
+            .is_ok(),
+        "the scheme is not case sensitive"
+    );
+}

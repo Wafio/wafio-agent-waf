@@ -88,6 +88,7 @@ fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     }
     f.check_required()?;
     f.check_paths()?;
+    f.resolved_acme_directory()?;
     let metrics_addr =
         std::env::var(wafio_agent_io::metrics::LISTEN_ADDRESS_ENV).unwrap_or_default();
     if !metrics_addr.is_empty() {

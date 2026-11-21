@@ -5,6 +5,10 @@
 //! taken writes nothing in the directory until it is free, and an entry that fails a check refuses
 //! the whole bundle. Keys are made by `openssl` at test time into a scratch directory that is
 //! removed when the test ends.
+//!
+//! The last tests order certificates from Pebble, the ACME test server of Let's Encrypt. They run
+//! when `WAFIO_PEBBLE_DIRECTORY` is set, which `eval "$(scripts/pebble.sh up)"` does, and print that
+//! they are skipped when it is not.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -1547,4 +1551,383 @@ async fn an_agent_without_a_usable_key_directory_leaves_the_feature_out_and_take
         c.received
     );
     KeyNeedles::of(&s.key).assert_absent_from_messages(&c.received);
+}
+
+// ── certificates ordered from Pebble ─────────────────────────────────────────────────────────
+
+/// Pebble, from the settings `scripts/pebble.sh up` printed. Pebble connects to the ports it names
+/// for a validation, so the tests that use it run one at a time.
+struct Pebble {
+    directory: String,
+    root: String,
+    /// The port Pebble connects to for HTTP-01, and for TLS-ALPN-01.
+    http: u16,
+    tls: u16,
+}
+
+static PEBBLE_IN_USE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+impl Pebble {
+    fn from_env() -> Option<Pebble> {
+        let directory = std::env::var("WAFIO_PEBBLE_DIRECTORY").ok()?;
+        let port = |name: &str| {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("{name} is not set"))
+                .parse()
+                .unwrap()
+        };
+        Some(Pebble {
+            directory,
+            root: std::env::var("WAFIO_PEBBLE_ROOT").expect("WAFIO_PEBBLE_ROOT is not set"),
+            http: port("WAFIO_PEBBLE_HTTP_PORT"),
+            tls: port("WAFIO_PEBBLE_TLS_PORT"),
+        })
+    }
+
+    /// The agent orders from Pebble, which the platform's roots do not know: it is given Pebble's
+    /// root the way any root is added to them.
+    fn set(&self, cmd: &mut Command) {
+        cmd.env("SSL_CERT_FILE", &self.root)
+            .env("WAFIO_ACME_DIRECTORY", &self.directory);
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+        ] {
+            cmd.env_remove(name);
+        }
+    }
+}
+
+macro_rules! pebble {
+    () => {
+        match Pebble::from_env() {
+            Some(pebble) => pebble,
+            None => {
+                eprintln!("WAFIO_PEBBLE_DIRECTORY is not set: this test is skipped");
+                return;
+            }
+        }
+    };
+}
+
+/// The `tls` object of an app whose certificate is ordered.
+fn acme_object(listen: u16, redirect: Option<u16>, request_id: &str) -> String {
+    let redirect = redirect.map_or(String::new(), |p| {
+        format!(r#""redirect_listen":"127.0.0.1:{p}","#)
+    });
+    format!(
+        r#"{{"listen":"127.0.0.1:{listen}","hosts":["{HOST}"],{redirect}"source":"acme","acme_request_id":"{request_id}"}}"#
+    )
+}
+
+/// A client that takes any certificate: what Pebble issues is signed by a root of its own.
+#[derive(Debug)]
+struct TakesAny;
+
+impl rustls::client::danger::ServerCertVerifier for TakesAny {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_taking_any() -> Arc<ClientConfig> {
+    pingora::tls::install_default_crypto_provider();
+    let mut config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(TakesAny))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.resumption = rustls::client::Resumption::disabled();
+    Arc::new(config)
+}
+
+/// The state file with a record of the shop, which `Setup::new` has not made yet: a hold that lets
+/// a test look at the app while it has nothing but its placeholder.
+fn seed_state(s: &Setup, record: &str) {
+    fs::write(
+        s.keys.join("state.json"),
+        format!(r#"{{"apps":{{"{SHOP}":{record}}}}}"#),
+    )
+    .unwrap();
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// What would give away what the agent keeps secret about its orders: the account's key, as the
+/// file holds it, and the key of the certificate it was issued for.
+fn assert_orders_keep_their_keys(s: &Setup, stream: &Conn, issued: &str) {
+    let account = fs::read_to_string(s.keys.join("acme-account.json")).unwrap();
+    let key = account
+        .split("\"key_pkcs8\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the account file holds the account key");
+    let log = s.log_text();
+    assert!(!log.contains(key), "the account key is in the log");
+    assert!(
+        !stream.received.iter().any(|m| m.contains(key)),
+        "the account key is in a message"
+    );
+    let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
+    assert!(
+        !state.contains(key) && !state.contains("PRIVATE KEY"),
+        "{state}"
+    );
+    let cache = fs::read_to_string(s.dir.join("state/last-bundle.json")).unwrap_or_default();
+    assert!(!cache.contains(key));
+    // The key of the issued certificate is in its file and nowhere else.
+    let end = "-----END PRIVATE KEY-----";
+    let key_block = &issued[..issued.find(end).expect("the file holds the key") + end.len()];
+    let needles = KeyNeedles::of(key_block);
+    needles.assert_in_file(issued.as_bytes());
+    needles.assert_absent("the log", log.as_bytes());
+    needles.assert_absent("the state", state.as_bytes());
+    needles.assert_absent_from_messages(&stream.received);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_issues_by_tls_alpn_on_the_tls_listener_and_a_placeholder_connection_goes_on() {
+    let pebble = pebble!();
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-alpn");
+    // The app has been waiting for a few seconds: it has nothing but the placeholder meanwhile.
+    seed_state(
+        &s,
+        &format!(
+            r#"{{"request_id":"r1","next_attempt_unix":{}}}"#,
+            unix_now() + 6
+        ),
+    );
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    let tls = acme_object(pebble.tls, Some(pebble.http), "r1");
+    let (ok, error) = stream.bundle("b1", 1, s.bundle(&[s.shop(&tls)])).await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    let pending = stream.status(SHOP, "pending").await;
+    assert_eq!(
+        (
+            pending.source.as_str(),
+            pending.request_id.as_str(),
+            pending.certificate_id.as_str()
+        ),
+        ("acme", "r1", "")
+    );
+    assert!(pending.chain_pem.is_empty());
+
+    // Nothing but the placeholder: the handshake succeeds with it and the app is not reached, and
+    // the redirect listener does not send anyone to HTTPS yet.
+    let any = client_taking_any();
+    let mut old = Https::connect(pebble.tls, &any, HOST).await.unwrap();
+    let placeholder = old.peer_leaf();
+    let mut fresh = Https::connect(pebble.tls, &any, HOST).await.unwrap();
+    let r = fresh.send(&get("/cart")).await.unwrap();
+    assert_eq!(r.status, 503);
+    assert_eq!(r.header("retry-after"), Some("60"));
+    let r = plain(pebble.http, HOST, "/cart").await.unwrap();
+    assert_eq!((r.status, r.header("location")), (503, None));
+    assert!(s.upstream.heads().is_empty(), "the app was not reached");
+
+    // The order runs once its wait is over, with TLS-ALPN-01 on the TLS listener.
+    let active = stream.status(SHOP, "active").await;
+    assert_eq!(
+        (active.source.as_str(), active.request_id.as_str()),
+        ("acme", "r1")
+    );
+    assert!(!active.chain_pem.is_empty() && active.leaf_sha256.len() == 64);
+    assert_ne!(active.leaf_sha256, placeholder);
+    assert_eq!((active.error.as_str(), active.next_attempt_unix), ("", 0));
+    let mut served = Https::connect(pebble.tls, &any, HOST).await.unwrap();
+    assert_eq!(
+        served.peer_leaf(),
+        active.leaf_sha256,
+        "the issued certificate is served, no restart"
+    );
+    assert_eq!(served.send(&get("/cart")).await.unwrap().status, 200);
+    // The connection that was open across the switch goes on: it is answered, not cut.
+    let r = old.send(&get("/cart")).await.unwrap();
+    assert_eq!(
+        r.status, 503,
+        "a connection made for the placeholder is answered 503 only"
+    );
+    let r = plain(pebble.http, HOST, "/cart?a=1").await.unwrap();
+    assert_eq!(r.status, 308);
+    assert_eq!(
+        r.header("location"),
+        Some(format!("https://{HOST}:{}/cart?a=1", pebble.tls).as_str())
+    );
+
+    // What the agent keeps: the certificate and the account in files only the agent reads, and the
+    // state that says how it was made.
+    let file = format!("acme-{SHOP}.pem");
+    for name in [file.as_str(), "acme-account.json"] {
+        let mode = fs::metadata(s.keys.join(name)).unwrap().permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+            0o600,
+            "{name}"
+        );
+    }
+    let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
+    assert!(
+        state.contains(&pebble.directory) && state.contains("tls-alpn-01"),
+        "{state}"
+    );
+    assert!(state.contains(r#""request_id":"r1""#), "{state}");
+    assert!(!files(&s.keys).contains(&format!("{CERT}.pem")));
+    assert_orders_keep_their_keys(
+        &s,
+        &stream,
+        &fs::read_to_string(s.keys.join(&file)).unwrap(),
+    );
+    let log = s.log_text();
+    assert!(
+        log.contains("[acme] made an account at") && log.contains("issued, served from"),
+        "{log}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_validates_by_http_on_the_redirect_listener_when_tls_alpn_cannot_reach() {
+    let pebble = pebble!();
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-http");
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    // The TLS listener is not where Pebble connects for TLS-ALPN-01; the redirect listener is
+    // where it connects for HTTP-01.
+    let [elsewhere] = free_ports::<1>();
+    let tls = acme_object(elsewhere, Some(pebble.http), "r1");
+    let (ok, error) = stream.bundle("b1", 1, s.bundle(&[s.shop(&tls)])).await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+
+    // The first order answers TLS-ALPN-01, which Pebble cannot reach: it fails, and says why.
+    let failed = stream.status(SHOP, "failed").await;
+    assert_eq!(failed.request_id, "r1");
+    assert!(failed.error.contains("tls-alpn-01"), "{}", failed.error);
+    assert!(
+        i64::try_from(unix_now()).unwrap() + 300 < failed.next_attempt_unix,
+        "the next attempt is minutes away: {}",
+        failed.next_attempt_unix
+    );
+    // A new request id orders at once, with the other challenge.
+    let tls = acme_object(elsewhere, Some(pebble.http), "r2");
+    let (ok, error) = stream.bundle("b2", 2, s.bundle(&[s.shop(&tls)])).await;
+    assert!(ok, "{error}");
+    let active = stream.status(SHOP, "active").await;
+    assert_eq!(
+        (active.request_id.as_str(), active.error.as_str()),
+        ("r2", "")
+    );
+    let served = Https::connect(elsewhere, &client_taking_any(), HOST)
+        .await
+        .unwrap();
+    assert_eq!(served.peer_leaf(), active.leaf_sha256);
+    assert_eq!(plain(pebble.http, HOST, "/").await.unwrap().status, 308);
+    let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
+    assert!(state.contains(r#""worked":"http-01""#), "{state}");
+    let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
+    assert_orders_keep_their_keys(&s, &stream, &file);
+}
+
+/// What a CDN does that turns port 80 into HTTPS: every plain request is sent to the same
+/// path over HTTPS, on the port of the TLS listener.
+async fn redirecting_to_https(port: u16, https: u16) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !contains(&head, b"\r\n\r\n") {
+                    match tcp.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).into_owned();
+                let path = text.split(' ').nth(1).unwrap_or("/").to_owned();
+                let reply = format!(
+                    "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{HOST}:{https}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = tcp.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_validates_by_http_on_the_tls_listener_behind_a_redirect_to_https() {
+    let pebble = pebble!();
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-cdn");
+    // The challenge that worked last is HTTP-01, and the app has no listener on plain HTTP: only
+    // the TLS listener, which something in front sends port 80 to.
+    seed_state(&s, r#"{"worked":"http-01"}"#);
+    redirecting_to_https(pebble.http, pebble.tls).await;
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    let tls = acme_object(pebble.tls, None, "r1");
+    let (ok, error) = stream.bundle("b1", 1, s.bundle(&[s.shop(&tls)])).await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    let active = stream.status(SHOP, "active").await;
+    assert_eq!(
+        (active.request_id.as_str(), active.error.as_str()),
+        ("r1", "")
+    );
+    let mut served = Https::connect(pebble.tls, &client_taking_any(), HOST)
+        .await
+        .unwrap();
+    assert_eq!(served.peer_leaf(), active.leaf_sha256);
+    assert_eq!(served.send(&get("/")).await.unwrap().status, 200);
+    let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
+    assert!(state.contains(r#""worked":"http-01""#), "{state}");
+    let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
+    assert_orders_keep_their_keys(&s, &stream, &file);
 }
