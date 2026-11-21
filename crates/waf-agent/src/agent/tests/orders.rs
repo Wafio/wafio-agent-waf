@@ -445,8 +445,10 @@ async fn the_account_is_taken_from_its_file_after_a_restart_and_made_again_for_a
 const A: &str = "1a2b3c4d-0000-4000-8000-00000000000a";
 const B: &str = "1a2b3c4d-0000-4000-8000-00000000000b";
 const C: &str = "1a2b3c4d-0000-4000-8000-00000000000c";
-/// The app of the tests that make the code panic through the log: no other test logs about it.
-const PANICKY: &str = "1a2b3c4d-0000-4000-8000-00000000000d";
+/// The apps of the two tests that make the code panic through the log, one each: the needles
+/// are shared by every test thread, so a needle must match the lines of one test only.
+const PANICS_ONCE: &str = "1a2b3c4d-0000-4000-8000-00000000000d";
+const PANICS_TWICE: &str = "1a2b3c4d-0000-4000-8000-00000000000e";
 
 #[tokio::test]
 async fn orders_run_one_at_a_time_and_the_app_that_has_been_due_the_longest_goes_first() {
@@ -1408,15 +1410,15 @@ async fn an_error_while_an_order_is_taken_in_is_noted_as_its_failure_and_the_wor
     PANIC_AT
         .lock()
         .unwrap()
-        .push(format!("app {PANICKY}: issued"));
+        .push(format!("app {PANICS_ONCE}: issued"));
     r.start();
-    r.apply(&[(PANICKY, &[HOST], "r1")], 1);
+    r.apply(&[(PANICS_ONCE, &[HOST], "r1")], 1);
     until("the failure is noted", || {
-        r.status(PANICKY).state == "failed"
+        r.status(PANICS_ONCE).state == "failed"
     })
     .await;
     until("the order is over", || !r.ordering()).await;
-    let status = r.status(PANICKY);
+    let status = r.status(PANICS_ONCE);
     assert_eq!(
         status.error,
         "the order failed (tls-alpn-01): the order stopped on an internal error"
@@ -1425,9 +1427,9 @@ async fn an_error_while_an_order_is_taken_in_is_noted_as_its_failure_and_the_wor
     assert_eq!(r.ca.script().orders.len(), 1, "it waits for its time");
 
     // The worker is alive: a new request id orders at once.
-    r.apply(&[(PANICKY, &[HOST], "r2")], 2);
+    r.apply(&[(PANICS_ONCE, &[HOST], "r2")], 2);
     until("the next order is taken in", || {
-        r.status(PANICKY).state == "active"
+        r.status(PANICS_ONCE).state == "active"
     })
     .await;
     assert_eq!(r.ca.script().orders.len(), 2);
@@ -1440,20 +1442,20 @@ async fn an_error_that_comes_again_in_noting_the_failure_lets_go_of_the_order_an
     let r = rig();
     {
         let mut at = PANIC_AT.lock().unwrap();
-        at.push(format!("app {PANICKY}: issued"));
-        at.push(format!("app {PANICKY}: the order failed"));
+        at.push(format!("app {PANICS_TWICE}: issued"));
+        at.push(format!("app {PANICS_TWICE}: the order failed"));
     }
     r.start();
-    r.apply(&[(PANICKY, &[HOST], "r1")], 1);
+    r.apply(&[(PANICS_TWICE, &[HOST], "r1")], 1);
     // Nothing could note the failure, so the app is ordered again as soon as the order is let go
     // of, and this one goes through.
     until("the next order is taken in", || {
-        r.ca.script().orders.len() == 2 && r.status(PANICKY).state == "active"
+        r.ca.script().orders.len() == 2 && r.status(PANICS_TWICE).state == "active"
     })
     .await;
     assert!(
         LOG.lock().unwrap().contains(&format!(
-            "app {PANICKY}: the order could not be noted as failed"
+            "app {PANICS_TWICE}: the order could not be noted as failed"
         )),
         "the log says so"
     );
