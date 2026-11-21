@@ -403,8 +403,8 @@ impl AgentArgs {
     }
 
     /// The ACME directory the agent orders from: the one named, or the production one of Let's
-    /// Encrypt. The agent sends its account key and its requests there, so only an https address
-    /// is accepted.
+    /// Encrypt. The agent signs its requests with its account key and the issued chain comes back
+    /// the same way, so only an https address is accepted.
     pub fn resolved_acme_directory(&self) -> Result<String, String> {
         let url = self.acme_directory.trim();
         if url.is_empty() {

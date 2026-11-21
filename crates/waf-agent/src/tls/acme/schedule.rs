@@ -46,20 +46,31 @@ pub enum Plan {
 
 /// The plan of an app with the source `acme`. An order is due when the app has no certificate of
 /// its own, when a host is not covered by it, or when the bundle asks for one with an id that no
-/// order has answered. The first two wait for the next attempt that a failed order set; a new id
-/// does not.
+/// order has answered. An order that failed under the current id is tried again, whatever the app
+/// is served meanwhile: the certificate it asked for is not there yet. Every case but a new id
+/// waits for the next attempt that the failed order set.
 pub fn plan(settings: &Settings, record: Option<&AppRecord>, own: Own, now: i64) -> Plan {
     let answered = record.map_or("", |r| r.request_id.as_str());
     if settings.request_id != answered {
         return Plan::Due { since: now };
     }
-    if own == Own::Whole {
+    if own == Own::Whole && record.is_none_or(|r| r.failures == 0) {
         return Plan::Idle;
     }
     match record.map_or(0, |r| r.next_attempt_unix) {
         until if until > now => Plan::Wait { until },
         0 => Plan::Due { since: now },
         since => Plan::Due { since },
+    }
+}
+
+/// When a failed order is tried again, for the status: the time `plan` holds the app back until,
+/// or 0 when no attempt is planned. Read with the clock at zero every planned attempt is still
+/// ahead, so the status and the worker cannot disagree.
+pub fn retry_at(settings: &Settings, record: Option<&AppRecord>, own: Own) -> i64 {
+    match plan(settings, record, own, 0) {
+        Plan::Wait { until } => until,
+        Plan::Due { .. } | Plan::Idle => 0,
     }
 }
 
@@ -87,15 +98,19 @@ pub fn choose(settings: &Settings, record: Option<&AppRecord>) -> Kind {
     }
 }
 
-/// The port the authority connects to for `kind` that the app does not serve, if it does not. A
-/// validation by HTTP-01 may also reach an app that listens on 443 only, through a CDN that sends
-/// port 80 to HTTPS.
-pub fn missing_port(settings: &Settings, kind: Kind) -> Option<u16> {
+/// What a failed order says about the port the authority connects to for `kind`, when the app
+/// does not serve it. A validation by HTTP-01 may still reach an app that listens on 443 only,
+/// through a CDN that sends port 80 to HTTPS, so for such an app the text says so and adds the
+/// way out.
+pub fn missing_listener(settings: &Settings, kind: Kind) -> Option<&'static str> {
     let https = port(&settings.listen) == Some(443);
     let plain = settings.redirect_listen.as_deref().and_then(port) == Some(80);
     match kind {
-        Kind::TlsAlpn01 if !https => Some(443),
-        Kind::Http01 if !plain && !https => Some(80),
+        Kind::TlsAlpn01 if !https => Some("this app does not listen on port 443"),
+        Kind::Http01 if !plain && !https => Some("this app does not listen on port 80"),
+        Kind::Http01 if !plain => Some(
+            "this app does not listen on port 80 (a check by HTTP-01 reaches it only through something that sends port 80 to HTTPS; a redirect_listen on port 80 answers it)",
+        ),
         _ => None,
     }
 }
@@ -196,6 +211,48 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_order_under_the_current_id_is_tried_again_while_the_certificate_is_whole() {
+        let s = settings("0.0.0.0:443", None, "r2");
+        let failed = AppRecord {
+            failures: 1,
+            ..record("r2", NOW + 600)
+        };
+        assert_eq!(
+            plan(&s, Some(&failed), Own::Whole, NOW),
+            Plan::Wait { until: NOW + 600 }
+        );
+        assert_eq!(
+            plan(&s, Some(&failed), Own::Whole, NOW + 700),
+            Plan::Due { since: NOW + 600 }
+        );
+        // The same record with the failures forgotten has nothing to try again.
+        assert_eq!(
+            plan(&s, Some(&record("r2", 0)), Own::Whole, NOW),
+            Plan::Idle
+        );
+    }
+
+    #[test]
+    fn the_time_a_status_gives_is_the_time_the_plan_waits_until() {
+        let s = settings("0.0.0.0:443", None, "r1");
+        let failed = AppRecord {
+            failures: 1,
+            ..record("r1", NOW + 600)
+        };
+        for own in [Own::Missing, Own::Gaps, Own::Whole] {
+            assert_eq!(retry_at(&s, Some(&failed), own), NOW + 600, "{own:?}");
+            assert_eq!(
+                plan(&s, Some(&failed), own, NOW),
+                Plan::Wait { until: NOW + 600 },
+                "{own:?}"
+            );
+        }
+        // Nothing planned: nothing to say.
+        assert_eq!(retry_at(&s, Some(&record("r1", 0)), Own::Whole), 0);
+        assert_eq!(retry_at(&s, None, Own::Whole), 0);
+    }
+
+    #[test]
     fn the_challenge_is_the_one_that_worked_else_the_port_the_app_listens_on_else_tls_alpn() {
         let on_443 = settings("0.0.0.0:443", Some("0.0.0.0:80"), "");
         let only_80 = settings("0.0.0.0:8443", Some("0.0.0.0:80"), "");
@@ -248,15 +305,29 @@ mod tests {
         let on_443 = settings("0.0.0.0:443", None, "");
         let only_80 = settings("0.0.0.0:8443", Some("0.0.0.0:80"), "");
         let neither = settings("0.0.0.0:8443", None, "");
-        assert_eq!(missing_port(&on_443, Kind::TlsAlpn01), None);
+        let both = settings("0.0.0.0:443", Some("0.0.0.0:80"), "");
+        assert_eq!(missing_listener(&on_443, Kind::TlsAlpn01), None);
+        assert_eq!(missing_listener(&only_80, Kind::Http01), None);
+        assert_eq!(missing_listener(&both, Kind::Http01), None);
         assert_eq!(
-            missing_port(&on_443, Kind::Http01),
-            None,
-            "a CDN may send port 80 to the HTTPS listener"
+            missing_listener(&only_80, Kind::TlsAlpn01),
+            Some("this app does not listen on port 443")
         );
-        assert_eq!(missing_port(&only_80, Kind::Http01), None);
-        assert_eq!(missing_port(&only_80, Kind::TlsAlpn01), Some(443));
-        assert_eq!(missing_port(&neither, Kind::TlsAlpn01), Some(443));
-        assert_eq!(missing_port(&neither, Kind::Http01), Some(80));
+        assert_eq!(
+            missing_listener(&neither, Kind::TlsAlpn01),
+            Some("this app does not listen on port 443")
+        );
+        assert_eq!(
+            missing_listener(&neither, Kind::Http01),
+            Some("this app does not listen on port 80")
+        );
+        // A CDN may send port 80 to the HTTPS listener, so the text allows for it and names the way
+        // out.
+        let cdn = missing_listener(&on_443, Kind::Http01).unwrap();
+        assert!(
+            cdn.starts_with("this app does not listen on port 80 (")
+                && cdn.contains("redirect_listen"),
+            "{cdn}"
+        );
     }
 }

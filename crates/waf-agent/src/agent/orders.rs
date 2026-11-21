@@ -118,10 +118,17 @@ impl Agent {
         Some(next)
     }
 
-    /// An order ended without anything to take in: the app is not running one any more.
-    pub(crate) fn abandon_order(&self, app_id: &str) {
-        if let Some(keys) = self.lock().tls.as_mut() {
-            keys.abandon_order(app_id);
+    /// Taking in what an order came to stopped on an internal error. The order is noted as failed,
+    /// so that the next one waits for its time as after any failure, and does not start at once and
+    /// stop the same way over and over against the authority.
+    pub(crate) fn order_stopped(&self, job: &Job, now: i64) {
+        let mut guard = self.lock();
+        let st = &mut *guard;
+        let Some(keys) = st.tls.as_mut() else { return };
+        let outcome = Err(CaError::new("the order stopped on an internal error"));
+        keys.finish_order(job, outcome, &self.routes.certificates(), "", now);
+        if let Some(out) = &self.statuses {
+            out.changed(keys.statuses(Some(&job.app_id)));
         }
     }
 
@@ -136,8 +143,10 @@ impl Agent {
         let mut guard = self.lock();
         let st = &mut *guard;
         let Some(keys) = st.tls.as_mut() else { return };
-        // A process that has closed writes nothing: the one that takes over orders again.
-        if st.closed {
+        // A process that has closed still takes in an order that ends while it holds the lock:
+        // the one that takes over finds the certificate and does not order again. Once the lock is
+        // handed over it writes nothing, and the one that takes over orders.
+        if st.closed && !keys.holds_lock() {
             keys.abandon_order(&job.app_id);
             return;
         }

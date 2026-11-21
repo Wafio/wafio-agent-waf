@@ -195,7 +195,18 @@ impl Agent {
         let mut st = self.lock();
         let closed = st.closed;
         let held = match st.tls.as_mut() {
-            Some(keys) if !closed => keys.take_over(),
+            Some(keys) if !closed => {
+                let had = keys.holds_lock();
+                let held = keys.take_over(&self.routes.certificates());
+                if held
+                    && !had
+                    && let Some(out) = &self.statuses
+                {
+                    // What the process that let go ordered may change what an app reports.
+                    out.changed(keys.statuses(None));
+                }
+                held
+            }
             _ => true,
         };
         drop(st);
@@ -334,6 +345,7 @@ impl Agent {
                 return Err(apply_error(TLS_SETTINGS_REFUSED));
             }
         };
+        let book = self.routes.certificates();
         let mut executors: HashMap<String, (Arc<AppAnalysisSetup>, Stores)> = HashMap::new();
         let mut specs: Vec<AppSpec> = Vec::new();
         let mut addresses: HashSet<String> = HashSet::new();
@@ -372,7 +384,7 @@ impl Agent {
                 app,
                 exec,
                 tls.get(&app.app_id)
-                    .map(|applied| tls_site(&app.app_id, applied)),
+                    .map(|applied| tls_site(&app.app_id, applied, &book)),
             );
             // The route is built here, so a bad route fails before later apps are built.
             if let Err(e) = wafio_proxy::config::build_route(&spec) {
@@ -520,10 +532,22 @@ impl ApplyLock<'_> {
     }
 }
 
+/// Whether the book serves `app_id` the placeholder, and it names exactly `hosts`.
+fn has_placeholder_for(book: &CertBook, app_id: &str, hosts: &[String]) -> bool {
+    book.get(app_id).is_some_and(|entry| {
+        entry.placeholder && crate::tls::acme::names::dns_names(entry.key.cert[0].as_ref()) == hosts
+    })
+}
+
 /// The proxy's view of an app's `tls` object: where it listens and which certificate it brings.
-fn tls_site(app_id: &str, applied: &Applied) -> TlsSite {
+fn tls_site(app_id: &str, applied: &Applied, book: &CertBook) -> TlsSite {
     let certificate = match (&applied.served, applied.settings.wanted_file(app_id)) {
         (Some(served), _) => BookChange::Set(book_entry(served)),
+        // The placeholder the book holds for these hosts stays: a new one would show a browser that
+        // clicked through the warning another certificate each time a bundle comes in.
+        (None, Some(_)) if has_placeholder_for(book, app_id, &applied.settings.hosts) => {
+            BookChange::Keep
+        }
         // An app that is ordered a certificate has nothing to serve before the first one: a
         // placeholder, so that a handshake succeeds and the app is answered `503` until then.
         (None, Some(_)) if applied.settings.source == Source::Acme => {

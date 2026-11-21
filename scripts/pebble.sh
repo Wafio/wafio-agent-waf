@@ -13,7 +13,8 @@
 #   WAFIO_PEBBLE_TLS_PORT    the port Pebble connects to for a TLS-ALPN-01 validation
 #   WAFIO_PEBBLE_RUN         the run directory, for `down`
 # Pebble connects to every name at 127.0.0.1: the DNS server answers all names with that address, and gives no IPv6 one.
-# The two validation ports are the ones the test's agent listens on; nothing here binds them.
+# The two validation ports are the ones the test's agent listens on; nothing here binds them, so each run notes its two in
+# its directory and the next run picks others.
 #
 # Both run from images pinned by digest, on the host network, with the ports of this run chosen free under a lock, so
 # that runs started together do not meet. Certificates last two minutes. These variables of the caller are passed to
@@ -28,16 +29,33 @@ challtestsrv=ghcr.io/letsencrypt/pebble-challtestsrv:2.10.3@sha256:0152c8cb506e2
 base=${WAFIO_PEBBLE_STATE:-${XDG_RUNTIME_DIR:-/tmp}/wafio-pebble-$(id -u)}
 
 down() {
-  local run=$1 name
+  local run=${1%/} name
+  # `rm -rf` runs on what it is given, so only a run directory of this user is taken.
+  case $run in
+    "$base"/run.*) [[ ${run#"$base"/} != */* ]] || run= ;;
+    *) run= ;;
+  esac
+  if [ -z "$run" ]; then
+    echo "pebble.sh down: $1 is not a run directory under $base" >&2
+    exit 2
+  fi
   name=$(basename "$run")
   docker rm -f "wafio-pebble-$name" "wafio-challtestsrv-$name" >/dev/null 2>&1 || true
   rm -rf "$run"
 }
 
+# What `up` has made, for the cleanup when it stops half way.
+run= box=
+undo() {
+  [ -z "$box" ] || docker rm -f "$box" >/dev/null 2>&1 || true
+  [ -z "$run" ] || down "$run"
+}
+
 up() {
   mkdir -p "$base"
   chmod 700 "$base"
-  local run
+  # Whatever stops this half way, no container and no run directory is left behind.
+  trap undo EXIT
   run=$(mktemp -d "$base/run.XXXXXX")
   local name
   name=$(basename "$run")
@@ -46,8 +64,15 @@ up() {
   flock 9
   local ports directory management dns challenge http tls
   # Six ports, free on TCP and UDP, held until all are chosen.
-  ports=$(python3 - <<'PY'
-import socket
+  # The last two are the validation ports another live run has noted for itself, which are skipped.
+  ports=$(python3 - "$base" <<'PY'
+import glob, socket, sys
+noted = set()
+for path in glob.glob(sys.argv[1] + "/run.*/ports"):
+    try:
+        noted.update(int(p) for p in open(path).read().split())
+    except (OSError, ValueError):
+        pass
 held, ports = [], []
 while len(ports) < 6:
     tcp = socket.socket()
@@ -59,12 +84,17 @@ while len(ports) < 6:
     except OSError:
         tcp.close()
         continue
+    if port in noted:
+        tcp.close()
+        udp.close()
+        continue
     held += [tcp, udp]
     ports.append(port)
 print(*ports)
 PY
   )
   read -r directory management dns challenge http tls <<<"$ports"
+  echo "$http $tls" >"$run/ports"
 
   cat >"$run/pebble-config.json" <<JSON
 {
@@ -87,10 +117,10 @@ PY
 }
 JSON
   # The root that signs Pebble's own certificate, out of the image.
-  local box
   box=$(docker create "$pebble")
   docker cp "$box:/test/certs/pebble.minica.pem" "$run/root.pem" >/dev/null
   docker rm "$box" >/dev/null
+  box=
 
   docker run -d --rm --network host --name "wafio-challtestsrv-$name" "$challtestsrv" \
     -dnsserver "127.0.0.1:$dns" -management "127.0.0.1:$challenge" \
@@ -113,12 +143,12 @@ JSON
       printf 'export WAFIO_PEBBLE_ROOT=%q\n' "$run/root.pem"
       printf 'export WAFIO_PEBBLE_HTTP_PORT=%q\n' "$http"
       printf 'export WAFIO_PEBBLE_TLS_PORT=%q\n' "$tls"
+      trap - EXIT
       return 0
     fi
     sleep 0.5
   done
   docker logs "wafio-pebble-$name" >&2 || true
-  down "$run"
   echo "pebble.sh: Pebble did not answer at https://localhost:$directory/dir" >&2
   return 1
 }
@@ -128,7 +158,10 @@ case "${1:-}" in
   down)
     case "${2:-${WAFIO_PEBBLE_RUN:-}}" in
       --all)
-        for run in "$base"/run.*; do [ -d "$run" ] && down "$run"; done
+        for dir in "$base"/run.*; do
+          [ -d "$dir" ] || continue
+          down "$dir"
+        done
         ;;
       '') echo 'pebble.sh down: name the run (or set WAFIO_PEBBLE_RUN), or use --all' >&2; exit 2 ;;
       *) down "${2:-$WAFIO_PEBBLE_RUN}" ;;

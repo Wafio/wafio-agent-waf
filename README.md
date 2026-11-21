@@ -122,7 +122,8 @@ are built only with it. No release build enables it.
 with it, and the tests of `tests/tls_bundle.rs` whose names start with `pebble` then order certificates from it with the real
 binary and a fake control plane: with TLS-ALPN-01, with HTTP-01 on the redirect listener, and with HTTP-01 on the HTTPS listener behind
 something that sends port 80 to HTTPS. Without `WAFIO_PEBBLE_DIRECTORY` they print that they are skipped. `scripts/pebble.sh down` stops
-the containers. The gate does not run them.
+the containers. The gate does not run them. Run them after `scripts/gen-test-certs.sh`, one at a time:
+`cargo test -p wafio-waf-agent --features test-tls --test tls_bundle pebble -- --test-threads=1 --nocapture`.
 
 The gate needs nothing from the private repository. The loader's file checks are tested here (`crates/engine-loader`) and the
 encodings with random and damaged buffers of a fixed seed (`crates/engine-abi/tests`); loading a real library, the failure cases that need
@@ -477,8 +478,10 @@ exactly as before.
 - One process writes in the key directory: the one that holds an exclusive `flock` on `tls.lock` there. A reload's successor reads
   what the process it replaces wrote, serves it, and writes nothing; it takes the lock once the process it replaces has stopped
   accepting, and then does what it put off (`state.json`, the removal of unused files, which spares a file the other process
-  recorded after this one started). Files are written under a temporary name, synced and renamed, so a reader sees a file whole
-  or not at all.
+  recorded after this one started). It also takes in the orders the other process ended after this one applied its bundle: it serves the
+  certificate that process kept and keeps its record of a failed order, with the time of the next try, so a reload in the middle of an
+  order does not make a second order for the same names. Files are written under a temporary name, synced and renamed, so a reader sees
+  a file whole or not at all.
 - An uploaded certificate arrives in a `CertificateInstall`, which the control plane sends to an agent that reported
   `tls_certificates`, when the agent has told it with a status that the bundle names a certificate it does not hold. The install
   holds the apply lock from its first check to the switch of the certificate, so a bundle is never applied in between. The checks
@@ -520,18 +523,23 @@ exactly as before.
   with no contact address, the terms of service agreed to (the request button of the dashboard is the acceptance), in `acme-account.json` of
   the key directory, 0600, and made again when the directory is not the one the file names. It is in no log line, no status and not
   in `state.json`. One worker orders, in the process that holds the key directory lock, one order at a time, the app that has been
-  due the longest first; the process that a reload replaces stops its worker when it lets the lock go. The requests to the authority go
-  through the agent's own HTTP client, so they use the platform's root certificates and `HTTPS_PROXY` like its other downloads. An order is due when the app has no
-  certificate of its own (`acme-<app id>.pem`), when a host of its entry is not among the names of that certificate, and when the
-  entry has an `acme_request_id` that no order has answered, at once and also while the last order waits for its next try. An order has
-  3 minutes. The agent answers the challenge of the authority with its own listeners: TLS-ALPN-01 on the HTTPS listener and HTTP-01 on the
+  due the longest first; the process that a reload replaces stops its worker when it lets the lock go, and keeps an order that ends before
+  that. The requests to the authority go through the agent's own HTTP client, so they use the platform's root certificates and `HTTPS_PROXY`
+  like its other downloads, and only to https addresses: the directory is one, and so must be every address it names. An order is due when
+  the app has no certificate of its own (`acme-<app id>.pem`), when a host of its entry is not among the names of that certificate, and when
+  the entry has an `acme_request_id` that no order has answered, at once and also while the last order waits for its next try. An order that
+  failed is tried again at its next try even when the app has a certificate of its own, as a new `acme_request_id` asked for another. An
+  order has 3 minutes. The authority is not trusted with which names to prove: an order whose authorizations are more than its names, or
+  for a name that is not one of them, fails before anything is answered. The agent answers the challenge of the authority with its own listeners: TLS-ALPN-01 on the HTTPS listener and HTTP-01 on the
   redirect listener and on the HTTPS listener, and takes the answers down however the order ends. It chooses the challenge that last worked,
   else TLS-ALPN-01 for a `listen` on port 443 and HTTP-01 for a `redirect_listen` on port 80, else TLS-ALPN-01; after a failed order it
-  tries the other. A name the authority already holds a proof for gets no challenge. The key of a certificate is a new ECDSA P-256 key
+  tries the other; a failure says when the app has no listener the challenge needs, and for HTTP-01 on an app with no
+  `redirect_listen` on port 80 that adding one is the way out. A name the authority already holds a proof for gets no challenge. The key of a certificate is a new ECDSA P-256 key
   for every order, and the chain that comes back is checked as an uploaded one is, and must cover every host, before it is kept
   (`acme-<app id>.pem`, written as the other certificate files are) and served from the next handshake on. An order that finishes
   after its app left the bundle, left gateway mode, changed its source or its hosts is dropped and writes nothing; a new request id
-  with the same hosts and source does not drop it. After a failed order the next one waits 10 minutes, with the other challenge;
+  with the same hosts and source does not drop it. After a failed order the next one waits 10 minutes, with the other challenge, and
+  a change to the hosts does not shorten that wait; a new request id does;
   `state.json` keeps the id the last order answered, the challenge that worked, the failures, the time of the next try and the text
   of the last error, so a restart does not order sooner.
 - An ordered certificate reports `pending` (an order is running or due, also before the first one; `chain_pem` is the certificate in use
@@ -540,7 +548,7 @@ exactly as before.
   next try). `request_id` is the id of the bundle entry the state answers: an order that ends under an id that is no longer the entry's
   reports nothing for the new one, which stays `pending` until its own order has run.
 - Before its first certificate an ordered app is served a placeholder: a self-signed certificate for its hosts, made from one key for the
-  process and never written to the key directory. A browser warns instead of the handshake failing, and an authority that reaches the app
+  process and never written to the key directory, and not made again by a bundle that leaves the hosts as they were. A browser warns instead of the handshake failing, and an authority that reaches the app
   through a CDN that sends port 80 to HTTPS can then get its answer. The app itself is not reached: such a connection gets `503` and the
   answers to a validation, and the redirect listener answers `503` too, not `308`. A client that clicked through the warning has a TLS
   session that a resumption can bring back without a new certificate, and a resumed placeholder session can reach the app. A bundle

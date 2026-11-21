@@ -27,9 +27,9 @@ pub struct Job {
     pub request_id: String,
     /// The challenge to answer.
     pub kind: Kind,
-    /// The port the challenge needs that the app does not serve, if it does not: a failure names
-    /// it.
-    pub missing_port: Option<u16>,
+    /// What a failure says about a port the challenge needs that the app does not serve, if there
+    /// is one.
+    pub missing_listener: Option<&'static str>,
 }
 
 /// A certificate that was checked: the key loads with the chain, and the chain covers every name.
@@ -121,6 +121,17 @@ pub async fn execute(
 ) -> Result<Issued, CaError> {
     let mut order = account.new_order(&job.hosts).await?;
     let authorizations = order.authorizations().await?;
+    // The authority is not trusted with which names to answer for: an authorization for a name
+    // that is not the order's would put up an answer for it on the agent's listeners.
+    if let Some(foreign) = authorizations
+        .iter()
+        .find(|a| !job.hosts.iter().any(|h| h.eq_ignore_ascii_case(&a.host)))
+    {
+        return Err(CaError::new(format!(
+            "the authority asks for a proof of {}, which is no name of the order",
+            foreign.host
+        )));
+    }
     let mut up: Vec<ChallengeGuard> = Vec::new();
     let mut answered = Vec::new();
     for authorization in authorizations.iter().filter(|a| !a.valid) {
@@ -172,7 +183,7 @@ mod tests {
             hosts: vec![SHOP.into(), WWW.into()],
             request_id: "r1".into(),
             kind,
-            missing_port: None,
+            missing_listener: None,
         }
     }
 
@@ -296,6 +307,51 @@ mod tests {
         );
         assert!(!answers(&book, SHOP));
         assert_eq!(ca.script().events, ["new order"]);
+    }
+
+    #[tokio::test]
+    async fn an_authority_that_lists_more_authorizations_than_the_order_has_names_is_refused_at_the_first_extra()
+     {
+        let (book, ca, account) = rig().await;
+        // The two names of the order, then a thousand more.
+        ca.script().authorizations_for = Some(
+            [SHOP.to_owned(), WWW.to_owned()]
+                .into_iter()
+                .chain((0..1000).map(|i| format!("extra{i}.example.com")))
+                .collect(),
+        );
+        let e = execute(&*account, &book, &job(Kind::Http01))
+            .await
+            .err()
+            .unwrap();
+        assert!(e.text.contains("more authorizations"), "{e:?}");
+        let script = ca.script();
+        assert_eq!(
+            script.fetched, 3,
+            "the two names and the first extra, no more"
+        );
+        assert_eq!(script.events, ["new order"], "nothing is answered");
+        drop(script);
+        assert!(!answers(&book, SHOP) && !answers(&book, WWW));
+    }
+
+    #[tokio::test]
+    async fn an_authorization_for_a_name_that_is_not_the_orders_puts_nothing_up() {
+        let (book, ca, account) = rig().await;
+        ca.script().authorizations_for =
+            Some(vec![SHOP.to_owned(), "other.example.com".to_owned()]);
+        let e = execute(&*account, &book, &job(Kind::TlsAlpn01))
+            .await
+            .err()
+            .unwrap();
+        assert!(e.text.contains("other.example.com"), "{e:?}");
+        assert_eq!(ca.script().events, ["new order"], "nothing is answered");
+        assert!(!answers(&book, SHOP) && !answers(&book, "other.example.com"));
+        // The names of an order are matched without regard to case.
+        let (book, ca, account) = rig().await;
+        ca.script().authorizations_for = Some(vec!["SHOP.example.com".to_owned(), WWW.to_owned()]);
+        execute(&*account, &book, &job(Kind::Http01)).await.unwrap();
+        assert_eq!(ca.script().orders.len(), 1);
     }
 
     #[tokio::test]

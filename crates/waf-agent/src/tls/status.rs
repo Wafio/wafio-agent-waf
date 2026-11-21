@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wafio_control::CertificateStatus;
 use wafio_proxy::cert_store::chain_pem;
 
-use super::acme::schedule::{Own, own};
+use super::acme::schedule::{Own, own, retry_at};
 use super::entry::{Certificate, Settings, Source};
 use super::state_file::AppRecord;
 use super::{Applied, Served};
@@ -88,7 +88,8 @@ fn uploaded(app_id: &str, wanted: &Certificate, served: Option<&Served>) -> Cert
 /// answered the request id of the bundle yet (so one is due, and the chain in use, if any, is
 /// still the previous one); `failed`: the order that answered the id failed, with the time of the
 /// next one; `active`: the certificate in use is the ordered one and covers every host. A finished
-/// order reports only while the id it started under is the bundle's.
+/// order reports only while the id it started under is the bundle's. A failed order says when the
+/// next attempt is by the same rule that makes the worker wait for it.
 pub fn ordered(
     app_id: &str,
     settings: &Settings,
@@ -110,7 +111,10 @@ pub fn ordered(
         State::Pending
     };
     let (error, next_attempt_unix) = match (state, failed) {
-        (State::Failed, Some(r)) => (r.error.clone(), r.next_attempt_unix),
+        (State::Failed, Some(r)) => (
+            r.error.clone(),
+            retry_at(settings, record, own(app_id, settings, served)),
+        ),
         _ => (String::new(), 0),
     };
     CertificateStatus {

@@ -36,6 +36,11 @@ impl CaError {
     }
 }
 
+/// The problem of an account file whose credentials cannot be used here (they do not parse, or the
+/// key is refused), as opposed to one the authority or the network failed on. It is no ACME
+/// problem type.
+pub const CREDENTIALS_UNUSABLE: &str = "credentials-unusable";
+
 /// An authorization of an order: one name the authority wants proved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authorization {
@@ -67,7 +72,8 @@ pub trait Ca: Send + Sync + 'static {
         directory: &str,
     ) -> Result<(Arc<dyn Account>, Zeroizing<Vec<u8>>), CaError>;
 
-    /// The account that kept credentials stand for.
+    /// The account that kept credentials stand for. Credentials that cannot be used at all, whatever
+    /// the authority is, fail with the problem `CREDENTIALS_UNUSABLE`; any other failure may pass.
     async fn restore_account(&self, credentials: &[u8]) -> Result<Arc<dyn Account>, CaError>;
 }
 
@@ -80,7 +86,9 @@ pub trait Account: Send + Sync {
 /// One order, from its authorizations to its certificate. The calls come in this order.
 #[async_trait]
 pub trait Order: Send {
-    /// The authorizations of the order, one for each name.
+    /// The authorizations of the order, at most one for each name of it. An authority that lists
+    /// more is refused as soon as it is seen, before the rest are fetched: the list is the
+    /// authority's to make, and every entry costs a request and its answer.
     async fn authorizations(&mut self) -> Result<Vec<Authorization>, CaError>;
 
     /// What the challenge of `kind` for `host` is answered with.

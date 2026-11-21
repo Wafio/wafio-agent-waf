@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 use zeroize::Zeroizing;
 
-use super::ca::{Account, Ca, CaError};
+use super::ca::{Account, CREDENTIALS_UNUSABLE, Ca, CaError};
 
 /// The problem type of an authority that does not know the account any more.
 pub const ACCOUNT_UNKNOWN: &str = "urn:ietf:params:acme:error:accountDoesNotExist";
@@ -57,8 +57,9 @@ impl Accounts {
     }
 
     /// The account: the one in use, else the one the file keeps for this directory, else a new
-    /// one, which is kept. A file that holds another directory's account, or none that can be
-    /// read, is replaced.
+    /// one, which is kept. A file that holds another directory's account, none that can be read,
+    /// or credentials that cannot be used, is replaced. A failure of the authority or the network
+    /// keeps the file.
     pub async fn get(&mut self) -> Result<Arc<dyn Account>, CaError> {
         if let Some(account) = &self.current {
             return Ok(account.clone());
@@ -68,26 +69,41 @@ impl Accounts {
             .await
             .ok()
             .flatten();
-        let account = match kept {
+        let restored = match kept {
             Some(text) if directory_of(&text).as_deref() == Some(self.directory.as_str()) => {
-                self.ca.restore_account(&text).await?
-            }
-            _ => {
-                let (account, credentials) = self.ca.create_account(&self.directory).await?;
-                let file = self.file.clone();
-                let written = tokio::task::spawn_blocking(move || file.write(&credentials)).await;
-                match written {
-                    Ok(Ok(())) => tracing::info!("[acme] made an account at {}", self.directory),
-                    Ok(Err(e)) => tracing::info!(
-                        "[acme] made an account at {} but cannot keep it: {e}",
-                        self.directory
-                    ),
-                    Err(_) => {}
+                match self.ca.restore_account(&text).await {
+                    Ok(account) => Some(account),
+                    // A file that cannot be used here would fail every order for good.
+                    Err(e) if e.problem.as_deref() == Some(CREDENTIALS_UNUSABLE) => {
+                        tracing::info!("[acme] {}; making a new account", e.text);
+                        None
+                    }
+                    Err(e) => return Err(e),
                 }
-                account
             }
+            _ => None,
+        };
+        let account = match restored {
+            Some(account) => account,
+            None => self.make().await?,
         };
         self.current = Some(account.clone());
+        Ok(account)
+    }
+
+    /// A new account at the directory, kept in the file.
+    async fn make(&self) -> Result<Arc<dyn Account>, CaError> {
+        let (account, credentials) = self.ca.create_account(&self.directory).await?;
+        let file = self.file.clone();
+        let written = tokio::task::spawn_blocking(move || file.write(&credentials)).await;
+        match written {
+            Ok(Ok(())) => tracing::info!("[acme] made an account at {}", self.directory),
+            Ok(Err(e)) => tracing::info!(
+                "[acme] made an account at {} but cannot keep it: {e}",
+                self.directory
+            ),
+            Err(_) => {}
+        }
         Ok(account)
     }
 
@@ -192,6 +208,40 @@ mod tests {
             assert!(ca.script().restored.is_empty());
             assert_eq!(directory_of(&file.read().unwrap()).as_deref(), Some(ONE));
         }
+    }
+
+    #[tokio::test]
+    async fn credentials_that_cannot_be_used_are_replaced_and_a_failed_request_keeps_them() {
+        let credentials = |directory: &str| {
+            format!(
+                r#"{{"id":"https://ca.test/acct/old","key_pkcs8":"{}","directory":"{directory}"}}"#,
+                crate::tls::acme::mock::ACCOUNT_KEY
+            )
+        };
+        // The file names the directory and can be read, and the key in it is refused.
+        let (ca, file) = rig();
+        file.write(credentials(ONE).as_bytes()).unwrap();
+        ca.script().restore_error = Some(CaError {
+            problem: Some(CREDENTIALS_UNUSABLE.into()),
+            text: "the kept account cannot be used".into(),
+        });
+        accounts(&ca, &file, ONE).get().await.unwrap();
+        assert_eq!(ca.script().restored.len(), 1, "it was tried");
+        assert_eq!(ca.script().created, [ONE], "and replaced");
+        assert_ne!(
+            file.read().unwrap().as_slice(),
+            credentials(ONE).as_bytes(),
+            "the file holds the new account"
+        );
+
+        // The authority or the network failed: the account is not lost for that.
+        let (ca, file) = rig();
+        file.write(credentials(ONE).as_bytes()).unwrap();
+        ca.script().restore_error = Some(CaError::new("connection refused"));
+        let e = accounts(&ca, &file, ONE).get().await.err().unwrap();
+        assert_eq!(e.text, "connection refused");
+        assert!(ca.script().created.is_empty());
+        assert_eq!(file.read().unwrap().as_slice(), credentials(ONE).as_bytes());
     }
 
     #[tokio::test]

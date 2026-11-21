@@ -23,6 +23,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Http {
     /// `None` reads the proxies from the environment, as every other request does.
     proxies: Option<Arc<ProxyConfig>>,
+    /// A request to an address that is not https goes out, which a test needs for its own server.
+    #[cfg(test)]
+    plain: bool,
 }
 
 impl Http {
@@ -35,7 +38,31 @@ impl Http {
     pub fn with_proxies(proxies: ProxyConfig) -> Http {
         Http {
             proxies: Some(Arc::new(proxies)),
+            plain: false,
         }
+    }
+
+    /// For a test that runs its own server over plain HTTP.
+    #[cfg(test)]
+    pub fn allowing_plain() -> Http {
+        Http {
+            proxies: None,
+            plain: true,
+        }
+    }
+
+    /// Only https goes out: the directory is https, but the addresses it and an order name are the
+    /// authority's to choose, and the request for a certificate and the certificate itself must
+    /// not cross the network in the clear.
+    fn allows(&self, url: &str) -> bool {
+        #[cfg(test)]
+        let plain = self.plain;
+        #[cfg(not(test))]
+        let plain = false;
+        plain
+            || url
+                .get(..8)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
     }
 }
 
@@ -65,10 +92,14 @@ impl HttpClient for Http {
         req: http::Request<BodyWrapper<Bytes>>,
     ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, Error>> + Send>> {
         let proxies = self.proxies.clone();
+        let allowed = self.allows(&req.uri().to_string());
         Box::pin(async move {
             let (parts, body) = req.into_parts();
-            let body = body_bytes(body).await?;
             let url = parts.uri.to_string();
+            if !allowed {
+                return Err(other(format!("{url} is not an https address")));
+            }
+            let body = body_bytes(body).await?;
             // The agent names itself; the client's own name is dropped.
             let headers: Vec<(String, String)> = parts
                 .headers
@@ -190,7 +221,7 @@ mod tests {
                 .to_vec(),
         );
         let url = format!("http://127.0.0.1:{port}/new-order");
-        let answer = Http::new()
+        let answer = Http::allowing_plain()
             .request(request(
                 "POST",
                 &url,
@@ -230,7 +261,7 @@ mod tests {
                 .to_vec(),
         );
         let url = format!("http://127.0.0.1:{port}/nonce");
-        let answer = Http::new()
+        let answer = Http::allowing_plain()
             .request(request("HEAD", &url, &[], b""))
             .await
             .unwrap();
@@ -256,12 +287,28 @@ mod tests {
         reply.extend(std::iter::repeat_n(b'x', RESPONSE_CAP + 1));
         let (port, _seen) = serve(reply);
         let url = format!("http://127.0.0.1:{port}/big");
-        let e = Http::new()
+        let e = Http::allowing_plain()
             .request(request("GET", &url, &[], b""))
             .await
             .err()
             .expect("an error");
         assert!(e.to_string().contains("larger than"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn an_address_that_is_not_https_is_refused_without_a_connection() {
+        let (port, seen) = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let url = format!("http://127.0.0.1:{port}/finalize");
+        let e = Http::new()
+            .request(request("POST", &url, &[], br#"{"csr":"x"}"#))
+            .await
+            .err()
+            .expect("an error");
+        assert!(e.to_string().contains("not an https address"), "{e}");
+        assert!(
+            seen.recv_timeout(Duration::from_millis(200)).is_err(),
+            "nothing was sent"
+        );
     }
 
     /// `HTTPS_PROXY`: the request to an https address asks the proxy for a tunnel, with the

@@ -85,13 +85,13 @@ impl Worker {
             self.accounts.lock().await.forget().await;
         }
         let (agent, directory, now) = (self.agent.clone(), self.directory.clone(), (self.clock)());
-        let app_id = job.app_id.clone();
+        let stopped = job.clone();
         let done =
             tokio::task::spawn_blocking(move || agent.order_done(&job, result, &directory, now))
                 .await;
         if done.is_err() {
-            // The order is over, and the next one must not wait for it.
-            self.agent.abandon_order(&app_id);
+            // The order is over and the next one must not wait for it, nor start at once.
+            self.agent.order_stopped(&stopped, (self.clock)());
         }
     }
 

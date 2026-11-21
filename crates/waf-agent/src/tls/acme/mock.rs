@@ -58,6 +58,13 @@ pub struct Script {
     pub valid: HashSet<String>,
     /// The challenges it offers.
     pub offered: Vec<Kind>,
+    /// The names its authorizations are for, in place of the order's own: a hostile or broken
+    /// authority.
+    pub authorizations_for: Option<Vec<String>>,
+    /// How many authorizations the orders fetched.
+    pub fetched: usize,
+    /// What restoring an account fails with, if it does.
+    pub restore_error: Option<CaError>,
     pub fail: Option<(Step, CaError)>,
     pub hang: Option<Step>,
     /// Stops at the step until the notification is given, after telling `MockCa::reached`.
@@ -84,6 +91,9 @@ impl Default for Script {
             most_running: 0,
             valid: HashSet::new(),
             offered: vec![Kind::TlsAlpn01, Kind::Http01],
+            authorizations_for: None,
+            fetched: 0,
+            restore_error: None,
             fail: None,
             hang: None,
             pause: None,
@@ -162,9 +172,14 @@ impl Ca for MockCa {
     }
 
     async fn restore_account(&self, credentials: &[u8]) -> Result<Arc<dyn Account>, CaError> {
-        self.script()
+        let mut script = self.script();
+        script
             .restored
             .push(String::from_utf8_lossy(credentials).into_owned());
+        if let Some(error) = script.restore_error.clone() {
+            return Err(error);
+        }
+        drop(script);
         Ok(Arc::new(MockAccount(self.clone())))
     }
 }
@@ -281,16 +296,28 @@ impl MockOrder {
 impl Order for MockOrder {
     async fn authorizations(&mut self) -> Result<Vec<Authorization>, CaError> {
         self.step(Step::Authorizations).await?;
-        let script = self.ca.script();
-        Ok(self
-            .hosts
-            .iter()
-            .map(|host| Authorization {
-                host: host.clone(),
-                valid: script.valid.contains(host),
+        let mut script = self.ca.script();
+        let names = script
+            .authorizations_for
+            .clone()
+            .unwrap_or_else(|| self.hosts.clone());
+        let mut found = Vec::new();
+        for host in names {
+            // Each one is fetched when it is reached, and the list is refused at the first one
+            // over the order's names, as an implementation of the trait must.
+            script.fetched += 1;
+            if found.len() == self.hosts.len() {
+                return Err(CaError::new(
+                    "the authority lists more authorizations than the order has names",
+                ));
+            }
+            found.push(Authorization {
+                valid: script.valid.contains(&host),
                 offered: script.offered.clone(),
-            })
-            .collect())
+                host,
+            });
+        }
+        Ok(found)
     }
 
     async fn answer(&mut self, host: &str, kind: Kind) -> Result<Answer, CaError> {

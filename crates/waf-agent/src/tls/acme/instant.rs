@@ -11,7 +11,7 @@ use instant_acme::{
 use zeroize::Zeroizing;
 
 use super::Kind;
-use super::ca::{Account, Answer, Authorization, Ca, CaError, Order};
+use super::ca::{Account, Answer, Authorization, CREDENTIALS_UNUSABLE, Ca, CaError, Order};
 use super::http::Http;
 
 /// How long the authority may take to validate the names, and then to issue the certificate. The
@@ -74,18 +74,29 @@ impl Ca for InstantAcme {
             instant_acme::Account::builder_with_http(Box::new(self.http.clone()))
                 .create(&new, directory.to_owned(), None)
                 .await?;
-        let text = Zeroizing::new(
-            serde_json::to_vec(&credentials).map_err(|e| CaError::new(e.to_string()))?,
-        );
+        // Room for the whole text from the start, so no growth leaves a copy of the key behind.
+        let mut text = Zeroizing::new(Vec::with_capacity(1024));
+        serde_json::to_writer(&mut *text, &credentials).map_err(|e| CaError::new(e.to_string()))?;
         Ok((Arc::new(CaAccount(account)), text))
     }
 
     async fn restore_account(&self, credentials: &[u8]) -> Result<Arc<dyn Account>, CaError> {
+        // The texts are fixed: what the parser says may quote the credentials.
+        let unusable = || CaError {
+            problem: Some(CREDENTIALS_UNUSABLE.to_owned()),
+            text: "the kept account cannot be used".to_owned(),
+        };
         let credentials: AccountCredentials =
-            serde_json::from_slice(credentials).map_err(|e| CaError::new(e.to_string()))?;
+            serde_json::from_slice(credentials).map_err(|_| unusable())?;
         let account = instant_acme::Account::builder_with_http(Box::new(self.http.clone()))
             .from_credentials(credentials)
-            .await?;
+            .await
+            .map_err(|e| match e {
+                instant_acme::Error::KeyRejected
+                | instant_acme::Error::Crypto
+                | instant_acme::Error::Str(_) => unusable(),
+                other => CaError::from(other),
+            })?;
         Ok(Arc::new(CaAccount(account)))
     }
 }
@@ -97,12 +108,17 @@ impl Account for CaAccount {
     async fn new_order(&self, hosts: &[String]) -> Result<Box<dyn Order>, CaError> {
         let identifiers: Vec<Identifier> = hosts.iter().cloned().map(Identifier::Dns).collect();
         let order = self.0.new_order(&NewOrder::new(&identifiers)).await?;
-        Ok(Box::new(CaOrder { order }))
+        Ok(Box::new(CaOrder {
+            order,
+            names: hosts.len(),
+        }))
     }
 }
 
 struct CaOrder {
     order: instant_acme::Order,
+    /// How many names the order is for, which is as many authorizations as the authority may list.
+    names: usize,
 }
 
 #[async_trait]
@@ -112,6 +128,11 @@ impl Order for CaOrder {
         let mut authorizations = self.order.authorizations();
         while let Some(next) = authorizations.next().await {
             let authorization = next?;
+            if found.len() == self.names {
+                return Err(CaError::new(
+                    "the authority lists more authorizations than the order has names",
+                ));
+            }
             found.push(Authorization {
                 host: authorization.identifier().to_string().to_ascii_lowercase(),
                 valid: authorization.status == AuthorizationStatus::Valid,
@@ -193,7 +214,13 @@ impl CaOrder {
     /// What the authority says of the first challenge that failed, for an order it made invalid.
     async fn why_invalid(&mut self) -> CaError {
         let mut authorizations = self.order.authorizations();
+        let mut seen = 0;
         while let Some(Ok(mut authorization)) = authorizations.next().await {
+            // The list is the authority's: look at no more than the order has names.
+            seen += 1;
+            if seen > self.names {
+                break;
+            }
             let Ok(state) = authorization.refresh().await else {
                 continue;
             };

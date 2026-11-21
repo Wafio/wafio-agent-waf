@@ -10,9 +10,11 @@ use wafio_proxy::cert_store::{BookEntry, leaf_sha256};
 
 use super::*;
 use crate::tls::acme::ACCOUNT_FILE;
+use crate::tls::acme::Kind;
 use crate::tls::acme::ca::CaError;
 use crate::tls::acme::mock::{ACCOUNT_KEY, Issue, MockCa, Step};
 use crate::tls::acme::names::dns_names;
+use crate::tls::acme::order::Job;
 use crate::tls::state_file::{STATE_FILE, StateFile};
 
 const BASE: i64 = 1_800_000_000;
@@ -1199,4 +1201,252 @@ async fn an_authority_that_does_not_know_the_account_gets_a_new_one_for_the_next
     until("the app is served", || r.issued(SHOP)).await;
     assert_eq!(r.ca.script().created, [DIRECTORY, DIRECTORY]);
     assert!(r.dir.dir().join(ACCOUNT_FILE).exists());
+}
+
+// ── a reload in the middle of an order ──────────────────────────────────────────────────────
+
+/// Two processes of the agent over one key directory, as in a reload: `x` holds the lock and
+/// orders, `y` has applied the same bundle and waits for the lock. The order of `x` has come to its
+/// last step and stops there until the notification is given; it fails there when `failing` says why.
+async fn reload_pair(failing: Option<&str>) -> (Rig, Rig, Arc<Notify>) {
+    let x = rig();
+    let go = Arc::new(Notify::new());
+    {
+        let mut script = x.ca.script();
+        script.pause = Some((Step::Certificate, go.clone()));
+        script.fail = failing.map(|why| (Step::Certificate, CaError::new(why)));
+    }
+    let y = rig_over(x.dir.clone(), None);
+    assert!(x.agent.holds_keys() && y.agent.waits_for_keys());
+    x.start();
+    y.start();
+    x.apply(&[(SHOP, &[HOST], "r1")], 1);
+    y.apply(&[(SHOP, &[HOST], "r1")], 1);
+    x.ca.reached.notified().await;
+    (x, y, go)
+}
+
+fn acme_file() -> String {
+    format!("acme-{SHOP}.pem")
+}
+
+/// `y` takes the lock over from `x`, which has closed, and has the certificate `x` ordered in the
+/// book and nothing ordered a second time.
+async fn served_without_a_second_order(x: &Rig, y: &mut Rig) {
+    let leaf = x.leaf(SHOP);
+    assert!(
+        y.book(SHOP).unwrap().placeholder,
+        "the successor serves the placeholder until it holds the lock"
+    );
+    y.told();
+    x.agent.close();
+    x.agent.release_keys();
+    assert!(y.agent.take_over_keys());
+    assert!(
+        y.issued(SHOP),
+        "served from the take-over, not the next bundle"
+    );
+    assert_eq!(y.leaf(SHOP), leaf);
+    let status = y.status(SHOP);
+    assert_eq!(
+        (status.state.as_str(), status.request_id.as_str()),
+        ("active", "r1")
+    );
+    assert_eq!(y.told().last(), Some(&pair("active", "r1")));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        y.ca.script().orders.is_empty(),
+        "no second issuance for the same names"
+    );
+    let record = y.state().apps[SHOP].clone();
+    assert_eq!(
+        (record.request_id.as_str(), record.served.as_deref()),
+        ("r1", Some(acme_file().as_str())),
+        "the record of the order stays in the state file"
+    );
+    assert!(y.files().contains(&acme_file()));
+}
+
+#[tokio::test]
+async fn a_certificate_ordered_after_the_successor_applied_its_bundle_is_served_by_it_at_the_take_over()
+ {
+    let (x, mut y, go) = reload_pair(None).await;
+    go.notify_one();
+    until("the certificate is kept", || {
+        x.issued(SHOP) && !x.ordering()
+    })
+    .await;
+    served_without_a_second_order(&x, &mut y).await;
+}
+
+#[tokio::test]
+async fn an_order_that_ends_while_the_process_is_closing_is_kept_until_it_lets_go_of_the_lock() {
+    let (x, mut y, go) = reload_pair(None).await;
+    // The listeners are still draining: the order ends after the process closed and before it
+    // lets go of the directory.
+    x.agent.close();
+    go.notify_one();
+    until("the certificate is kept", || {
+        x.files().contains(&acme_file()) && !x.ordering()
+    })
+    .await;
+    served_without_a_second_order(&x, &mut y).await;
+}
+
+#[tokio::test]
+async fn an_order_that_ends_after_the_process_let_go_of_the_lock_writes_nothing() {
+    let (x, y, go) = reload_pair(None).await;
+    x.agent.close();
+    x.agent.release_keys();
+    go.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!x.files().contains(&acme_file()));
+    assert!(y.agent.take_over_keys());
+    until("the successor orders", || y.issued(SHOP)).await;
+    assert_eq!(y.ca.script().orders.len(), 1);
+}
+
+#[tokio::test]
+async fn an_order_that_fails_after_the_successor_applied_its_bundle_keeps_its_wait_with_the_successor()
+ {
+    let (x, y, go) = reload_pair(Some("the authority said no")).await;
+    go.notify_one();
+    until("the failure is noted", || x.status(SHOP).state == "failed").await;
+    until("it is taken in", || !x.ordering()).await;
+    let at = x.status(SHOP).next_attempt_unix;
+    assert!((BASE + 600..BASE + 620).contains(&at), "{at}");
+    x.agent.close();
+    x.agent.release_keys();
+    assert!(y.agent.take_over_keys());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        y.ca.script().orders.is_empty(),
+        "no order before the time the failure set"
+    );
+    let status = y.status(SHOP);
+    assert_eq!(
+        (status.state.as_str(), status.next_attempt_unix),
+        ("failed", at)
+    );
+    assert_eq!(y.state().apps[SHOP].failures, 1);
+    assert!(y.book(SHOP).unwrap().placeholder);
+}
+
+#[tokio::test]
+async fn an_order_that_stops_while_it_is_taken_in_is_noted_as_failed_and_waits_for_its_time() {
+    let (r, _go) = mid_order().await;
+    let job = Job {
+        app_id: SHOP.into(),
+        hosts: vec![HOST.into()],
+        request_id: "r1".into(),
+        kind: Kind::TlsAlpn01,
+        missing_listener: None,
+    };
+    r.agent.order_stopped(&job, clock());
+    assert!(!r.ordering());
+    let status = r.status(SHOP);
+    assert_eq!(status.state, "failed");
+    assert_eq!(
+        status.error,
+        "the order failed (tls-alpn-01): the order stopped on an internal error"
+    );
+    assert!((BASE + 600..BASE + 620).contains(&status.next_attempt_unix));
+    assert_eq!(r.state().apps[SHOP].failures, 1);
+}
+
+// ── retries and what a bundle does not change ───────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_order_for_a_new_request_id_is_tried_again_while_the_old_certificate_is_served() {
+    let mut r = rig();
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the certificate is served", || r.issued(SHOP)).await;
+    until("it is taken in", || !r.ordering()).await;
+    let first = r.leaf(SHOP);
+    r.ca.script().fail = Some((Step::Finalize, CaError::new("the authority said no")));
+    r.told();
+
+    r.apply(&[(SHOP, &[HOST], "r2")], 2);
+    until("the order failed", || r.status(SHOP).state == "failed").await;
+    until("the failure is taken in", || !r.ordering()).await;
+    let status = r.status(SHOP);
+    assert_eq!(status.request_id, "r2");
+    assert!((BASE + 600..BASE + 620).contains(&status.next_attempt_unix));
+    assert_eq!(
+        status.leaf_sha256, first,
+        "the old chain is in use meanwhile"
+    );
+    assert_eq!(r.leaf(SHOP), first);
+    assert_eq!(r.ca.script().orders.len(), 2);
+
+    // The time the status names is a time something happens: nothing before it, an order at it.
+    tokio::time::advance(Duration::from_secs(550)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(r.ca.script().orders.len(), 2);
+    r.ca.script().fail = None;
+    tokio::time::advance(Duration::from_secs(80)).await;
+    until("the next order", || r.ca.script().orders.len() == 3).await;
+    until("the new certificate is served", || {
+        r.issued(SHOP) && r.leaf(SHOP) != first
+    })
+    .await;
+    until("it is taken in", || !r.ordering()).await;
+    let status = r.status(SHOP);
+    assert_eq!(
+        (status.state.as_str(), status.request_id.as_str()),
+        ("active", "r2")
+    );
+    assert_eq!(status.next_attempt_unix, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn adding_a_host_does_not_skip_the_wait_a_failed_order_set() {
+    let r = rig();
+    r.ca.script().fail = Some((Step::Finalize, CaError::new("the authority said no")));
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the order failed", || r.status(SHOP).state == "failed").await;
+    until("the failure is taken in", || !r.ordering()).await;
+    let at = r.status(SHOP).next_attempt_unix;
+
+    r.apply(&[(SHOP, &[HOST, "www.example.com"], "r1")], 2);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(r.ca.script().orders.len(), 1, "it waits as it did");
+    let status = r.status(SHOP);
+    assert_eq!(
+        (status.state.as_str(), status.next_attempt_unix),
+        ("failed", at)
+    );
+    assert_eq!(r.state().apps[SHOP].failures, 1);
+
+    // At its time the order is for both names.
+    tokio::time::advance(Duration::from_secs(620)).await;
+    until("the next order", || r.ca.script().orders.len() == 2).await;
+    assert_eq!(r.ca.script().orders[1], [HOST, "www.example.com"]);
+    until("its failure is taken in", || !r.ordering()).await;
+    assert_eq!(r.state().apps[SHOP].failures, 2);
+}
+
+#[tokio::test]
+async fn the_placeholder_is_not_made_again_while_the_hosts_are_the_same() {
+    // No worker: the app has no certificate and no order runs.
+    let r = rig();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    let first = r.book(SHOP).unwrap();
+    assert!(first.placeholder);
+    r.apply(&[(SHOP, &[HOST], "r2")], 2);
+    let second = r.book(SHOP).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&first.key, &second.key),
+        "the same certificate, so a browser that accepted it is not asked again"
+    );
+    // Other hosts need another one.
+    r.apply(&[(SHOP, &[HOST, "www.example.com"], "r2")], 3);
+    let third = r.book(SHOP).unwrap();
+    assert!(third.placeholder && !std::sync::Arc::ptr_eq(&first.key, &third.key));
+    assert_eq!(
+        dns_names(third.key.cert[0].as_ref()),
+        [HOST, "www.example.com"]
+    );
 }

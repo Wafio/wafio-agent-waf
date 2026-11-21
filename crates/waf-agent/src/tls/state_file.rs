@@ -61,6 +61,14 @@ impl AppRecord {
             }
     }
 
+    /// Takes over everything `other` says of the orders, and leaves the file served as it is.
+    pub fn take_orders_from(&mut self, other: &AppRecord) {
+        *self = AppRecord {
+            served: self.served.take(),
+            ..other.clone()
+        };
+    }
+
     /// Forgets the failures, so the next order is not held back by them.
     pub fn forget_failures(&mut self) {
         self.tried.clear();
