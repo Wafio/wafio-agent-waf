@@ -4,19 +4,21 @@
 //! pacer lets each app send at most one in that time. What it is given is the latest status of an
 //! app, never a list of changes: a change that comes inside the window goes out at its end, as the
 //! latest state, and the ones before it are not sent. A status that asks for a certificate
-//! (`missing`) is repeated every minute until the state changes, as the control plane expects.
+//! (`missing`) is repeated every minute until the state changes, as the control plane expects. A
+//! refused bundle does not end that: the bundle in force still names the certificate, so the
+//! request goes on after the `failed` that says why the new bundle was not taken.
 //!
 //! The pacer knows nothing of where a state comes from: whoever decides a status offers it, so
 //! the states of an ordered certificate go through it as they are.
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use wafio_control::CertificateStatus;
 
-use super::status::State;
+use super::status::{State, unix_now};
 
 /// The shortest time between two statuses of one app.
 pub const MIN_GAP: Duration = Duration::from_secs(10);
@@ -32,6 +34,10 @@ pub struct Offer {
     /// The statuses are all there are: an app that is not among them has left the bundle, and
     /// nothing more is said of it.
     pub whole: bool,
+    /// What the bundle in force says of the apps, for the offer of a refused bundle. An app of
+    /// `statuses` that is `missing` there asks again once its `failed` has gone out: the bundle in
+    /// force still names a certificate it does not hold.
+    pub in_force: Vec<CertificateStatus>,
 }
 
 /// The end of the pacer that states are offered to.
@@ -50,20 +56,33 @@ impl Statuses {
     /// A live bundle was handled; these are the statuses it leaves. With `whole` the apps that are
     /// not among them are forgotten.
     pub fn after_bundle(&self, statuses: Vec<CertificateStatus>, whole: bool) {
-        self.offer(statuses, true, whole);
+        self.offer(statuses, true, whole, Vec::new());
+    }
+
+    /// A live bundle was refused; `failed` says so for the apps it names, and `in_force` is what
+    /// the bundle that is still in force says of its apps. No app is forgotten.
+    pub fn after_refusal(&self, failed: Vec<CertificateStatus>, in_force: Vec<CertificateStatus>) {
+        self.offer(failed, true, false, in_force);
     }
 
     /// The state of these apps may have changed; the pacer sends what differs from the last.
     pub fn changed(&self, statuses: Vec<CertificateStatus>) {
-        self.offer(statuses, false, false);
+        self.offer(statuses, false, false, Vec::new());
     }
 
-    fn offer(&self, statuses: Vec<CertificateStatus>, forced: bool, whole: bool) {
+    fn offer(
+        &self,
+        statuses: Vec<CertificateStatus>,
+        forced: bool,
+        whole: bool,
+        in_force: Vec<CertificateStatus>,
+    ) {
         // The pacer ends with the process; an offer to a pacer that has gone is of no use.
         let _ = self.0.send(Offer {
             statuses,
             forced,
             whole,
+            in_force,
         });
     }
 }
@@ -80,6 +99,10 @@ impl Offers {
 struct Slot {
     wanted: CertificateStatus,
     sent: Option<(Instant, CertificateStatus)>,
+    /// What `wanted` becomes once it has been sent: the `missing` of the bundle in force, for an
+    /// app whose bundle was refused. The refusal is said once, and the request for the
+    /// certificate goes on every minute as before.
+    resume: Option<CertificateStatus>,
     /// A live bundle asked for a status, which goes even if it says what the last one said.
     forced: bool,
     /// When `wanted` is sent next, if it is.
@@ -129,16 +152,23 @@ impl Pacer {
             self.slots.retain(|app, _| named.contains(app.as_str()));
         }
         for status in offer.statuses {
+            let resume = offer
+                .in_force
+                .iter()
+                .find(|s| s.app_id == status.app_id && s.state == State::Missing.as_str())
+                .cloned();
             let slot = self
                 .slots
                 .entry(status.app_id.clone())
                 .or_insert_with(|| Slot {
                     wanted: status.clone(),
+                    resume: None,
                     sent: None,
                     forced: false,
                     due: None,
                 });
             slot.wanted = status;
+            slot.resume = resume;
             slot.forced |= offer.forced;
             slot.due = slot.next_due(now);
         }
@@ -151,9 +181,7 @@ impl Pacer {
 
     /// The statuses that are due at `now`, made now.
     pub fn take_due(&mut self, now: Instant) -> Vec<CertificateStatus> {
-        let unix_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+        let unix_time = unix_now();
         let mut due = Vec::new();
         for slot in self.slots.values_mut() {
             if slot.due.is_none_or(|at| at > now) {
@@ -161,11 +189,14 @@ impl Pacer {
             }
             slot.sent = Some((now, slot.wanted.clone()));
             slot.forced = false;
-            slot.due = slot.next_due(now);
             due.push(CertificateStatus {
                 unix_time,
                 ..slot.wanted.clone()
             });
+            if let Some(back) = slot.resume.take() {
+                slot.wanted = back;
+            }
+            slot.due = slot.next_due(now);
         }
         due
     }
@@ -385,9 +416,84 @@ mod tests {
             .after_bundle(vec![status("other", State::Missing)], true);
         rig.at(301).await;
         rig.statuses
-            .after_bundle(vec![status("stays", State::Failed)], false);
+            .after_refusal(vec![status("stays", State::Failed)], Vec::new());
         rig.at(400).await;
         assert_eq!(rig.sent("other").len(), 2, "repeated at 360");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_said_once_and_the_request_for_the_certificate_goes_on() {
+        let rig = Rig::start();
+        rig.statuses
+            .after_bundle(vec![status("a", State::Missing)], true);
+        rig.at(20).await;
+        // A bundle is refused: both apps of it hear `failed`, and the bundle in force still has
+        // `a` waiting for its certificate.
+        rig.statuses.after_refusal(
+            vec![status("a", State::Failed), status("b", State::Failed)],
+            vec![status("a", State::Missing), status("c", State::Active)],
+        );
+        rig.at(200).await;
+        assert_eq!(
+            rig.sent("a"),
+            [
+                at_state(0, State::Missing),
+                at_state(20, State::Failed),
+                at_state(30, State::Missing),
+                at_state(90, State::Missing),
+                at_state(150, State::Missing),
+            ],
+            "asks again a window after the `failed`, then every minute"
+        );
+        assert_eq!(
+            rig.sent("b"),
+            [at_state(20, State::Failed)],
+            "the bundle in force does not have it waiting, so it stays failed"
+        );
+        assert!(
+            rig.sent("c").is_empty(),
+            "an app the refusal does not name is left alone"
+        );
+
+        // The retry of the bundle is refused again, and the request goes on after it.
+        rig.statuses.after_refusal(
+            vec![status("a", State::Failed)],
+            vec![status("a", State::Missing)],
+        );
+        rig.at(300).await;
+        assert_eq!(
+            rig.sent("a")[5..],
+            [
+                at_state(200, State::Failed),
+                at_state(210, State::Missing),
+                at_state(270, State::Missing)
+            ]
+        );
+
+        // The certificate arrives, and the asking ends.
+        rig.statuses.changed(vec![status("a", State::Active)]);
+        rig.at(700).await;
+        assert_eq!(rig.sent("a").len(), 9);
+        assert_eq!(rig.sent("a").last().unwrap(), &at_state(300, State::Active));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_that_is_followed_by_a_state_before_it_is_sent_leaves_no_request_behind() {
+        let rig = Rig::start();
+        rig.statuses.changed(vec![status("a", State::Active)]);
+        rig.at(1).await;
+        // Inside the window: refused, and then the certificate shows up before `failed` goes.
+        rig.statuses.after_refusal(
+            vec![status("a", State::Failed)],
+            vec![status("a", State::Missing)],
+        );
+        rig.statuses.changed(vec![status("a", State::Active)]);
+        rig.at(500).await;
+        assert_eq!(
+            rig.sent("a"),
+            [at_state(0, State::Active), at_state(10, State::Active)],
+            "only the latest state goes, and nothing is asked for"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -9,7 +9,7 @@ use crate::ready::ReadyActions;
 use crate::tls::dir::tests::{Scratch, my_uid};
 use crate::tls::install::tests::{Made, fixture};
 use crate::tls::pacer::{Offer, Offers, Statuses};
-use crate::tls::status::REFUSED_SETTINGS;
+use crate::tls::status::{REFUSED_SETTINGS, unix_now};
 use crate::tls::tests::make_pem;
 use std::time::Duration;
 
@@ -722,12 +722,15 @@ fn only(offers: &mut Offers) -> Offer {
     all.remove(0)
 }
 
-fn states(offer: &Offer) -> Vec<(String, String, String)> {
-    offer
-        .statuses
+fn summary(statuses: &[CertificateStatus]) -> Vec<(String, String, String)> {
+    statuses
         .iter()
         .map(|s| (s.app_id.clone(), s.source.clone(), s.state.clone()))
         .collect()
+}
+
+fn states(offer: &Offer) -> Vec<(String, String, String)> {
+    summary(&offer.statuses)
 }
 
 #[test]
@@ -919,24 +922,31 @@ fn a_bundle_refused_for_its_tls_settings_gives_each_gateway_app_in_it_failed_wit
         states(&offer),
         [
             (SHOP.into(), "uploaded".into(), "failed".into()),
-            (ACME_APP.into(), "acme".into(), "failed".into()),
             (BLOG.into(), "uploaded".into(), "failed".into()),
-        ]
+        ],
+        "an ordered certificate reports through its order, and a `failed` here would stay on it"
     );
     for s in &offer.statuses {
         assert_eq!(s.error, REFUSED_SETTINGS);
-        assert_eq!(s.next_attempt_unix, 0);
+        assert_eq!(
+            s.next_attempt_unix, 0,
+            "the control plane sends the bundle again"
+        );
     }
-    let [shop_status, acme_status, blog_status] = &offer.statuses[..] else {
-        panic!("three statuses");
+    let [shop_status, blog_status] = &offer.statuses[..] else {
+        panic!("two statuses");
     };
-    // The uploaded one names its certificate, the ordered one the request its bundle carries.
+    // The uploaded one names its certificate the bundle carries.
     assert_eq!(blog_status.certificate_id, ORPHAN);
-    assert_eq!(acme_status.request_id, "r1");
     // The certificate an app is served meanwhile stays described.
     assert_eq!(shop_status.leaf_sha256, f.ec.leaf);
     assert_eq!(shop_status.chain_pem, f.ec.cert);
-    assert!(blog_status.chain_pem.is_empty() && acme_status.chain_pem.is_empty());
+    assert!(blog_status.chain_pem.is_empty());
+    // The bundle in force is what the apps go back to.
+    assert_eq!(
+        summary(&offer.in_force),
+        [(SHOP.into(), "uploaded".into(), "active".into())]
+    );
 }
 
 #[test]
@@ -973,12 +983,22 @@ fn a_bundle_refused_for_an_address_it_cannot_bind_says_which_and_why_for_an_http
         a.report_bundle();
         let offer = only(&mut offers);
         assert!(offer.forced && !offer.whole);
-        assert_eq!(offer.statuses.len(), 2);
+        assert!(offer.in_force.is_empty(), "no bundle is in force yet");
+        assert_eq!(
+            states(&offer),
+            [(SHOP.into(), "uploaded".into(), "failed".into())]
+        );
         for s in &offer.statuses {
-            assert_eq!(s.state, "failed");
             assert_eq!(
                 s.error,
                 format!("cannot listen on {address}: address in use")
+            );
+            // The bundle is tried again after the longest wait of a retry, for as long as it takes.
+            let retry = unix_now() + i64::try_from(WAF_BUNDLE_RETRY_MAX.as_secs()).unwrap();
+            assert!(
+                (retry - 10..=retry).contains(&s.next_attempt_unix),
+                "{} for {retry}",
+                s.next_attempt_unix
             );
         }
     }
@@ -1010,6 +1030,137 @@ fn a_bundle_refused_for_an_address_it_cannot_bind_says_which_and_why_for_an_http
     );
     a.report_bundle();
     assert_eq!(states(&only(&mut offers)), states(&offer));
+}
+
+/// Runs the pacer on a paused clock beside an agent, so a test can say what the control plane
+/// hears and when. The agent is called outside the runtime, as the link calls it from a blocking
+/// thread.
+struct Clocked {
+    rt: tokio::runtime::Runtime,
+    origin: tokio::time::Instant,
+    heard: Arc<Mutex<Vec<(u64, String, String)>>>,
+}
+
+impl Clocked {
+    fn start(offers: Offers) -> Clocked {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let origin = rt.block_on(async { tokio::time::Instant::now() });
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let log = heard.clone();
+        rt.spawn(crate::tls::pacer::run(offers, move |s| {
+            log.lock()
+                .unwrap()
+                .push((origin.elapsed().as_secs(), s.app_id, s.state));
+        }));
+        Clocked { rt, origin, heard }
+    }
+
+    /// Lets the clock run to `secs` after the start, and the pacer with it.
+    fn at(&self, secs: u64) {
+        let until = self.origin + Duration::from_secs(secs);
+        self.rt
+            .block_on(async move { tokio::time::sleep_until(until).await });
+    }
+
+    /// What the control plane heard of `app`: (seconds since the start, state).
+    fn heard(&self, app: &str) -> Vec<(u64, String)> {
+        self.heard
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, id, _)| id == app)
+            .map(|(at, _, state)| (*at, state.clone()))
+            .collect()
+    }
+}
+
+fn at_state(at: u64, state: &str) -> (u64, String) {
+    (at, state.to_owned())
+}
+
+#[test]
+fn a_bundle_refused_for_a_bind_does_not_end_the_request_for_a_certificate_still_missing() {
+    let (a, proxy, _dir, offers) = agent_with_statuses();
+    let f = fixture();
+    let clock = Clocked::start(offers);
+    let shop = app_json(
+        SHOP,
+        18080,
+        Some(&tls_object("shop.example.com", CERT, &f.ec.leaf)),
+    );
+    // A second gateway app on an address that something else holds.
+    let blog = app_json(
+        BLOG,
+        18081,
+        Some(
+            &tls_object("blog.example.com", ORPHAN, &f.other_ec.leaf)
+                .replace("0.0.0.0:443", "127.0.0.1:18444"),
+        ),
+    );
+    let taken = || {
+        *proxy.fail.lock().unwrap() = Some(wafio_proxy::listeners::BIND_ERROR.into());
+        *proxy.unbound.lock().unwrap() =
+            Some(("127.0.0.1:18444".into(), std::io::ErrorKind::AddrInUse));
+    };
+
+    // The bundle in force names a certificate the agent does not hold: it asks for it.
+    apply(&a, &bundle_of(std::slice::from_ref(&shop)), 1).unwrap();
+    a.report_bundle();
+    clock.at(20);
+    assert_eq!(clock.heard(SHOP), [at_state(0, "missing")]);
+
+    // A bundle that adds the second app is refused for its address. Each gateway app in it hears
+    // `failed`, and the first goes on asking for its certificate a few seconds later: the bundle
+    // in force still names it.
+    taken();
+    assert!(apply(&a, &bundle_of(&[shop.clone(), blog.clone()]), 2).is_err());
+    a.report_bundle();
+    clock.at(60);
+    assert_eq!(
+        clock.heard(SHOP),
+        [
+            at_state(0, "missing"),
+            at_state(20, "failed"),
+            at_state(30, "missing")
+        ]
+    );
+    assert_eq!(clock.heard(BLOG), [at_state(20, "failed")]);
+
+    // The retry fails the same way a minute later, and the request goes on after each.
+    clock.at(80);
+    taken();
+    assert!(apply(&a, &bundle_of(&[shop, blog]), 2).is_err());
+    a.report_bundle();
+    clock.at(100);
+    assert_eq!(
+        clock.heard(SHOP),
+        [
+            at_state(0, "missing"),
+            at_state(20, "failed"),
+            at_state(30, "missing"),
+            at_state(80, "failed"),
+            at_state(90, "missing")
+        ]
+    );
+    assert_eq!(
+        clock.heard(BLOG),
+        [at_state(20, "failed"), at_state(80, "failed")],
+        "the second app is not in the bundle in force, so nothing is asked for"
+    );
+
+    // The certificate arrives, which the bundle in force allows: `active`, and no more asking.
+    assert_eq!(
+        a.install_certificate(&install_of(&f.ec, SHOP, CERT)),
+        Ok(())
+    );
+    clock.at(500);
+    let shop_heard = clock.heard(SHOP);
+    assert_eq!(shop_heard.last(), Some(&at_state(100, "active")));
+    assert_eq!(shop_heard.len(), 6, "{shop_heard:?}");
 }
 
 #[test]
@@ -1089,13 +1240,12 @@ fn a_bundle_cannot_be_applied_between_the_check_of_an_install_and_its_commit() {
         std::thread::spawn(move || a.install_certificate_with(&install, gated_load))
     };
     // The install has read the bundle in force and is in the middle of its check.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut step = GATE.0.lock().unwrap();
     while *step != 1 {
-        step = GATE
-            .1
-            .wait_timeout(step, Duration::from_secs(10))
-            .unwrap()
-            .0;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!left.is_zero(), "the install never reached its check");
+        step = GATE.1.wait_timeout(step, left).unwrap().0;
     }
     drop(step);
 

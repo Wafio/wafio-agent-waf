@@ -39,9 +39,10 @@ const STREAM_SEND_BUFFER: usize = 16;
 /// Default security-data base directory.
 pub const DEFAULT_SECURITY_DATA_DIR: &str = "/etc/wafio/security-data";
 
-/// Retry bounds for a WAF configuration bundle whose apply failed.
+/// Retry bounds for a WAF configuration bundle whose apply failed. The longest wait is also the
+/// fixed wait of a bundle whose address cannot be bound.
 pub(crate) const WAF_BUNDLE_RETRY_MIN: Duration = Duration::from_secs(2);
-pub(crate) const WAF_BUNDLE_RETRY_MAX: Duration = Duration::from_secs(60);
+pub const WAF_BUNDLE_RETRY_MAX: Duration = Duration::from_secs(60);
 /// About 8 minutes of retries; a bundle refused for good must not cost a rebuild forever. A bundle
 /// refused because an address is taken is another case: it retries without a limit.
 pub(crate) const WAF_BUNDLE_RETRY_ATTEMPTS: u32 = 10;

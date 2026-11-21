@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 use pingora::tls::sign::CertifiedKey;
 use wafio_control::{AckCode, CertificateInstall};
-use wafio_proxy::cert_store::{BookEntry, CertBook, certified_key_from_pem, leaf_sha256};
+use wafio_proxy::cert_store::{BookEntry, CertBook, leaf_sha256};
 use zeroize::Zeroizing;
 
 use crate::bundle::BundleApp;
 use dir::{KeyDir, MAX_KEY_FILE, ReadError};
 use entry::{Refusal, Settings, Source, check, is_known_source};
-use install::{LoadKey, Secrets, verify_and_store};
+use install::{LoadKey, Secrets, load_key, pair_from_file, verify_and_store};
 use state_file::{AppRecord, STATE_FILE, StateFile, is_key_file};
 
 /// The certificate an app is served with, and where it came from.
@@ -168,9 +168,10 @@ impl Keys {
 
     /// Reads `file` and builds its key. With `leaf` the certificate must be that one.
     fn load(&self, file: &str, leaf: Option<&str>) -> Result<Served, Fault> {
-        // The file holds the key, so the text is wiped once the key is read from it.
+        // The file holds the key, so the text is wiped once the key is read from it, and so is
+        // the DER of the key.
         let pem = Zeroizing::new(self.dir.read(file, MAX_KEY_FILE).map_err(Fault::Read)?);
-        let key = certified_key_from_pem(&pem).map_err(Fault::Pem)?;
+        let key = pair_from_file(&pem, &mut Secrets::default(), load_key).map_err(Fault::Pem)?;
         let leaf_sha256 = leaf_sha256(&key);
         if leaf.is_some_and(|want| want != leaf_sha256) {
             return Err(Fault::OtherLeaf);
@@ -395,10 +396,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::bundle::decode_bundle;
     use dir::tests::{Scratch, my_uid};
-    use install::load_key;
     use std::path::Path;
     use std::process::Command;
-    use wafio_proxy::cert_store::BookChange;
+    use wafio_proxy::cert_store::{BookChange, certified_key_from_pem};
 
     const APP: &str = "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11";
     const OTHER_APP: &str = "6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90";

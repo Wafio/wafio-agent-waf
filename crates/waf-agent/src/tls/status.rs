@@ -6,6 +6,7 @@
 //! `pacer`.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use wafio_control::CertificateStatus;
 use wafio_proxy::cert_store::chain_pem;
@@ -43,6 +44,13 @@ impl State {
             State::Missing => "missing",
         }
     }
+}
+
+/// The time now as the control plane takes it, seconds since the epoch.
+pub fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
 }
 
 /// A status with the fields every source fills; the caller sets the rest.
@@ -96,11 +104,14 @@ pub fn current(applied: &HashMap<String, Applied>, only: Option<&str>) -> Vec<Ce
 /// `failed` for each app of a bundle that was refused for a reason that concerns its HTTPS
 /// settings, `why` being the reason. The apps are those of the refused bundle, read as sent: its
 /// settings may be what failed. The certificate each is served meanwhile stays described, from
-/// the bundle in force.
+/// the bundle in force. `retry_at` is when the bundle is tried again, or 0 when nothing is
+/// planned. An ordered certificate has none until it reports through its order: a `failed` here
+/// would stay on its app after the bundle was taken.
 pub fn refused(
     apps: &[BundleApp],
     applied: &HashMap<String, Applied>,
     why: &str,
+    retry_at: i64,
 ) -> Vec<CertificateStatus> {
     let error = error_text(why);
     let mut all: Vec<CertificateStatus> = apps
@@ -113,14 +124,11 @@ pub fn refused(
                     certificate_id: entry.certificate_id.clone(),
                     ..base(&app.app_id, SOURCE_UPLOADED, State::Failed, served)
                 },
-                SOURCE_ACME => CertificateStatus {
-                    request_id: entry.acme_request_id.clone(),
-                    ..base(&app.app_id, SOURCE_ACME, State::Failed, served)
-                },
                 _ => return None,
             };
             Some(CertificateStatus {
                 error: error.clone(),
+                next_attempt_unix: retry_at,
                 ..status
             })
         })
@@ -255,12 +263,66 @@ mod tests {
         .unwrap()
         .apps;
         assert_eq!(
-            refused(&apps, &HashMap::new(), "PRIVATE KEY text")[0].error,
+            refused(&apps, &HashMap::new(), "PRIVATE KEY text", 0)[0].error,
             ERROR_WITHHELD
         );
         assert_eq!(
-            refused(&apps, &HashMap::new(), "bad\nphrase")[0].error,
+            refused(&apps, &HashMap::new(), "bad\nphrase", 0)[0].error,
             "badphrase"
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_when_the_bundle_is_tried_again_and_skips_what_reports_no_state_yet() {
+        let tls = |source: &str, extra: &str| {
+            format!(r#"{{"hosts":["a.example.com"],"source":"{source}"{extra}}}"#)
+        };
+        let uploaded = tls(
+            "uploaded",
+            &format!(
+                r#","certificate_id":"{CERT}","leaf_sha256":"{}""#,
+                "ab".repeat(32)
+            ),
+        );
+        let entries = [
+            (APP, uploaded),
+            (
+                "1a2b3c4d-0000-4000-8000-000000000002",
+                tls("acme", r#","acme_request_id":"r1""#),
+            ),
+            ("1a2b3c4d-0000-4000-8000-000000000003", tls("", "")),
+            ("1a2b3c4d-0000-4000-8000-000000000004", tls("uploaded", "")),
+        ];
+        let list: Vec<String> = entries
+            .iter()
+            .map(|(id, tls)| format!(r#"{{"app_id":"{id}","tls":{tls}}}"#))
+            .collect();
+        let apps =
+            crate::bundle::decode_bundle(format!(r#"{{"apps":[{}]}}"#, list.join(",")).as_bytes())
+                .unwrap()
+                .apps;
+        let got = refused(
+            &apps,
+            &HashMap::new(),
+            "cannot listen on 0.0.0.0:443: address in use",
+            1_800_000_060,
+        );
+        let [only] = &got[..] else {
+            panic!("only an uploaded certificate that the bundle names has a status: {got:?}");
+        };
+        assert_eq!(
+            (
+                only.app_id.as_str(),
+                only.state.as_str(),
+                only.certificate_id.as_str(),
+                only.next_attempt_unix
+            ),
+            (APP, "failed", CERT, 1_800_000_060)
+        );
+        assert_eq!(only.error, "cannot listen on 0.0.0.0:443: address in use");
+        assert_eq!(
+            refused(&apps, &HashMap::new(), "x", 0)[0].next_attempt_unix,
+            0
         );
     }
 }

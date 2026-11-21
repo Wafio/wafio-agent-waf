@@ -114,8 +114,8 @@ In order: agent-material check (`scripts/check-ai.sh`), secret scan (`gitleaks`)
 and scans the files for secrets instead of the history; run `scripts/check-ai.sh` in the checkout then.
 
 The feature `test-tls` of `wafio-waf-agent` lets `WAFIO_TEST_TLS_DIR` name the key directory, so that the tests of the binary can use a
-directory that the user they run as owns (the fixed path needs the user of the unit); `tests/tls_bundle.rs` is built only with it. No
-release build enables it.
+directory that the user they run as owns (the fixed path needs the user of the unit); `tests/tls_bundle.rs` and `tests/control_plane.rs`
+are built only with it. No release build enables it.
 
 The gate needs nothing from the private repository. The loader's file checks are tested here (`crates/engine-loader`) and the
 encodings with random and damaged buffers of a fixed seed (`crates/engine-abi/tests`); loading a real library, the failure cases that need
@@ -478,14 +478,15 @@ exactly as before.
   certificate is held already (`ok`, nothing is written); the chain is over 64 KiB or the key over 16 KiB (`too_large`); a block of
   the chain is not a `CERTIFICATE`, the chain has none, or the key text is not exactly one unencrypted `PRIVATE KEY`, `RSA PRIVATE KEY`
   or `EC PRIVATE KEY` block, an `EC PARAMETERS` block beside it being ignored as the control plane ignores it (`bad_pem`); more than
-  10 certificates (`too_large`); the SHA-256 of the leaf is not `leaf_sha256` (`leaf_mismatch`); the TLS library cannot sign with the
+  10 certificates, or a chain that is over 64 KiB once it is written again with lines of 64 characters (`too_large`); the SHA-256 of the leaf is not `leaf_sha256` (`leaf_mismatch`); the TLS library cannot sign with the
   key, which it reads as RSA, ECDSA P-256 or P-384 or Ed25519 (`unsupported_key`); the key does not belong to the leaf
   (`key_mismatch`); the file cannot be written (`write_failed`, which a process that waits for the directory lock also answers, as it
   writes nothing until it has the lock). Then the file is written, key first and the chain after it, both written again from their
   DER, so what is on disk is one key block and the chain whatever text came in; the next handshake gets the certificate and an open
   connection goes on; the certificate it replaces is removed; and `active` is reported. The key is in no log line, no message
   the agent sends, no bundle cache and no heartbeat. The message that carries it, the DER decoded from it and the text of the file
-  are zeroed when the install ends, however it ends. That is best effort: the gRPC library keeps its decode buffer and the TLS
+  are zeroed when the install ends, however it ends, and so are the text and the DER of a key file the agent reads. That is best
+  effort: the gRPC library keeps its decode buffer, the PEM reader the base64 of the key in a buffer it grows and frees, and the TLS
   library its copy of the key.
 - The agent reports each app whose bundle names an uploaded certificate in a `CertificateStatus`: `active` (the named certificate is
   served; `chain_pem` is the served chain written again from its DER, `leaf_sha256` its leaf), `missing` (it is not held; the
@@ -494,9 +495,14 @@ exactly as before.
   then one for each change of state or of the served leaf, and one each minute while the state is `missing`. An app sends at most
   one in ten seconds: a change inside that time goes out when it is over, as the latest state only. An app whose source is empty
   or not known, or that is uploaded with no certificate named, has none. An app with the source `acme` reports nothing, as the agent
-  orders no certificate. A bundle that is refused because a `tls` object fails a check, or because an HTTPS or redirect address
-  cannot be bound, gives each such app in it `failed` with a fixed phrase: `the bundle was refused: its TLS settings are not valid`,
-  or `cannot listen on 0.0.0.0:443: address in use` (the address and the kind of the error). An error text has its control characters
+  orders no certificate, a refused bundle included. A bundle that is refused because a `tls` object fails a check, or because an
+  HTTPS or redirect address cannot be bound, gives each uploaded app in it `failed` with a fixed phrase: `the bundle was refused: its
+  TLS settings are not valid`, or `cannot listen on 0.0.0.0:443: address in use` (the address and the kind of the error). For an
+  address that cannot be bound `next_attempt_unix` is a minute ahead, when the bundle is tried again; for a refused `tls` object it is
+  0, as the control plane sends the bundle again. The refusal changes nothing in force, so an app whose bundle in force still names
+  a certificate the agent does not hold asks for it again (`missing`) once its `failed` has gone, and then every minute. A bundle
+  refused for any other reason (a plain app on the address of an HTTPS listener, say) says nothing of the certificates: each app
+  reports the state it is in. An error text has its control characters
   removed, is cut to 1 KiB on a character boundary, and becomes `error text withheld` when it holds `-----BEGIN` or `PRIVATE KEY`.
 - Apps that give the same `listen` share the listener and may differ in their `proxy_config`; a host name belongs to one app on a
   listener. Before a request is routed its head is read with the largest read buffer and the largest finite read timeout of those apps, and an answer made

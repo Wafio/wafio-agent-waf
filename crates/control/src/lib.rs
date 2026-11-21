@@ -27,7 +27,8 @@ pub use grpc_reconnect::{
 };
 pub use grpc_stream::{
     AgentStats, ControlConfig, ControlLink, DEFAULT_SECURITY_DATA_DIR, HANDSHAKE_TIMEOUT,
-    HEARTBEAT_INTERVAL, HeartbeatCounters, Hooks, LinkError, default_server_name,
+    HEARTBEAT_INTERVAL, HeartbeatCounters, Hooks, LinkError, WAF_BUNDLE_RETRY_MAX,
+    default_server_name,
 };
 pub use malware_database::{FetchResult, MAX_MALWARE_SNAPSHOT_BYTES, SecurityData};
 pub use timestamp::Timestamp;

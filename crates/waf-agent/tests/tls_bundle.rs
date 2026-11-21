@@ -1488,7 +1488,19 @@ async fn a_bundle_that_cannot_bind_its_https_address_is_refused_and_its_gateway_
         ("uploaded", CERT)
     );
     assert!(failed.chain_pem.is_empty(), "no certificate was served");
-    assert_eq!(failed.next_attempt_unix, 0);
+    // The bundle is tried again a minute after it was refused, for as long as it takes.
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    assert!(
+        (now + 30..=now + 60).contains(&failed.next_attempt_unix),
+        "{} against {now}",
+        failed.next_attempt_unix
+    );
     // The plain address of the app was never opened either.
     assert!(TcpStream::connect(("127.0.0.1", s.plain)).await.is_err());
     s.assert_log_has_no_key();

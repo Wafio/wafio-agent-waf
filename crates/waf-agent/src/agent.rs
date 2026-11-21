@@ -10,6 +10,7 @@ use wafio_application::RateLimitStore;
 use wafio_application::blocklist::BlockStore;
 use wafio_control::{
     AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink, CertificateStatus,
+    WAF_BUNDLE_RETRY_MAX,
 };
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
@@ -309,7 +310,7 @@ impl Agent {
                     rejected.app_id.chars().take(64).collect::<String>(),
                     rejected.refusal
                 );
-                status::refused(&b.apps, keys.applied(), status::REFUSED_SETTINGS)
+                status::refused(&b.apps, keys.applied(), status::REFUSED_SETTINGS, 0)
             }),
             None => Ok(HashMap::new()),
         };
@@ -430,7 +431,10 @@ impl Agent {
             });
             if let (Some((address, kind)), Some(keys)) = (failure, &st.tls) {
                 let why = format!("cannot listen on {address}: {kind}");
-                st.refusal = Some(status::refused(apps, keys.applied(), &why));
+                // The bundle is tried again after the longest wait, for as long as it takes.
+                let retry_at =
+                    status::unix_now().saturating_add_unsigned(WAF_BUNDLE_RETRY_MAX.as_secs());
+                st.refusal = Some(status::refused(apps, keys.applied(), &why, retry_at));
             }
             BundleError::Bind(error)
         } else {
@@ -441,6 +445,7 @@ impl Agent {
                     apps,
                     keys.applied(),
                     status::REFUSED_SETTINGS,
+                    0,
                 ));
             }
             BundleError::Apply(error)
@@ -473,14 +478,15 @@ impl Agent {
     }
 
     /// A live bundle was handled: the control plane hears the state of the apps it names, or that
-    /// the bundle was refused because of its HTTPS settings.
+    /// the bundle was refused because of its HTTPS settings. A refusal leaves the bundle in force
+    /// as it was, so an app of it that still asks for a certificate goes on asking.
     pub fn report_bundle(&self) {
         let Some(out) = &self.statuses else { return };
         let mut guard = self.lock();
         let st = &mut *guard;
         let Some(keys) = &st.tls else { return };
         match st.refusal.take() {
-            Some(failed) => out.after_bundle(failed, false),
+            Some(failed) => out.after_refusal(failed, status::current(keys.applied(), None)),
             None => out.after_bundle(status::current(keys.applied(), None), true),
         }
     }

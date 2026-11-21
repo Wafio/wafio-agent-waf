@@ -5,6 +5,11 @@
 //! and only then writes a file. The file is made from the decoded parts, not from the text that
 //! came in, so what lands on disk is one key block and the chain, written the way the reader of
 //! the directory expects.
+//!
+//! Care is taken that the DER of the key and the text of the file are wiped when the work ends,
+//! however it ends. It is best effort: the PEM reader keeps the base64 of the key in a buffer that
+//! it grows and frees unwiped, the gRPC library keeps its decode buffer, and the TLS library its
+//! own copy of the key.
 
 use std::sync::Arc;
 
@@ -14,7 +19,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::{CertifiedKey, SigningKey};
 use rustls::{Error as TlsError, InconsistentKeys};
 use wafio_control::{AckCode, CertificateInstall};
-use wafio_proxy::cert_store::{chain_pem, pem_block_len, push_pem_block, sha256_hex};
+use wafio_proxy::cert_store::{PairFault, chain_pem, pem_block_len, push_pem_block, sha256_hex};
 use zeroize::{Zeroize, Zeroizing};
 
 /// The most the chain text may hold, and the most the key text may.
@@ -75,8 +80,12 @@ impl Drop for WipeOnExit<'_> {
     }
 }
 
-/// Checks the pair of an install in the order the control plane's contract lists the refusals, and
-/// hands the checked key and the text of the file to `store`. `store` writes the file and switches
+/// Checks the pair of an install and hands the checked key and the text of the file to `store`.
+/// The first check that fails is the answer, and they run in this order: the size of the chain and
+/// of the key (`TooLarge`), the PEM blocks of the chain and of the key (`BadPem`), the number of
+/// certificates and the length of the chain written again (`TooLarge`), the digest of the leaf
+/// (`LeafMismatch`), the key type (`UnsupportedKey`), the key against the leaf (`KeyMismatch`).
+/// Sizes come first so that a large input is never parsed. `store` writes the file and switches
 /// what is served; its refusal is the install's. Everything that held the key is wiped when this
 /// returns or unwinds.
 pub(crate) fn verify_and_store(
@@ -100,25 +109,75 @@ fn run(
     }
     let chain = chain_of(&install.chain_pem)?;
     secrets.der = Some(key_of(&install.key_pem)?);
-    if chain.len() > MAX_CERTIFICATES {
+    // The chain is written again with lines of 64 characters, which can make it longer than the
+    // text it came in. The control plane drops a status whose chain is over the limit, so a chain
+    // that would be is refused here.
+    if chain.len() > MAX_CERTIFICATES || written_len(&chain) > MAX_CHAIN_PEM {
         return Err(AckCode::TooLarge);
     }
     if sha256_hex(chain[0].as_ref()) != install.leaf_sha256 {
         return Err(AckCode::LeafMismatch);
     }
     let der = secrets.der.as_ref().expect("set above");
-    let signing = load(der).map_err(|_| AckCode::UnsupportedKey)?;
-    let certified = CertifiedKey::new(chain, signing);
-    match certified.keys_match() {
-        Ok(()) | Err(TlsError::InconsistentKeys(InconsistentKeys::Unknown)) => {}
-        Err(_) => return Err(AckCode::KeyMismatch),
-    }
+    let certified = certify(chain, der, load)?;
     // The DER has done its work once the file text is made from it.
     secrets.file = file_text(der, &certified.cert)?;
     if let Some(der) = &mut secrets.der {
         der.zeroize();
     }
     store(Arc::new(certified), &secrets.file)
+}
+
+/// The signing key of `der` with `chain`, checked against the leaf. `CertifiedKey::from_der`
+/// would do the same but drops the owned DER unzeroed, so the caller keeps it and wipes it.
+fn certify(
+    chain: Vec<CertificateDer<'static>>,
+    der: &PrivateKeyDer<'_>,
+    load: LoadKey,
+) -> Result<CertifiedKey, AckCode> {
+    let signing = load(der).map_err(|_| AckCode::UnsupportedKey)?;
+    let certified = CertifiedKey::new(chain, signing);
+    match certified.keys_match() {
+        Ok(()) | Err(TlsError::InconsistentKeys(InconsistentKeys::Unknown)) => Ok(certified),
+        Err(_) => Err(AckCode::KeyMismatch),
+    }
+}
+
+/// The pair in a key file of the directory: the key block and the certificates, in any order. It
+/// is read as an install is checked, so the DER of the key is decoded once, is held in `secrets`
+/// and is wiped when this returns or unwinds; the reader of the proxy decodes the key block twice
+/// and drops both copies unwiped.
+pub(crate) fn pair_from_file(
+    text: &[u8],
+    secrets: &mut Secrets,
+    load: LoadKey,
+) -> Result<CertifiedKey, PairFault> {
+    let wipe = WipeOnExit(secrets);
+    let secrets = &mut *wipe.0;
+    let found = sections(text, b"-----BEGIN EC PARAMETERS-----").map_err(|_| PairFault::NotPem)?;
+    let mut chain = Vec::new();
+    for (kind, mut der) in found {
+        match kind {
+            SectionKind::Certificate => chain.push(CertificateDer::from(der.to_vec())),
+            SectionKind::PrivateKey | SectionKind::RsaPrivateKey | SectionKind::EcPrivateKey
+                if secrets.der.is_none() =>
+            {
+                secrets.der = PrivateKeyDer::from_pem(kind, std::mem::take(&mut *der));
+                if secrets.der.is_none() {
+                    return Err(PairFault::NotPem);
+                }
+            }
+            _ => return Err(PairFault::NotPem),
+        }
+    }
+    if chain.is_empty() {
+        return Err(PairFault::NoCertificate);
+    }
+    let der = secrets.der.as_ref().ok_or(PairFault::NoKey)?;
+    certify(chain, der, load).map_err(|code| match code {
+        AckCode::KeyMismatch => PairFault::KeyMismatch,
+        _ => PairFault::KeyUnusable,
+    })
 }
 
 /// A section of a PEM text: its kind and the DER it holds, which is wiped on drop.
@@ -191,15 +250,20 @@ fn key_label(der: &PrivateKeyDer<'_>) -> Result<&'static str, AckCode> {
     }
 }
 
+/// The length of the text of `chain` written again, as the key file and the status carry it.
+fn written_len(chain: &[CertificateDer<'_>]) -> usize {
+    chain
+        .iter()
+        .map(|c| pem_block_len("CERTIFICATE", c.as_ref().len()))
+        .sum()
+}
+
 /// The text of the key file: the key, then the chain, each written again from its DER. The buffer
 /// has its full size from the start, so it never grows and leaves no unwiped copy behind.
 fn file_text(der: &PrivateKeyDer<'_>, chain: &[CertificateDer<'_>]) -> Result<Vec<u8>, AckCode> {
     let label = key_label(der)?;
-    let chain_len: usize = chain
-        .iter()
-        .map(|c| pem_block_len("CERTIFICATE", c.as_ref().len()))
-        .sum();
-    let mut text = Vec::with_capacity(pem_block_len(label, der.secret_der().len()) + chain_len);
+    let mut text =
+        Vec::with_capacity(pem_block_len(label, der.secret_der().len()) + written_len(chain));
     push_pem_block(label, der.secret_der(), &mut text);
     text.extend_from_slice(&chain_pem(chain));
     debug_assert_eq!(text.capacity(), text.len());
@@ -556,7 +620,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_checks_run_in_the_order_of_the_contract_and_the_first_failure_wins() {
+    fn the_first_check_that_fails_is_the_answer_in_a_fixed_order() {
         let f = fixture();
         let wrong_leaf = "ab".repeat(32);
         // Over ten certificates, a wrong leaf and a key of another certificate: the count.
@@ -589,6 +653,174 @@ pub(crate) mod tests {
             code(&install_of(&f.ec.cert, &f.rsa.key, &f.ec.leaf)),
             Err(AckCode::KeyMismatch)
         );
+    }
+
+    /// A certificate block with its base64 on one line, as some tools and people write it.
+    fn unwrapped_block(der: &[u8]) -> String {
+        let mut wrapped = Vec::new();
+        push_pem_block("CERTIFICATE", der, &mut wrapped);
+        let text = String::from_utf8(wrapped).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let body = lines[1..lines.len() - 1].concat();
+        format!("{}\n{body}\n{}\n", lines[0], lines[lines.len() - 1])
+    }
+
+    #[test]
+    fn a_chain_that_is_over_the_limit_once_written_again_is_too_large() {
+        // Ten blocks with no line breaks fit the limit as they come in. Written again with lines
+        // of 64 characters they do not, and the control plane drops a status that carries more
+        // than the limit, so the install is refused instead of served and never shown.
+        let f = fixture();
+        let der = vec![0x30u8; 4824];
+        let chain_of_n = |n: usize| unwrapped_block(&der).repeat(n);
+        let sent = chain_of_n(10);
+        let written =
+            wafio_proxy::cert_store::chain_pem(&vec![CertificateDer::from(der.clone()); 10]);
+        assert!(sent.len() <= MAX_CHAIN_PEM, "{}", sent.len());
+        assert!(written.len() > MAX_CHAIN_PEM, "{}", written.len());
+        let leaf = sha256_hex(&der);
+        assert_eq!(
+            code(&install_of(sent.as_bytes(), &f.ec.key, &leaf)),
+            Err(AckCode::TooLarge)
+        );
+        // Nine of them are under the limit both ways: the check goes on to the key, which is not
+        // the key of these made-up certificates.
+        let nine = chain_of_n(9);
+        assert_eq!(
+            code(&install_of(nine.as_bytes(), &f.ec.key, &leaf)),
+            Err(AckCode::KeyMismatch)
+        );
+    }
+
+    fn pair(text: &[u8]) -> (Result<CertifiedKey, PairFault>, Secrets) {
+        let mut secrets = Secrets::default();
+        (pair_from_file(text, &mut secrets, load_key), secrets)
+    }
+
+    #[test]
+    fn a_key_file_is_read_in_any_order_and_leaves_no_der_of_the_key_behind() {
+        let f = fixture();
+        let two = [f.ec.cert.clone(), f.other_ec.cert.clone()].concat();
+        let cat = |parts: &[&[u8]]| parts.concat();
+        let cases: [(&str, Vec<u8>, &str, usize); 8] = [
+            (
+                "key then chain",
+                cat(&[&f.ec.key, &f.ec.cert]),
+                &f.ec.leaf,
+                1,
+            ),
+            (
+                "chain then key",
+                cat(&[&f.ec.cert, &f.ec.key]),
+                &f.ec.leaf,
+                1,
+            ),
+            ("pkcs8 rsa", cat(&[&f.rsa.key, &f.rsa.cert]), &f.rsa.leaf, 1),
+            (
+                "pkcs1 rsa",
+                cat(&[&f.rsa_pkcs1, &f.rsa.cert]),
+                &f.rsa.leaf,
+                1,
+            ),
+            ("sec1", cat(&[&f.ec_sec1, &f.ec.cert]), &f.ec.leaf, 1),
+            (
+                "sec1 with its curve block",
+                cat(&[&f.ec_with_params.key, &f.ec_with_params.cert]),
+                &f.ec_with_params.leaf,
+                1,
+            ),
+            ("two certificates", cat(&[&f.ec.key, &two]), &f.ec.leaf, 2),
+            (
+                "text around the blocks",
+                cat(&[b"Bag Attributes\n", &f.ec.key, b"\n", &f.ec.cert]),
+                &f.ec.leaf,
+                1,
+            ),
+        ];
+        for (what, text, leaf, certificates) in cases {
+            let (got, secrets) = pair(&text);
+            let key = got.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(leaf_sha256(&key), leaf, "{what}");
+            assert_eq!(key.cert.len(), certificates, "{what}");
+            let proxy_reading = certified_key_from_pem(&text).unwrap();
+            assert_eq!(
+                leaf_sha256(&proxy_reading),
+                leaf,
+                "{what}: as the proxy reads it"
+            );
+            assert_eq!(
+                secrets.sizes(),
+                (Some(0), 0, 0),
+                "{what}: the DER was wiped"
+            );
+        }
+
+        let csr = b"-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n";
+        let cut = &f.ec.cert[..f.ec.cert.len() - 40];
+        let faults: [(&str, Vec<u8>, PairFault); 11] = [
+            ("nothing", Vec::new(), PairFault::NoCertificate),
+            (
+                "text",
+                b"a certificate, please".to_vec(),
+                PairFault::NoCertificate,
+            ),
+            ("a key alone", f.ec.key.clone(), PairFault::NoCertificate),
+            ("a chain alone", f.ec.cert.clone(), PairFault::NoKey),
+            (
+                "two keys",
+                cat(&[&f.ec.key, &f.rsa.key, &f.ec.cert]),
+                PairFault::NotPem,
+            ),
+            (
+                "a key under a passphrase",
+                cat(&[&f.rsa_encrypted_pkcs8, &f.rsa.cert]),
+                PairFault::NotPem,
+            ),
+            (
+                "a block that is neither",
+                cat(&[&f.ec.key, &f.ec.cert, csr]),
+                PairFault::NotPem,
+            ),
+            (
+                "a block cut short",
+                cat(&[&f.ec.key, cut]),
+                PairFault::NotPem,
+            ),
+            (
+                "a key that cannot sign",
+                cat(&[&f.p521.key, &f.p521.cert]),
+                PairFault::KeyUnusable,
+            ),
+            (
+                "the key of another certificate",
+                cat(&[&f.other_ec.key, &f.ec.cert]),
+                PairFault::KeyMismatch,
+            ),
+            (
+                "an RSA key under a certificate of ECDSA",
+                cat(&[&f.rsa.key, &f.ec.cert]),
+                PairFault::KeyMismatch,
+            ),
+        ];
+        for (what, text, fault) in faults {
+            let (got, secrets) = pair(&text);
+            assert_eq!(got.err(), Some(fault), "{what}");
+            let (der, file, _) = secrets.sizes();
+            assert_eq!(
+                (der.unwrap_or(0), file),
+                (0, 0),
+                "{what}: the DER was wiped"
+            );
+        }
+
+        // A panic while the key is read leaves nothing behind either.
+        let text = cat(&[&f.ec.key, &f.ec.cert]);
+        let mut secrets = Secrets::default();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            pair_from_file(&text, &mut secrets, panicking)
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(secrets.sizes(), (Some(0), 0, 0));
     }
 
     #[test]
@@ -915,6 +1147,13 @@ pub(crate) mod tests {
                             panic!("case {cases}: a pair that passed does not read back: {e}")
                         });
                         assert_eq!(leaf_sha256(&read), install.leaf_sha256, "case {cases}");
+                        // The agent's own reading of its file agrees, and wipes the key.
+                        let (own, secrets) = pair(&text);
+                        let own = own.unwrap_or_else(|e| {
+                            panic!("case {cases}: the file is not read by the agent: {e}")
+                        });
+                        assert_eq!(leaf_sha256(&own), install.leaf_sha256, "case {cases}");
+                        assert_eq!(secrets.sizes(), (Some(0), 0, 0), "case {cases}");
                         assert!(
                             (1..=MAX_CERTIFICATES).contains(&read.cert.len()),
                             "case {cases}"
