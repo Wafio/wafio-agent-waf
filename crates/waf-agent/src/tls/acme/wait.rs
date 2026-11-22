@@ -58,7 +58,8 @@ fn number(text: &str, digits: usize) -> Option<i64> {
 }
 
 /// The seconds since the epoch of a date in the form `Sun, 06 Nov 1994 08:49:37 GMT`, the only form
-/// RFC 9110 lets a sender use. The two obsolete forms are not read.
+/// RFC 9110 lets a sender use. The two obsolete forms are not read, so a header in one of them is
+/// as good as none and the wait is the hour.
 fn http_date(text: &str) -> Option<i64> {
     let (weekday, rest) = text.split_once(", ")?;
     if weekday.len() != 3 || !weekday.bytes().all(|b| b.is_ascii_alphabetic()) {

@@ -86,12 +86,13 @@ fn uploaded(app_id: &str, wanted: &Certificate, served: Option<&Served>) -> Cert
 
 /// The status of an app whose certificate is ordered. `pending`: an order is running, or none has
 /// answered the request id of the bundle yet (so one is due, and the chain in use, if any, is
-/// still the previous one); `failed`: the order that answered the id failed, with the time of the
-/// next one, or the authority's wait after an order under an earlier id still holds the new one
-/// back; `active`: the certificate in use is the ordered one and covers every host. A finished
-/// order reports only while the id it started under is the bundle's. A failed order says when the
-/// next attempt is by the same rule that makes the worker wait for it. The chain in use is
-/// described whatever the state, one that has expired included: a failed renewal keeps serving it.
+/// still the previous one); `failed`: the order that answered the id failed (or gave a certificate
+/// that was due for renewal at once), with the time of the next one, or the authority's wait after
+/// an order under an earlier id still holds the new one back; `active`: the certificate in use is
+/// the ordered one and covers every host. A finished order reports only while the id it started
+/// under is the bundle's. A failed order says when the next attempt is by the same rule that makes
+/// the worker wait for it. The chain in use is described whatever the state, one that has expired
+/// included: a failed renewal keeps serving it.
 pub fn ordered(
     app_id: &str,
     settings: &Settings,

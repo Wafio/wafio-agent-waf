@@ -120,11 +120,17 @@ impl AppRecord {
         self.error.clear();
     }
 
-    /// The order that was running ended, however it ended: it is no unfinished attempt.
+    /// The order that was running ended, however it ended: it is no unfinished attempt, and the
+    /// crashes counted before it are forgotten.
     pub fn end_attempt(&mut self) {
+        self.drop_attempt();
+        self.interrupted = 0;
+    }
+
+    /// The note of the order that is running goes, and the crashes counted before it stay.
+    pub fn drop_attempt(&mut self) {
         self.attempt_started = 0;
         self.attempt_request_id.clear();
-        self.interrupted = 0;
     }
 
     /// Keeps no more than an entry can have. A file of another build, or one that was edited, may
@@ -322,6 +328,22 @@ mod tests {
                 forgotten.interrupted
             ),
             (0, "", 0)
+        );
+        // A hand-over drops the note of the order and keeps the crashes counted before it.
+        let mut handed = AppRecord {
+            attempt_started: 1_800_000_000,
+            attempt_request_id: "r2".into(),
+            interrupted: 1,
+            ..AppRecord::default()
+        };
+        handed.drop_attempt();
+        assert_eq!(
+            (
+                handed.attempt_started,
+                handed.attempt_request_id.as_str(),
+                handed.interrupted
+            ),
+            (0, "", 1)
         );
     }
 

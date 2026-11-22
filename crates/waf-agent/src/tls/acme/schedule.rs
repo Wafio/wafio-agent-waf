@@ -95,7 +95,8 @@ fn other_directory(record: Option<&AppRecord>, directory: &str) -> bool {
 /// order is due when the app has no certificate of its own, when a host is not covered by it, when
 /// the bundle asks for one with an id that no order has answered, when the certificate has a third
 /// of its lifetime left, and when another directory than `directory` issued it (it is served until
-/// the new one replaces it). An order that failed under the current id is tried again, whatever the
+/// the new one replaces it). A certificate that was due when it was kept is no endless reason to
+/// order: taking it in noted a failure, whose wait holds the next order back. An order that failed under the current id is tried again, whatever the
 /// app is served meanwhile: the certificate it asked for is not there yet (but not once a whole
 /// certificate is there and the failed order was for a host the app has dropped). A due order
 /// waits for the next attempt that the failed order set, and for the authority's wait. A new id
@@ -511,6 +512,39 @@ mod tests {
             plan(&s, Some(&answered), Own::Whole { renew_at: i64::MAX }, NOW),
             Plan::Idle
         );
+    }
+
+    #[test]
+    fn a_certificate_that_was_due_when_it_was_kept_waits_for_the_failure_it_counted_as() {
+        let s = settings("0.0.0.0:443", None, "r1");
+        let due = Own::Whole {
+            renew_at: NOW - 86_400,
+        };
+        // With no failure on record a due certificate is ordered at once, due since its time.
+        assert_eq!(
+            plan(&s, Some(&record("r1", 0)), due, NOW),
+            Plan::Due {
+                since: NOW - 86_400
+            }
+        );
+        // The failure that taking it in counted holds the next order back, and then it is due
+        // since the end of the wait, not since the time the certificate was due.
+        let kept = AppRecord {
+            failures: 1,
+            tried_hosts: s.hosts.clone(),
+            ..record("r1", NOW + 600)
+        };
+        for now in [NOW, NOW + 599] {
+            assert_eq!(
+                plan(&s, Some(&kept), due, now),
+                Plan::Wait { until: NOW + 600 }
+            );
+        }
+        assert_eq!(
+            plan(&s, Some(&kept), due, NOW + 600),
+            Plan::Due { since: NOW + 600 }
+        );
+        assert_eq!(retry_at(&s, Some(&kept), due), NOW + 600);
     }
 
     #[test]

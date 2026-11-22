@@ -543,24 +543,30 @@ exactly as before.
   `redirect_listen` on port 80 that adding one is the way out. A name the authority already holds a proof for gets no challenge. The key of a certificate is a new ECDSA P-256 key
   for every order, and the chain that comes back is checked as an uploaded one is, and must cover every host, before it is kept
   (`acme-<app id>.pem`, written as the other certificate files are) and served from the next handshake on. An order that finishes
-  after its app left the bundle, left gateway mode, changed its source or its hosts is dropped and writes nothing; a new request id
-  with the same hosts and source does not drop it. After a failed order the next one waits 10 minutes, then 1 hour, 4 hours, 12 hours and
+  after its app left the bundle, left gateway mode, changed its source or its hosts is dropped and nothing of it is kept, except that its
+  note of an unfinished attempt is cleared from `state.json`; a new request id with the same hosts and source does not drop it. After a failed order the next one waits 10 minutes, then 1 hour, 4 hours, 12 hours and
   a day for each failure after those, and tries the other challenge; a success or a new request id starts that ladder again, and a change
   to the hosts does not shorten the wait. When the authority answers `rateLimited` the app waits the later of an hour and the `Retry-After`
-  of the answer (seconds, or a date in the form `Sun, 06 Nov 1994 08:49:37 GMT`; one that is missing, malformed or in the past asks for
-  nothing) and at most 7 days, so an authority cannot park an app for good. A new request id does not lift that wait: the status under the
-  new id is `failed` with its time. A renewal that fails keeps serving the certificate the app has, expired or not, and reports `failed`
-  with that chain. `state.json` keeps the id the last order answered, the directory that issued the certificate, the challenge that worked,
+  of the answer (seconds, or a date in the form `Sun, 06 Nov 1994 08:49:37 GMT`; one that is missing, malformed, in the past or in one
+  of the two obsolete date forms asks for nothing) and at most 7 days, so an authority cannot park an app for good. A new request id does
+  not lift that wait: the status under the new id is `failed` with its time. At each look the agent drops a wait that has passed and cuts
+  one that reaches further than it ever sets (the authority's to 7 days, its own to a day), so a clock that was set ahead and back parks
+  no app. A renewal that fails keeps serving the certificate the app has, expired or not, and reports `failed` with that chain. A
+  certificate that is due for renewal the moment the authority gives it (a host clock far ahead, or an authority that issues expired or
+  very short-lived certificates) is kept and served, and counts as a failed order with the same ladder and the error `the authority
+  issued a certificate that is due for renewal at once`, so an app cannot order again and again until the authority's rate limit stops it. `state.json` keeps the id the last order answered, the directory that issued the certificate, the challenge that worked,
   the failures and the hosts of the failed order, the time of the next try, the wait of the authority and the text of the last error, so a
   restart does not order sooner. An order notes its start there, synced, before it asks the authority anything: a start that finds an
   order unfinished (the process was killed) orders again at once, and the second one in a row counts as a failure with the backoff, so a
   process that is started over and over cannot spend the authority's limits. An order that a reload cuts short, and one that the
-  process before ended, is no crash. A file of an earlier build, without these fields, is read as it is. What `state.json` keeps for an
+  process before ended, is no crash, and does not clear the crashes counted before it. A file of an earlier build, without these fields, is read as it is. What `state.json` keeps for an
   app is bounded (at most 100 hosts of a failed order, an error text of 1 KiB), and the agent never writes a file larger than it reads
   (1 MiB): if the whole is too large the hosts of the failed orders go, then the error texts are cut short, and the file is left as it is
   when even that is not enough.
-- An ordered certificate reports `pending` (an order is running or due, also before the first one; `chain_pem` is the certificate in use
-  meanwhile, if any), `active` (the ordered certificate is served and covers every host) or `failed` (the last order failed: `error` is a
+- An ordered certificate reports `pending` (an order is running, or is due for a certificate that is missing, lacks a host or answers a
+  request id no order has answered; `chain_pem` is the certificate in use meanwhile, if any), `active` (the ordered certificate is
+  served and covers every host; a renewal, or a reissue by another directory, that is due but waits behind the order of another app stays
+  `active` until its own order starts) or `failed` (the last order failed: `error` is a
   fixed phrase with the problem type and detail the authority gave or the kind of the I/O error, and `next_attempt_unix` the time of the
   next try; also the state of a new request id while the wait the authority set for an earlier order stands, with that time).
   `request_id` is the id of the bundle entry the state answers: an order that ends under an id that is no longer the entry's
@@ -568,7 +574,8 @@ exactly as before.
 - The metrics listener (`WAFIO_METRICS_ADDR`) has three series for the certificates: `wafio_waf_acme_orders_total{result}` counts the
   orders that ended, `issued` (a certificate was kept and is served) or `failed` (the authority, the key directory, or an agent that was
   stopped twice in a row while the order ran); `wafio_waf_certificate_installs_total{result}` counts the installs of uploaded
-  certificates the control plane sent, `ok` or the code the agent refused with; `wafio_waf_tls_certificate_expiry_seconds{app_id}` is
+  certificates the key directory answered, `ok` or the code it refused with (an agent with no key directory, and an install that
+  panics, are answered by the control link and not counted); `wafio_waf_tls_certificate_expiry_seconds{app_id}` is
   the number of seconds until the certificate each app is served ends, negative once it has. An app served no certificate, or only the
   placeholder, has no series of the last kind, and it goes when the app leaves the bundle or stops serving that certificate. The only
   label values are those results and the id of an app.

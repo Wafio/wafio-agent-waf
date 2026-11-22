@@ -104,7 +104,8 @@ impl Agent {
     }
 
     /// The order to start next, if one is due, when the authority at `directory` is the one the
-    /// agent orders from. A started order is reported `pending`. Blocking: it may write.
+    /// agent orders from. A started order is reported `pending`, and so is whatever the look
+    /// changed: a crash loop counted as a failure, a wait that ended. Blocking: it may write.
     pub(crate) fn next_order(&self, now: i64, directory: &str) -> Option<NextOrder> {
         let mut guard = self.lock();
         let st = &mut *guard;
@@ -115,9 +116,13 @@ impl Agent {
             return Some(NextOrder::Wait(None));
         }
         let keys = st.tls.as_mut()?;
-        let next = keys.next_order(now, directory);
-        if let (NextOrder::Order(job), Some(out)) = (&next, &self.statuses) {
-            out.changed(keys.statuses(Some(&job.app_id)));
+        let (next, changed) = keys.next_order(now, directory);
+        if let Some(out) = &self.statuses {
+            if changed {
+                out.changed(keys.statuses(None));
+            } else if let NextOrder::Order(job) = &next {
+                out.changed(keys.statuses(Some(&job.app_id)));
+            }
         }
         Some(next)
     }

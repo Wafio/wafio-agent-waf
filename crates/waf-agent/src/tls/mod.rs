@@ -36,6 +36,11 @@ use state_file::{AppRecord, STATE_FILE, StateFile, is_key_file};
 /// Why the second start in a row that finds an order unfinished counts as a failure.
 pub(crate) const INTERRUPTED: &str = "the agent stopped while the order ran, again and again";
 
+/// Why an order that gave a certificate counts as a failure: the certificate is due for renewal
+/// the moment it is kept.
+pub(crate) const DUE_AT_ISSUE: &str =
+    "the authority issued a certificate that is due for renewal at once";
+
 /// The certificate an app is served with, and where it came from.
 #[derive(Clone)]
 pub struct Served {
@@ -341,13 +346,16 @@ impl Keys {
 
     /// The order to start next, if one is due: the app that has been due the longest. Only the
     /// process that holds the key directory lock orders. The app counts as running until
-    /// `finish_order`. `directory` is the authority the agent orders from now. Blocking: it may
-    /// write.
-    pub fn next_order(&mut self, now: i64, directory: &str) -> NextOrder {
+    /// `finish_order`. `directory` is the authority the agent orders from now. The second value
+    /// says that looking changed what an app reports (a crash counted as a failure, a wait ended
+    /// or cut short), which the caller offers as it does a started order. Blocking: it may write.
+    pub fn next_order(&mut self, now: i64, directory: &str) -> (NextOrder, bool) {
         if !self.dir.holds_lock() || self.running.is_some() {
-            return NextOrder::Wait(None);
+            return (NextOrder::Wait(None), false);
         }
-        self.count_unfinished(now);
+        let counted = self.count_unfinished(now);
+        let bounded = self.bound_waits(now);
+        let changed = counted || bounded;
         let mut first: Option<(i64, &String)> = None;
         let mut wake: Option<i64> = None;
         for (id, app) in &self.applied {
@@ -364,7 +372,7 @@ impl Keys {
             }
         }
         let Some((_, id)) = first else {
-            return NextOrder::Wait(wake);
+            return (NextOrder::Wait(wake), changed);
         };
         let id = id.clone();
         let app = &self.applied[&id];
@@ -379,7 +387,7 @@ impl Keys {
             app_id: id.clone(),
         };
         self.running = Some(id);
-        NextOrder::Order(job)
+        (NextOrder::Order(job), changed)
     }
 
     /// The app whose certificate is being ordered, if one is.
@@ -407,8 +415,9 @@ impl Keys {
     /// by a crash: it is no failure the first time, and the app is ordered again at once. The
     /// second one in a row counts as a failure, with the backoff, so that a process that is
     /// restarted over and over cannot spend the authority's limits. An attempt that the process
-    /// before this one cut short at a hand-over is no crash: it noted so (`release`).
-    fn count_unfinished(&mut self, now: i64) {
+    /// before this one cut short at a hand-over is no crash: it noted so (`release`). Says
+    /// whether a failure was counted.
+    fn count_unfinished(&mut self, now: i64) -> bool {
         let cut_short: Vec<String> = self
             .applied
             .iter()
@@ -421,6 +430,7 @@ impl Keys {
                     .is_some_and(|r| r.attempt_started != 0)
             })
             .collect();
+        let mut failed = false;
         for id in &cut_short {
             let Some(record) = self.state.apps.get_mut(id) else {
                 continue;
@@ -443,11 +453,40 @@ impl Keys {
             record.tried_hosts.clear();
             record.error = status::error_text(INTERRUPTED);
             self.metrics.order_failed();
+            failed = true;
             tracing::info!("[acme] app {id}: {INTERRUPTED}");
         }
         if !cut_short.is_empty() {
             self.settle(&HashSet::new());
         }
+        failed
+    }
+
+    /// Holds the waits on record to what this look at the clock allows. The authority's wait only
+    /// holds an order back while it is ahead, so one that has passed is dropped, and a new request
+    /// id no longer reports it. No wait reaches further than the code ever sets one: a clock that
+    /// ran ahead when a wait was noted and was then set right would otherwise park an app for
+    /// weeks. Says whether a record changed, which may change what the app reports.
+    fn bound_waits(&mut self, now: i64) -> bool {
+        let latest_ca_wait = now.saturating_add(wait::CA_WAIT_CAP);
+        let latest_retry = now.saturating_add(wait::backoff(u32::MAX));
+        let mut changed = false;
+        for record in self.state.apps.values_mut() {
+            let ca_wait = if record.ca_wait_unix <= now {
+                0
+            } else {
+                record.ca_wait_unix.min(latest_ca_wait)
+            };
+            let retry = record.next_attempt_unix.min(latest_retry);
+            if (ca_wait, retry) != (record.ca_wait_unix, record.next_attempt_unix) {
+                (record.ca_wait_unix, record.next_attempt_unix) = (ca_wait, retry);
+                changed = true;
+            }
+        }
+        if changed {
+            self.settle(&HashSet::new());
+        }
+        changed
     }
 
     /// The order of `app_id` is over and nothing of it is kept.
@@ -458,11 +497,14 @@ impl Keys {
     }
 
     /// Takes in what the order of `job` came to, under the apply lock. If the app is no longer
-    /// served by order, or its hosts changed meanwhile, the order is dropped and nothing is
-    /// written: the book follows the bundle. A certificate is kept as `acme-<app_id>.pem`, served
-    /// from the next handshake on in place of the placeholder or the certificate it replaces, and
-    /// remembered in `state.json`. A new request id in the bundle does not drop it: the same hosts
-    /// and source still ask for it, and the new id orders next.
+    /// served by order, or its hosts changed meanwhile, the order is dropped and nothing of it is
+    /// kept, except that its note of an unfinished attempt is cleared from `state.json`: the book
+    /// follows the bundle. A certificate is kept as `acme-<app_id>.pem`, served from the next
+    /// handshake on in place of the placeholder or the certificate it replaces, and remembered in
+    /// `state.json`. A new request id in the bundle does not drop it: the same hosts and source
+    /// still ask for it, and the new id orders next. A certificate that is due for renewal the
+    /// moment it is kept is served too, and counts as a failed order, so the next one waits for
+    /// the backoff.
     ///
     /// The app counts as ordering until this is done, so `stop_order` can note an error in it.
     pub fn finish_order(
@@ -546,16 +588,37 @@ impl Keys {
             let _ = self.dir.remove(&file);
             return self.order_failed(job, "the certificate cannot be served", 0, now);
         }
+        // Nothing else puts a floor between two issuances: a clock that runs far ahead, or an
+        // authority that issues short-lived or expired certificates, would order again at once
+        // until the authority's rate limit answered.
+        let due_at_issue = issued
+            .key
+            .cert
+            .first()
+            .and_then(|leaf| acme::names::validity(leaf.as_ref()))
+            .is_some_and(|(from, to)| schedule::renew_at(from, to) <= now);
         let served = Served {
             file: file.clone(),
             leaf_sha256: leaf_sha256(&issued.key),
             key: issued.key,
         };
         let record = self.state.apps.entry(job.app_id.clone()).or_default();
+        let earlier_failures = if record.request_id == job.request_id {
+            record.failures
+        } else {
+            0
+        };
         record.request_id.clone_from(&job.request_id);
         record.directory = directory.to_owned();
         record.worked = job.kind.as_str().to_owned();
         record.forget_failures();
+        if due_at_issue {
+            record.failures = earlier_failures.saturating_add(1);
+            record.next_attempt_unix = now.saturating_add(wait::backoff(record.failures));
+            record.tried_hosts.clone_from(&job.hosts);
+            record.error = status::error_text(DUE_AT_ISSUE);
+            tracing::info!("[acme] app {}: {DUE_AT_ISSUE}", job.app_id);
+        }
         self.metrics.order_issued();
         tracing::info!("[acme] app {}: issued, served from {file}", job.app_id);
         self.serve(&job.app_id, served);
@@ -708,7 +771,8 @@ impl Keys {
 
     /// Lets go of the lock for the process that takes over. An order that the hand-over cuts short
     /// is noted as no attempt that was left unfinished, so the process that takes over orders
-    /// again without counting a crash.
+    /// again without counting a crash. Crashes counted before it stay counted: reloads between
+    /// crashes must not hide a crash loop.
     pub fn release(&mut self) {
         if self.dir.holds_lock() {
             if let Some(record) = self
@@ -716,7 +780,7 @@ impl Keys {
                 .as_ref()
                 .and_then(|id| self.state.apps.get_mut(id))
             {
-                record.end_attempt();
+                record.drop_attempt();
             }
             self.save_state();
             self.dir.release_lock();
@@ -1197,7 +1261,7 @@ pub(crate) mod tests {
         let mut k = keys(&s);
         let acme = r#"{"listen":"0.0.0.0:443","hosts":["shop.example.com"],"source":"acme","acme_request_id":"r1"}"#;
         apply(&mut k, &[(APP, acme.to_owned())]);
-        let NextOrder::Order(job) = k.next_order(1_800_000_000, "https://ca.test/dir") else {
+        let (NextOrder::Order(job), _) = k.next_order(1_800_000_000, "https://ca.test/dir") else {
             panic!("an order is due");
         };
         let (pem, _) = make_pem(&s.0, "x");
@@ -1225,7 +1289,7 @@ pub(crate) mod tests {
             "an order that left no trace would be made again at once"
         );
         assert!(matches!(
-            k.next_order(1_800_000_001, "https://ca.test/dir"),
+            k.next_order(1_800_000_001, "https://ca.test/dir").0,
             NextOrder::Wait(Some(_))
         ));
     }
@@ -1453,7 +1517,7 @@ pub(crate) mod tests {
 
     /// The order that is due at `now`, which counts as running from then on.
     fn order(k: &mut Keys, now: i64) -> Job {
-        match k.next_order(now, DIR) {
+        match k.next_order(now, DIR).0 {
             NextOrder::Order(job) => job,
             NextOrder::Wait(until) => {
                 panic!("an order is due at {now}, not waiting until {until:?}")
@@ -1463,7 +1527,7 @@ pub(crate) mod tests {
 
     /// The time the next order waits for, if it waits.
     fn waits_until(k: &mut Keys, now: i64) -> Option<i64> {
-        match k.next_order(now, DIR) {
+        match k.next_order(now, DIR).0 {
             NextOrder::Wait(until) => until,
             NextOrder::Order(job) => panic!("no order is due at {now}, one is: {job:?}"),
         }
@@ -1485,10 +1549,12 @@ pub(crate) mod tests {
         }
     }
 
-    fn issued(s: &Scratch) -> Issued {
-        let (pem, _) = make_pem(&s.0, "issued");
+    /// A certificate that is a year long from a fortnight before `T0`: not due for renewal for
+    /// months.
+    fn issued() -> Issued {
+        let (pem, key) = acme::mock::dated_pair(&["shop.example.com"], (2027, 1, 1), (2028, 1, 1));
         Issued {
-            key: Arc::new(certified_key_from_pem(&pem).unwrap()),
+            key,
             file: Zeroizing::new(pem),
         }
     }
@@ -1522,7 +1588,7 @@ pub(crate) mod tests {
 
         // A success forgets the failures, and the next failure is the first again.
         let job = order(&mut k, now);
-        k.finish_order(&job, Ok(issued(&s)), &book_of(&[APP]), DIR, now);
+        k.finish_order(&job, Ok(issued()), &book_of(&[APP]), DIR, now);
         let record = record_on_disk(&s);
         assert_eq!(
             (
@@ -1698,7 +1764,9 @@ pub(crate) mod tests {
         drop(k);
         let mut k = keys(&s);
         apply(&mut k, &[(APP, acme("r1"))]);
-        assert_eq!(waits_until(&mut k, T0 + 11), Some(T0 + 11 + 600));
+        let (next, changed) = k.next_order(T0 + 11, DIR);
+        assert!(matches!(next, NextOrder::Wait(Some(at)) if at == T0 + 11 + 600));
+        assert!(changed, "the failure it counts is for the caller to report");
         let record = record_on_disk(&s);
         assert_eq!(
             (
@@ -1726,6 +1794,10 @@ pub(crate) mod tests {
         let mut k = keys(&s);
         apply(&mut k, &[(APP, acme("r1"))]);
         assert_eq!(waits_until(&mut k, T0 + 16), Some(T0 + 611));
+        assert!(
+            !k.next_order(T0 + 17, DIR).1,
+            "nothing counted, nothing to say"
+        );
 
         // After the wait the order is made, and killed again: the next one counts at once, with
         // the next rung of the ladder, and does not order again before it.
@@ -1867,6 +1939,225 @@ pub(crate) mod tests {
         assert_eq!(StateFile::load(&k.dir).0.apps.len(), 1);
     }
 
+    /// A key directory whose `state.json` holds this record for the app.
+    fn seeded_with_record(record: &str) -> Scratch {
+        let s = Scratch::new();
+        let state = format!(r#"{{"apps":{{"{APP}":{record}}}}}"#);
+        keys(&s).dir.write(STATE_FILE, state.as_bytes()).unwrap();
+        s
+    }
+
+    /// An issued certificate valid between two days.
+    fn dated(from: acme::mock::Day, to: acme::mock::Day) -> Issued {
+        let (pem, key) = acme::mock::dated_pair(&["shop.example.com"], from, to);
+        Issued {
+            key,
+            file: Zeroizing::new(pem),
+        }
+    }
+
+    #[test]
+    fn a_certificate_that_is_due_for_renewal_when_it_is_kept_counts_as_a_failed_order() {
+        let m = Arc::new(TlsMetrics::default());
+        let s = Scratch::new();
+        let mut k = keys(&s).with_metrics(m.clone());
+        let book = book_of(&[APP]);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        // It ended before T0, so it is due the moment it is kept.
+        let mut now = T0;
+        for (failures, wait) in [(1, 600), (2, 3600), (3, 4 * 3600)] {
+            let job = order(&mut k, now);
+            let issued = dated((2026, 10, 1), (2027, 1, 1));
+            let leaf = leaf_sha256(&issued.key);
+            k.finish_order(&job, Ok(issued), &book, DIR, now);
+            let record = record_on_disk(&s);
+            assert_eq!(
+                (
+                    record.failures,
+                    record.next_attempt_unix - now,
+                    record.error.as_str(),
+                    record.tried_hosts.as_slice()
+                ),
+                (
+                    failures,
+                    wait,
+                    DUE_AT_ISSUE,
+                    ["shop.example.com".to_owned()].as_slice()
+                )
+            );
+            assert_eq!(
+                record.served,
+                Some(format!("acme-{APP}.pem")),
+                "it is served"
+            );
+            let [status] = &k.statuses(Some(APP))[..] else {
+                panic!("one status");
+            };
+            assert_eq!(
+                (
+                    status.state.as_str(),
+                    status.error.as_str(),
+                    status.next_attempt_unix,
+                    status.leaf_sha256.as_str()
+                ),
+                ("failed", DUE_AT_ISSUE, now + wait, leaf.as_str()),
+                "it is described, and the next order is when the wait ends"
+            );
+            assert_eq!(waits_until(&mut k, now + wait - 1), Some(now + wait));
+            now += wait;
+        }
+
+        // A certificate that is not due ends it: the failures are forgotten.
+        let job = order(&mut k, now);
+        k.finish_order(&job, Ok(issued()), &book, DIR, now);
+        let record = record_on_disk(&s);
+        assert_eq!(
+            (
+                record.failures,
+                record.next_attempt_unix,
+                record.error.as_str()
+            ),
+            (0, 0, "")
+        );
+        assert_eq!(k.statuses(Some(APP))[0].state, "active");
+        // Four orders gave a certificate, and none failed.
+        let text = metric_lines(&m);
+        assert!(
+            text.contains("wafio_waf_acme_orders_total{result=\"issued\"} 4\n")
+                && text.contains("wafio_waf_acme_orders_total{result=\"failed\"} 0\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_due_certificate_for_a_new_request_id_starts_the_ladder_again() {
+        let s = Scratch::new();
+        let mut k = keys(&s);
+        let book = book_of(&[APP]);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        for failures in 1..=2_u32 {
+            let at = T0 + i64::from(failures) * 100_000;
+            let job = order(&mut k, at);
+            k.finish_order(&job, Ok(dated((2026, 10, 1), (2027, 1, 1))), &book, DIR, at);
+            assert_eq!(record_on_disk(&s).failures, failures);
+        }
+        // The new id is ordered at once, and its certificate is due again: the first rung.
+        apply(&mut k, &[(APP, acme("r2"))]);
+        let at = T0 + 300_000;
+        let job = order(&mut k, at);
+        assert_eq!(job.request_id, "r2");
+        k.finish_order(&job, Ok(dated((2026, 10, 1), (2027, 1, 1))), &book, DIR, at);
+        let record = record_on_disk(&s);
+        assert_eq!(
+            (
+                record.failures,
+                record.next_attempt_unix,
+                record.request_id.as_str()
+            ),
+            (1, at + 600, "r2")
+        );
+    }
+
+    #[test]
+    fn a_wait_of_the_authority_that_has_passed_is_dropped_and_a_new_request_id_reports_pending() {
+        let record = format!(
+            r#"{{"request_id":"r1","failures":1,"tried":"tls-alpn-01","tried_hosts":["shop.example.com"],"next_attempt_unix":{},"ca_wait_unix":{},"error":"too many certificates"}}"#,
+            T0 - 100,
+            T0 - 5
+        );
+        let s = seeded_with_record(&record);
+        let mut k = keys(&s);
+        apply(&mut k, &[(APP, acme("r2"))]);
+        // Before the look the wait is on record, and the status holds it against the new id.
+        assert_eq!(k.statuses(Some(APP))[0].state, "failed");
+        let (next, changed) = k.next_order(T0, DIR);
+        let NextOrder::Order(job) = next else {
+            panic!("an order is due");
+        };
+        assert_eq!(job.request_id, "r2");
+        assert!(changed, "the status of the app changed with the look");
+        assert_eq!(record_on_disk(&s).ca_wait_unix, 0);
+        k.abandon_order(APP);
+        let [status] = &k.statuses(Some(APP))[..] else {
+            panic!("one status");
+        };
+        assert_eq!(
+            (
+                status.state.as_str(),
+                status.error.as_str(),
+                status.next_attempt_unix
+            ),
+            ("pending", "", 0)
+        );
+    }
+
+    #[test]
+    fn a_wait_that_a_clock_set_ahead_left_is_cut_to_what_the_code_sets_at_the_next_look() {
+        let month = 30 * 86_400;
+        let record = format!(
+            r#"{{"request_id":"r1","failures":1,"tried":"tls-alpn-01","tried_hosts":["shop.example.com"],"next_attempt_unix":{},"ca_wait_unix":{},"error":"too many certificates"}}"#,
+            T0 + month,
+            T0 + month
+        );
+        let s = seeded_with_record(&record);
+        let mut k = keys(&s);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        assert_eq!(k.statuses(Some(APP))[0].next_attempt_unix, T0 + month);
+        // At most a week for the authority's wait and a day for the agent's own.
+        let (next, changed) = k.next_order(T0, DIR);
+        assert!(matches!(next, NextOrder::Wait(Some(at)) if at == T0 + 7 * 86_400));
+        assert!(changed);
+        let on_disk = record_on_disk(&s);
+        assert_eq!(
+            (on_disk.next_attempt_unix, on_disk.ca_wait_unix),
+            (T0 + 86_400, T0 + 7 * 86_400)
+        );
+        assert_eq!(k.statuses(Some(APP))[0].next_attempt_unix, T0 + 7 * 86_400);
+        // A look that finds nothing to cut says nothing.
+        assert!(!k.next_order(T0 + 1, DIR).1);
+        // The cut wait ends at its time, and the order follows.
+        let job = order(&mut k, T0 + 7 * 86_400);
+        assert_eq!(job.request_id, "r1");
+        assert_eq!(record_on_disk(&s).ca_wait_unix, 0);
+    }
+
+    #[test]
+    fn a_hand_over_drops_the_note_of_the_order_and_keeps_the_crashes_counted_before_it() {
+        let s = Scratch::new();
+        let mut k = keys(&s);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        let job = order(&mut k, T0);
+        k.begin_attempt(&job, T0).unwrap();
+        drop(k);
+        // The process was killed during the order: the next start counts it once and orders again.
+        let mut k = keys(&s);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        let job = order(&mut k, T0 + 5);
+        k.begin_attempt(&job, T0 + 5).unwrap();
+        assert_eq!(record_on_disk(&s).interrupted, 1);
+        k.release();
+        let record = record_on_disk(&s);
+        assert_eq!(
+            (
+                record.attempt_started,
+                record.attempt_request_id.as_str(),
+                record.interrupted
+            ),
+            (0, "", 1),
+            "no crash of its own, and the earlier one is not forgotten"
+        );
+        // The process that takes over is killed during its order: that is the second in a row.
+        let mut k = keys(&s);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        let job = order(&mut k, T0 + 10);
+        k.begin_attempt(&job, T0 + 10).unwrap();
+        drop(k);
+        let mut k = keys(&s);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        assert_eq!(waits_until(&mut k, T0 + 15), Some(T0 + 15 + 600));
+        assert_eq!(record_on_disk(&s).failures, 1);
+    }
+
     fn metric_lines(m: &Arc<TlsMetrics>) -> String {
         let reg = wafio_agent_io::metrics::Registry::new();
         m.register(&reg);
@@ -1890,7 +2181,7 @@ pub(crate) mod tests {
             "the placeholder has no series"
         );
         let job = order(&mut k, T0 + 600);
-        k.finish_order(&job, Ok(issued(&s)), &book, DIR, T0 + 600);
+        k.finish_order(&job, Ok(issued()), &book, DIR, T0 + 600);
         let text = metric_lines(&m);
         assert!(
             text.contains("wafio_waf_acme_orders_total{result=\"failed\"} 1\n"),
@@ -1912,7 +2203,7 @@ pub(crate) mod tests {
         let job = order(&mut k, T0 + 700);
         k.begin_attempt(&job, T0 + 700).unwrap();
         apply(&mut k, &[]);
-        k.finish_order(&job, Ok(issued(&s)), &book, DIR, T0 + 800);
+        k.finish_order(&job, Ok(issued()), &book, DIR, T0 + 800);
         let text = metric_lines(&m);
         assert!(
             text.contains("wafio_waf_acme_orders_total{result=\"issued\"} 1\n"),

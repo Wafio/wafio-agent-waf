@@ -450,6 +450,8 @@ const A: &str = "1a2b3c4d-0000-4000-8000-00000000000a";
 const B: &str = "1a2b3c4d-0000-4000-8000-00000000000b";
 const C: &str = "1a2b3c4d-0000-4000-8000-00000000000c";
 const D: &str = "1a2b3c4d-0000-4000-8000-00000000001d";
+/// An app whose id sorts before all of the others.
+const E: &str = "1a2b3c4d-0000-4000-8000-000000000001";
 /// The apps of the two tests that make the code panic through the log, one each: the needles
 /// are shared by every test thread, so a needle must match the lines of one test only.
 const PANICS_ONCE: &str = "1a2b3c4d-0000-4000-8000-00000000000d";
@@ -1745,7 +1747,7 @@ async fn a_second_unfinished_attempt_in_a_row_is_a_failure_with_the_backoff_and_
         r#"{{"apps":{{"{SHOP}":{{"request_id":"r1","attempt_started":{},"attempt_request_id":"r1","interrupted":1}}}}}}"#,
         BASE - 5
     );
-    let r = rig_over(seeded(&state), None);
+    let mut r = rig_over(seeded(&state), None);
     r.start();
     r.apply(&[(SHOP, &[HOST], "r1")], 1);
     until("the failure is counted", || {
@@ -1755,6 +1757,25 @@ async fn a_second_unfinished_attempt_in_a_row_is_a_failure_with_the_backoff_and_
     let status = r.status(SHOP);
     assert_eq!(status.error, crate::tls::INTERRUPTED);
     assert!((BASE + 600..BASE + 620).contains(&status.next_attempt_unix));
+    // The live bundle was reported before the worker looked, and said `pending`; the failure the
+    // look counted is told of too, though no order follows it.
+    let told: Vec<CertificateStatus> = r
+        .offers
+        .drain()
+        .into_iter()
+        .flat_map(|offer| offer.statuses)
+        .filter(|s| s.source == "acme")
+        .collect();
+    assert_eq!(told.first().map(|s| s.state.as_str()), Some("pending"));
+    let last = told.last().unwrap();
+    assert_eq!(
+        (
+            last.state.as_str(),
+            last.error.as_str(),
+            last.next_attempt_unix
+        ),
+        ("failed", crate::tls::INTERRUPTED, status.next_attempt_unix)
+    );
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(r.ca.script().orders.is_empty(), "no order before its time");
     let record = r.state().apps[SHOP].clone();
@@ -2057,7 +2078,7 @@ async fn renewals_and_backoffs_are_taken_in_the_order_of_their_time_and_the_stat
     let (c_pem, _) = dated_pair(&["c.example.com"], (2026, 12, 15), (2027, 3, 15));
     let a_at = 1_801_267_200;
     let c_at = 1_802_476_800;
-    let (b_at, d_at) = (BASE + 600, BASE + 1_000_000);
+    let (b_at, d_at) = (BASE + 600, BASE + 80_000);
     let state = format!(
         r#"{{"apps":{{"{A}":{},"{B}":{},"{C}":{},"{D}":{}}}}}"#,
         record_of_issued(A, DIRECTORY),
@@ -2119,6 +2140,128 @@ async fn renewals_and_backoffs_are_taken_in_the_order_of_their_time_and_the_stat
     for app in [A, B, C, D] {
         assert_eq!(r.status(app).state, "active", "{app}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn when_everything_is_due_at_once_the_longest_due_goes_first_and_a_new_request_id_last() {
+    // Due since the time of a backoff (B, D), since the time of a renewal (A, C), and since now
+    // (E, which has no certificate and a request id nothing has answered).
+    let (a_pem, _) = dated_pair(&["a.example.com"], (2026, 12, 1), (2027, 3, 1));
+    let (c_pem, _) = dated_pair(&["c.example.com"], (2026, 12, 15), (2027, 3, 15));
+    let c_at = 1_802_476_800;
+    let (b_at, d_at) = (BASE + 600, BASE + 80_000);
+    let state = format!(
+        r#"{{"apps":{{"{A}":{},"{B}":{},"{C}":{},"{D}":{}}}}}"#,
+        record_of_issued(A, DIRECTORY),
+        record_of_failed("b.example.com", b_at),
+        record_of_issued(C, DIRECTORY),
+        record_of_failed("d.example.com", d_at),
+    );
+    // The clock is past all four times when the agent starts.
+    let _ = clock();
+    tokio::time::advance(Duration::from_secs(
+        u64::try_from(c_at + 10 - BASE).unwrap(),
+    ))
+    .await;
+    let r = rig_over(
+        seeded_with(
+            &state,
+            &[
+                (&format!("acme-{A}.pem"), &a_pem),
+                (&format!("acme-{C}.pem"), &c_pem),
+            ],
+        ),
+        None,
+    );
+    r.start();
+    r.apply(
+        &[
+            (A, &["a.example.com"], "r1"),
+            (B, &["b.example.com"], "r1"),
+            (C, &["c.example.com"], "r1"),
+            (D, &["d.example.com"], "r1"),
+            (E, &["e.example.com"], "r1"),
+        ],
+        1,
+    );
+    until("five orders are made", || r.ca.script().orders.len() == 5).await;
+    until("the last is taken in", || !r.ordering()).await;
+    let hosts: Vec<String> = r.ca.script().orders.iter().map(|o| o.join(",")).collect();
+    assert_eq!(
+        hosts,
+        [
+            "b.example.com",
+            "d.example.com",
+            "a.example.com",
+            "c.example.com",
+            "e.example.com"
+        ]
+    );
+    assert_eq!(r.ca.script().most_running, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_certificate_that_is_due_when_it_is_issued_is_served_and_the_next_order_waits() {
+    let mut r = rig();
+    // Valid until 2027-01-01 and the clock is at 2027-01-15: due the moment it is kept, as when
+    // the host's clock runs ahead, or the authority issues short-lived certificates.
+    r.ca.script().validity = Some(((2026, 10, 1), (2027, 1, 1)));
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the certificate is served", || r.issued(SHOP)).await;
+    until("it is taken in", || !r.ordering()).await;
+    let first = r.leaf(SHOP);
+    let status = r.status(SHOP);
+    assert_eq!(
+        (status.state.as_str(), status.error.as_str()),
+        ("failed", crate::tls::DUE_AT_ISSUE)
+    );
+    assert!((BASE + 600..BASE + 620).contains(&status.next_attempt_unix));
+    assert_eq!(
+        status.chain_pem,
+        chain_pem(&r.book(SHOP).unwrap().key.cert),
+        "the certificate in use is described"
+    );
+    assert_eq!(r.told().last(), Some(&pair("failed", "r1")));
+    // Not an order after it at once, and not before the ten minutes are over.
+    tokio::time::advance(Duration::from_secs(590)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(r.ca.script().orders.len(), 1);
+
+    // The second order is due again, and the ladder goes on: an hour.
+    tokio::time::advance(Duration::from_secs(30)).await;
+    until("the second order", || r.ca.script().orders.len() == 2).await;
+    until("it is taken in", || !r.ordering()).await;
+    assert_ne!(r.leaf(SHOP), first);
+    let status = r.status(SHOP);
+    assert!(
+        (clock() + 3590..clock() + 3610).contains(&status.next_attempt_unix),
+        "{}",
+        status.next_attempt_unix
+    );
+    assert_eq!(r.state().apps[SHOP].failures, 2);
+    tokio::time::advance(Duration::from_secs(3000)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(r.ca.script().orders.len(), 2);
+
+    // A certificate that is not due ends it.
+    r.ca.script().validity = Some(((2027, 1, 15), (2027, 4, 15)));
+    tokio::time::advance(Duration::from_secs(700)).await;
+    until("the third order", || r.ca.script().orders.len() == 3).await;
+    until("it is taken in", || !r.ordering()).await;
+    let status = r.status(SHOP);
+    assert_eq!(
+        (
+            status.state.as_str(),
+            status.error.as_str(),
+            status.next_attempt_unix
+        ),
+        ("active", "", 0)
+    );
+    assert_eq!(r.state().apps[SHOP].failures, 0);
+    tokio::time::advance(Duration::from_secs(20 * 86_400)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(r.ca.script().orders.len(), 3);
 }
 
 #[tokio::test(start_paused = true)]
