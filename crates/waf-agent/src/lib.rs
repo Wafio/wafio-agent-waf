@@ -80,6 +80,7 @@ pub fn main_entry() -> ExitCode {
 fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     stderr_log::init();
     // Keeps the keys of the served certificates out of core dumps and away from ptrace.
+    #[cfg(target_os = "linux")]
     if let Err(e) = nix::sys::prctl::set_dumpable(false) {
         tracing::info!("[tls] WARNING: cannot keep key material out of core dumps: {e}");
     }
