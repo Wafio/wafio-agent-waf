@@ -1771,6 +1771,18 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// The ordered certificate and the account are in files that only the agent's user can read.
+fn assert_order_files_are_private(s: &Setup) {
+    for name in [format!("acme-{SHOP}.pem"), "acme-account.json".to_owned()] {
+        let mode = fs::metadata(s.keys.join(&name)).unwrap().permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+            0o600,
+            "{name}"
+        );
+    }
+}
+
 /// What would give away what the agent keeps secret about its orders: the account's key, as the
 /// file holds it, and the key of the certificate it was issued for.
 fn assert_orders_keep_their_keys(s: &Setup, stream: &Conn, issued: &str) {
@@ -1879,14 +1891,7 @@ async fn pebble_issues_by_tls_alpn_on_the_tls_listener_and_a_placeholder_connect
     // What the agent keeps: the certificate and the account in files only the agent reads, and the
     // state that says how it was made.
     let file = format!("acme-{SHOP}.pem");
-    for name in [file.as_str(), "acme-account.json"] {
-        let mode = fs::metadata(s.keys.join(name)).unwrap().permissions();
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
-            0o600,
-            "{name}"
-        );
-    }
+    assert_order_files_are_private(&s);
     let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
     assert!(
         state.contains(&pebble.directory) && state.contains("tls-alpn-01"),
@@ -2370,11 +2375,16 @@ async fn pebble_a_new_request_id_orders_again_at_once_while_the_certificate_is_w
     let first = stream.status(SHOP, "active").await;
     let any = client_taking_any();
     let mut old = Https::connect(pebble.tls, &any, HOST).await.unwrap();
-    let (_, until) = old.peer_validity();
+    let (from, until) = old.peer_validity();
+    // The certificate is renewed when a third of its lifetime is left: the new order below must
+    // come from the new request id, which has to be well before that.
+    let renew_at = until - (until - from) / 3;
     assert!(
         i64::try_from(unix_now()).unwrap() + 60 < until,
         "the first certificate is far from its renewal"
     );
+    // What came before the new id is not what the case looks at.
+    stream.backlog.clear();
 
     let (ok, error) = stream
         .bundle(
@@ -2384,14 +2394,26 @@ async fn pebble_a_new_request_id_orders_again_at_once_while_the_certificate_is_w
         )
         .await;
     assert!(ok, "{error}");
-    // The status of the new id is `pending` until its order has run, then `active` with another
-    // leaf; a status of the old id is never taken for it.
+    // The control plane hears the latest state of an app at most once in 10 seconds, so what comes
+    // for the new id is its `active` with another leaf, the order having run in the meantime.
     let second = stream
         .status_where(Duration::from_secs(40), SHOP, |s| {
             s.state == "active" && s.request_id == "r2"
         })
         .await;
+    assert!(
+        i64::try_from(unix_now()).unwrap() < renew_at,
+        "the order was made before the renewal was due, so it was the new id that made it"
+    );
     assert_ne!(second.leaf_sha256, first.leaf_sha256);
+    assert!(
+        !stream.backlog.iter().any(|m| matches!(
+            &m.kind,
+            Some(Out::CertificateStatus(s)) if s.app_id == SHOP && s.request_id == "r1"
+        )),
+        "a status of the old id came after the new one was sent: {:?}",
+        stream.backlog
+    );
     let mut fresh = Https::connect(pebble.tls, &any, HOST).await.unwrap();
     assert_eq!(fresh.peer_leaf(), second.leaf_sha256);
     assert_eq!(fresh.send(&get("/")).await.unwrap().status, 200);
@@ -2441,6 +2463,9 @@ async fn pebble_an_agent_killed_in_the_middle_of_an_order_orders_again_at_start(
     );
     agent.kill();
     assert!(!s.keys.join(format!("acme-{SHOP}.pem")).exists());
+    // A kill in the middle of a write leaves a temporary file; the validation this one died in is
+    // not a write, so the file is made here.
+    fs::write(s.keys.join(".tmp-1"), "half a write").unwrap();
     // What Pebble held goes to a listener that is gone, and every later check is answered.
     relay.open();
 
@@ -2456,7 +2481,8 @@ async fn pebble_an_agent_killed_in_the_middle_of_an_order_orders_again_at_start(
         .unwrap();
     assert_eq!(served.peer_leaf(), active.leaf_sha256);
     // A start that finds an unfinished order orders again, and an order that ends leaves nothing of
-    // the one that did not: no note of a start, no failure, no temporary file.
+    // the one that did not: no note of a start, no failure, and the temporary file of the cut-short
+    // write is cleared out.
     let record = shop_record(&s).unwrap();
     for field in [
         "attempt_started",
@@ -2467,6 +2493,16 @@ async fn pebble_an_agent_killed_in_the_middle_of_an_order_orders_again_at_start(
         assert!(record.get(field).is_none(), "{field} in {record}");
     }
     assert_directory_holds_only_the_order(&s);
+    assert_order_files_are_private(&s);
+    let log = s.log_text();
+    assert_eq!(
+        log.matches(&format!(
+            "[acme] app {SHOP}: the agent stopped during an order; ordering again"
+        ))
+        .count(),
+        1,
+        "the start noted the unfinished order: {log}"
+    );
     let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
     assert_orders_keep_their_keys(&s, &stream, &file);
 }
@@ -2555,6 +2591,7 @@ async fn pebble_a_reload_in_the_middle_of_an_order_gives_the_successor_the_certi
         "the certificate was not replaced"
     );
     assert_directory_holds_only_the_order(&s);
+    assert_order_files_are_private(&s);
     let log = s.log_text();
     assert_eq!(log.matches("made an account").count(), 1, "{log}");
     assert_eq!(log.matches("issued, served from").count(), 1, "{log}");
@@ -2562,6 +2599,11 @@ async fn pebble_a_reload_in_the_middle_of_an_order_gives_the_successor_the_certi
     for field in ["attempt_started", "interrupted", "failures"] {
         assert!(record.get(field).is_none(), "{field} in {record}");
     }
+    // The successor read the certificate off the disk and reported it: nothing it sent, and
+    // nothing the process before it sent, holds the key.
+    let text = fs::read_to_string(&file).unwrap();
+    assert_orders_keep_their_keys(&s, &next, &text);
+    assert_orders_keep_their_keys(&s, &stream, &text);
     signal(second, "-TERM");
 }
 
