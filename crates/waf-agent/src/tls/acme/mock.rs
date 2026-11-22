@@ -4,19 +4,24 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, Issuer, KeyPair,
-    PKCS_ECDSA_P256_SHA256, PublicKeyData, SignatureAlgorithm,
+    PKCS_ECDSA_P256_SHA256, PublicKeyData, SignatureAlgorithm, date_time_ymd,
 };
-use wafio_proxy::cert_store::{CertBook, push_pem_block};
+use rustls::sign::CertifiedKey;
+use wafio_proxy::cert_store::{CertBook, certified_key_from_pem, push_pem_block};
 use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::prelude::FromDer;
 use zeroize::Zeroizing;
 
 use super::Kind;
 use super::ca::{Account, Answer, Authorization, Ca, CaError, Order};
+
+/// A day as (year, month, day).
+pub type Day = (i32, u8, u8);
 
 /// The steps of an order, for a test to make one fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +83,15 @@ pub struct Script {
     pub alpn_certs: Vec<Vec<u8>>,
     /// The token of the HTTP-01 answer each name got, and the authorization.
     pub http_answers: Vec<(String, String, String)>,
+    /// What the authority sends as `Retry-After` with its last answer.
+    pub retry_after: Option<String>,
+    /// The days (year, month, day) the certificates it issues are valid from and to; the default
+    /// is long enough to never be due.
+    pub validity: Option<(Day, Day)>,
+    /// A key directory whose `state.json` is read at every request to the authority, and what it
+    /// held each time.
+    pub watch: Option<std::path::PathBuf>,
+    pub state_seen: Vec<String>,
 }
 
 impl Default for Script {
@@ -102,6 +116,10 @@ impl Default for Script {
             up_while_waiting: Vec::new(),
             alpn_certs: Vec::new(),
             http_answers: Vec::new(),
+            retry_after: None,
+            validity: None,
+            watch: None,
+            state_seen: Vec::new(),
         }
     }
 }
@@ -148,6 +166,50 @@ impl MockCa {
     pub fn script(&self) -> std::sync::MutexGuard<'_, Script> {
         self.script.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// A request to the authority arrives: what the watched `state.json` holds now is noted.
+    fn request(&self) {
+        let mut script = self.script();
+        if let Some(dir) = script.watch.clone() {
+            let text = std::fs::read_to_string(dir.join("state.json")).unwrap_or_default();
+            script.state_seen.push(text);
+        }
+    }
+}
+
+/// A key and a self-signed certificate for `hosts`, valid from the day `from` to the day `to`
+/// (year, month, day, midnight UTC): the text of a key file, and the key the listeners serve.
+pub fn dated_pair(hosts: &[&str], from: Day, to: Day) -> (Vec<u8>, Arc<CertifiedKey>) {
+    pair_valid(hosts, |params| {
+        params.not_before = date_time_ymd(from.0, from.1, from.2);
+        params.not_after = date_time_ymd(to.0, to.1, to.2);
+    })
+}
+
+/// `dated_pair` for a certificate valid from the time `from` (seconds since the epoch) for
+/// `lasts` seconds.
+pub fn short_pair(hosts: &[&str], from: u64, lasts: u64) -> (Vec<u8>, Arc<CertifiedKey>) {
+    pair_valid(hosts, |params| {
+        let epoch = date_time_ymd(1970, 1, 1);
+        params.not_before = epoch + Duration::from_secs(from);
+        params.not_after = epoch + Duration::from_secs(from + lasts);
+    })
+}
+
+fn pair_valid(
+    hosts: &[&str],
+    dates: impl FnOnce(&mut CertificateParams),
+) -> (Vec<u8>, Arc<CertifiedKey>) {
+    let pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let names: Vec<String> = hosts.iter().map(|h| (*h).to_owned()).collect();
+    let mut params = CertificateParams::new(names).unwrap();
+    dates(&mut params);
+    let certificate = params.self_signed(&pair).unwrap();
+    let mut file = Vec::new();
+    push_pem_block("PRIVATE KEY", &pair.serialize_der(), &mut file);
+    push_pem_block("CERTIFICATE", certificate.der(), &mut file);
+    let key = Arc::new(certified_key_from_pem(&file).unwrap());
+    (file, key)
 }
 
 #[async_trait]
@@ -156,6 +218,7 @@ impl Ca for MockCa {
         &self,
         directory: &str,
     ) -> Result<(Arc<dyn Account>, Zeroizing<Vec<u8>>), CaError> {
+        self.request();
         let id = {
             let mut script = self.script();
             script.created.push(directory.to_owned());
@@ -172,6 +235,7 @@ impl Ca for MockCa {
     }
 
     async fn restore_account(&self, credentials: &[u8]) -> Result<Arc<dyn Account>, CaError> {
+        self.request();
         let mut script = self.script();
         script
             .restored
@@ -181,6 +245,10 @@ impl Ca for MockCa {
         }
         drop(script);
         Ok(Arc::new(MockAccount(self.clone())))
+    }
+
+    fn retry_after(&self) -> Option<String> {
+        self.script().retry_after.clone()
     }
 }
 
@@ -193,6 +261,7 @@ struct MockAccount(MockCa);
 impl Account for MockAccount {
     async fn new_order(&self, hosts: &[String]) -> Result<Box<dyn Order>, CaError> {
         let ca = self.0.clone();
+        ca.request();
         {
             let mut script = ca.script();
             script.orders.push(hosts.to_vec());
@@ -277,7 +346,11 @@ impl MockOrder {
             Issue::FirstNameOnly => self.hosts[..1].to_vec(),
             _ => self.hosts.clone(),
         };
-        let params = CertificateParams::new(names).unwrap();
+        let mut params = CertificateParams::new(names).unwrap();
+        if let Some((from, to)) = self.ca.script().validity {
+            params.not_before = date_time_ymd(from.0, from.1, from.2);
+            params.not_after = date_time_ymd(to.0, to.1, to.2);
+        }
         let issuer: &Issuer<'_, KeyPair> = &self.ca.root.issuer;
         let leaf = match issue {
             Issue::OtherKey => params

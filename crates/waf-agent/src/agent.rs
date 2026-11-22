@@ -24,6 +24,7 @@ use crate::tls::acme::placeholder;
 use crate::tls::dir::KeyDir;
 use crate::tls::entry::{Settings, Source};
 use crate::tls::install::{LoadKey, Secrets, load_key};
+use crate::tls::metrics::TlsMetrics;
 use crate::tls::pacer::Statuses;
 use crate::tls::status;
 use crate::tls::{Applied, Keys, book_entry};
@@ -90,6 +91,8 @@ pub struct Agent {
     statuses: Option<Statuses>,
     /// The worker that orders certificates, and what wakes it.
     orders: orders::Orders,
+    /// What the agent counts of its certificates.
+    tls_metrics: Arc<TlsMetrics>,
 }
 
 fn apply_error(s: &str) -> BundleError {
@@ -121,7 +124,13 @@ impl Agent {
             ready,
             statuses: None,
             orders: orders::Orders::default(),
+            tls_metrics: Arc::default(),
         }
+    }
+
+    /// The counts and gauges of the certificates, for the metrics listener.
+    pub fn tls_metrics(&self) -> Arc<TlsMetrics> {
+        self.tls_metrics.clone()
     }
 
     /// The certificate statuses of the apps served over HTTPS are offered to `statuses`.
@@ -134,7 +143,7 @@ impl Agent {
     /// certificates in `dir`. Without it the object is ignored and the app is served as its bundle
     /// says.
     pub fn with_key_dir(self, dir: KeyDir) -> Agent {
-        self.lock().tls = Some(Keys::new(dir));
+        self.lock().tls = Some(Keys::new(dir).with_metrics(self.tls_metrics.clone()));
         self
     }
 

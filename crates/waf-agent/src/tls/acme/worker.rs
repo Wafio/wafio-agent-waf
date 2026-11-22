@@ -11,8 +11,14 @@ use super::ATTEMPT_CAP;
 use super::account::{ACCOUNT_UNKNOWN, AccountFile, Accounts};
 use super::ca::{Ca, CaError};
 use super::order::{self, Issued, Job};
+use super::wait::RATE_LIMITED;
 use crate::agent::Agent;
 use crate::tls::NextOrder;
+
+/// The longest the worker sleeps before it looks again. A sleep counts the time the process runs,
+/// not the clock the due times are in, which may be set or may go on while the machine is
+/// suspended.
+const MAX_SLEEP: Duration = Duration::from_secs(3600);
 
 /// An order that runs as a task of its own, so that a panic in it ends that order and not the
 /// worker, and that is stopped when the worker is: whatever it put up is taken down when its
@@ -27,6 +33,7 @@ impl Drop for Attempt {
 
 pub struct Worker {
     agent: Arc<Agent>,
+    ca: Arc<dyn Ca>,
     accounts: Arc<tokio::sync::Mutex<Accounts>>,
     directory: String,
     /// The time, in seconds since the epoch. A test moves it.
@@ -41,9 +48,10 @@ impl Worker {
         directory: String,
         clock: fn() -> i64,
     ) -> Worker {
-        let accounts = Accounts::new(ca, file, directory.clone());
+        let accounts = Accounts::new(ca.clone(), file, directory.clone());
         Worker {
             agent,
+            ca,
             accounts: Arc::new(tokio::sync::Mutex::new(accounts)),
             directory,
             clock,
@@ -54,19 +62,23 @@ impl Worker {
     pub async fn run(self) {
         loop {
             let now = (self.clock)();
-            let until = match self.agent.next_order(now) {
-                None => return,
-                Some(NextOrder::Order(job)) => {
+            // It may write the state file, so it runs where a write may.
+            let (agent, directory) = (self.agent.clone(), self.directory.clone());
+            let next = tokio::task::spawn_blocking(move || agent.next_order(now, &directory)).await;
+            let until = match next {
+                Ok(None) | Err(_) => return,
+                Ok(Some(NextOrder::Order(job))) => {
                     self.order(job).await;
                     continue;
                 }
-                Some(NextOrder::Wait(until)) => until,
+                Ok(Some(NextOrder::Wait(until))) => until,
             };
             // A change that comes between the question and the wait is not lost: it leaves a note.
             let changed = self.agent.orders_changed();
             match until {
                 Some(until) => {
-                    let wait = Duration::from_secs(until.saturating_sub(now).max(1).unsigned_abs());
+                    let wait = Duration::from_secs(until.saturating_sub(now).max(1).unsigned_abs())
+                        .min(MAX_SLEEP);
                     tokio::select! {
                         () = changed => {}
                         () = tokio::time::sleep(wait) => {}
@@ -78,7 +90,14 @@ impl Worker {
     }
 
     async fn order(&self, job: Job) {
-        let result = self.attempt(&job).await;
+        let result = self.attempt(&job).await.map_err(|mut e| {
+            // The client library leaves `Retry-After` out of an error, and a rate limit sets its
+            // wait by it.
+            if e.problem.as_deref() == Some(RATE_LIMITED) {
+                e.retry_after = self.ca.retry_after();
+            }
+            e
+        });
         if let Err(e) = &result
             && e.problem.as_deref() == Some(ACCOUNT_UNKNOWN)
         {
@@ -111,6 +130,14 @@ impl Worker {
     /// One order, within the time an attempt may take. A failure is a value, a panic and the cap
     /// included.
     async fn attempt(&self, job: &Job) -> Result<Issued, CaError> {
+        // Nothing is asked of the authority before the state file says an order has begun: a
+        // process that is killed and started again over and over must not make an order each time.
+        let (agent, begun, now) = (self.agent.clone(), job.clone(), (self.clock)());
+        match tokio::task::spawn_blocking(move || agent.begin_attempt(&begun, now)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => return Err(CaError::new(why)),
+            Err(_) => return Err(CaError::new("the order stopped on an internal error")),
+        }
         let (accounts, book, job) = (
             self.accounts.clone(),
             self.agent.certificate_book(),

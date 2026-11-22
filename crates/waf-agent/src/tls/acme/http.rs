@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,6 +23,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Http {
     /// `None` reads the proxies from the environment, as every other request does.
     proxies: Option<Arc<ProxyConfig>>,
+    /// The `Retry-After` of the last answer, if it had one. The client library drops it from an
+    /// error, and an order that was rate limited needs it.
+    retry_after: Arc<Mutex<Option<String>>>,
     /// A request to an address that is not https goes out, which a test needs for its own server.
     #[cfg(test)]
     plain: bool,
@@ -38,6 +41,7 @@ impl Http {
     pub fn with_proxies(proxies: ProxyConfig) -> Http {
         Http {
             proxies: Some(Arc::new(proxies)),
+            retry_after: Arc::default(),
             plain: false,
         }
     }
@@ -47,8 +51,17 @@ impl Http {
     pub fn allowing_plain() -> Http {
         Http {
             proxies: None,
+            retry_after: Arc::default(),
             plain: true,
         }
+    }
+
+    /// The `Retry-After` header of the last answer, as it was written (its first 64 characters).
+    pub fn last_retry_after(&self) -> Option<String> {
+        self.retry_after
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Only https goes out: the directory is https, but the addresses it and an order name are the
@@ -93,6 +106,8 @@ impl HttpClient for Http {
     ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, Error>> + Send>> {
         let proxies = self.proxies.clone();
         let allowed = self.allows(&req.uri().to_string());
+        let retry_after = self.retry_after.clone();
+        *retry_after.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Box::pin(async move {
             let (parts, body) = req.into_parts();
             let url = parts.uri.to_string();
@@ -138,6 +153,11 @@ impl HttpClient for Http {
             )
             .await
             .map_err(other)?;
+            *retry_after.lock().unwrap_or_else(|e| e.into_inner()) = answer
+                .headers
+                .get(http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.chars().take(64).collect());
             let mut response = http::Response::new(());
             *response.status_mut() = http::StatusCode::from_u16(answer.status).map_err(other)?;
             *response.headers_mut() = answer.headers;
@@ -252,6 +272,41 @@ mod tests {
         assert_eq!(answer.parts.headers["location"], "https://ca.test/acct/7");
         let mut body = answer.body;
         assert_eq!(body.into_bytes().await.unwrap(), &br#"{"ok":true}"#[..]);
+    }
+
+    #[tokio::test]
+    async fn the_retry_after_of_the_last_answer_is_kept_for_the_order_that_failed_on_it() {
+        let http = Http::allowing_plain();
+        let shared = http.clone();
+        assert_eq!(http.last_retry_after(), None);
+        let get = |http: Http, reply: Vec<u8>| async move {
+            let (port, _seen) = serve(reply);
+            let url = format!("http://127.0.0.1:{port}/new-order");
+            http.request(request("POST", &url, &[], b"{}"))
+                .await
+                .unwrap();
+        };
+        get(
+            http.clone(),
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7200\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        assert_eq!(shared.last_retry_after().as_deref(), Some("7200"));
+        // An answer with none leaves none, not the one before.
+        get(
+            http.clone(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+        assert_eq!(http.last_retry_after(), None);
+        // A value is cut to what a date needs and more.
+        let long = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Length: 0\r\n\r\n",
+            "9".repeat(500)
+        );
+        get(http.clone(), long.into_bytes()).await;
+        assert_eq!(http.last_retry_after().unwrap(), "9".repeat(64));
     }
 
     #[tokio::test]

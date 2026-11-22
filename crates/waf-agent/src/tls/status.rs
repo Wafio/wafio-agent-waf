@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wafio_control::CertificateStatus;
 use wafio_proxy::cert_store::chain_pem;
 
-use super::acme::schedule::{Own, failed, own, retry_at};
+use super::acme::schedule::{Own, failed, held_by_authority, own, retry_at};
 use super::entry::{Certificate, Settings, Source};
 use super::state_file::AppRecord;
 use super::{Applied, Served};
@@ -86,10 +86,13 @@ fn uploaded(app_id: &str, wanted: &Certificate, served: Option<&Served>) -> Cert
 
 /// The status of an app whose certificate is ordered. `pending`: an order is running, or none has
 /// answered the request id of the bundle yet (so one is due, and the chain in use, if any, is
-/// still the previous one); `failed`: the order that answered the id failed, with the time of the
-/// next one; `active`: the certificate in use is the ordered one and covers every host. A finished
-/// order reports only while the id it started under is the bundle's. A failed order says when the
-/// next attempt is by the same rule that makes the worker wait for it.
+/// still the previous one); `failed`: the order that answered the id failed (or gave a certificate
+/// that was due for renewal at once), with the time of the next one, or the authority's wait after
+/// an order under an earlier id still holds the new one back; `active`: the certificate in use is
+/// the ordered one and covers every host. A finished order reports only while the id it started
+/// under is the bundle's. A failed order says when the next attempt is by the same rule that makes
+/// the worker wait for it. The chain in use is described whatever the state, one that has expired
+/// included: a failed renewal keeps serving it.
 pub fn ordered(
     app_id: &str,
     settings: &Settings,
@@ -101,12 +104,14 @@ pub fn ordered(
         r.request_id == settings.request_id
     });
     let own = own(app_id, settings, served);
-    let failure = failed(settings, record, own);
-    let state = if running || !answered {
+    let failure = failed(settings, record, own).or_else(|| held_by_authority(settings, record));
+    let state = if running {
         State::Pending
     } else if failure.is_some() {
         State::Failed
-    } else if own == Own::Whole {
+    } else if !answered {
+        State::Pending
+    } else if matches!(own, Own::Whole { .. }) {
         State::Active
     } else {
         State::Pending
@@ -399,6 +404,89 @@ mod tests {
                 s.app_id.as_str()
             ),
             ("acme", "", APP)
+        );
+    }
+
+    #[test]
+    fn a_new_request_id_inside_the_authoritys_wait_is_failed_with_its_time_and_a_failed_renewal_keeps_its_chain()
+     {
+        let file = format!("acme-{APP}.pem");
+        let chain =
+            crate::tls::acme::placeholder::certificate(&["shop.example.com".to_owned()]).unwrap();
+        let served = Served {
+            file,
+            leaf_sha256: leaf_sha256(&chain),
+            key: chain.clone(),
+        };
+        let limited = AppRecord {
+            ca_wait_unix: 1_800_007_200,
+            ..acme_record("r1", 1)
+        };
+        // The same id: failed, at the later of the agent's backoff and the authority's wait.
+        let same = ordered(
+            APP,
+            &acme_settings(&["shop.example.com"], "r1"),
+            Some(&served),
+            Some(&limited),
+            false,
+        );
+        assert_eq!(
+            (
+                same.state.as_str(),
+                same.next_attempt_unix,
+                same.leaf_sha256.is_empty()
+            ),
+            ("failed", 1_800_007_200, false)
+        );
+        assert_eq!(same.chain_pem, chain_pem(&chain.cert), "the chain in use");
+        // A new id: the backoff is lifted, the wait is not, and the status says so under the new id.
+        let new_id = ordered(
+            APP,
+            &acme_settings(&["shop.example.com"], "r2"),
+            Some(&served),
+            Some(&limited),
+            false,
+        );
+        assert_eq!(
+            (
+                new_id.state.as_str(),
+                new_id.request_id.as_str(),
+                new_id.next_attempt_unix
+            ),
+            ("failed", "r2", 1_800_007_200)
+        );
+        assert_eq!(new_id.error, "it failed");
+        assert!(!new_id.chain_pem.is_empty());
+        // While its order runs it is pending, and without a wait the new id is pending too.
+        let running = ordered(
+            APP,
+            &acme_settings(&["shop.example.com"], "r2"),
+            Some(&served),
+            Some(&limited),
+            true,
+        );
+        assert_eq!(
+            (running.state.as_str(), running.next_attempt_unix),
+            ("pending", 0)
+        );
+        let free = AppRecord {
+            ca_wait_unix: 0,
+            ..limited
+        };
+        let new_id = ordered(
+            APP,
+            &acme_settings(&["shop.example.com"], "r2"),
+            Some(&served),
+            Some(&free),
+            false,
+        );
+        assert_eq!(
+            (
+                new_id.state.as_str(),
+                new_id.error.as_str(),
+                new_id.next_attempt_unix
+            ),
+            ("pending", "", 0)
         );
     }
 
