@@ -276,15 +276,12 @@ fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_one_ser
     let shop = app_json(SHOP, 18080, Some(&good));
     apply(&a, &bundle_of(std::slice::from_ref(&shop)), 1).unwrap();
 
-    let lines = Arc::new(Mutex::new(Vec::new()));
     let bad = app_json(
         BLOG,
         18081,
         Some(&good.replace("shop.example.com", "*.example.com")),
     );
-    let refused = tracing::subscriber::with_default(Collect(lines.clone()), || {
-        apply(&a, &bundle_of(&[shop.clone(), bad]), 2)
-    });
+    let (refused, lines) = logged(|| apply(&a, &bundle_of(&[shop.clone(), bad]), 2));
     assert_eq!(
         refused,
         Err(BundleError::Apply("invalid TLS site settings".into()))
@@ -296,7 +293,6 @@ fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_one_ser
     );
     assert_eq!(a.generation().0, 1);
     assert_eq!(a.app_ids(), [SHOP]);
-    let lines = lines.lock().unwrap().join("\n");
     assert!(lines.contains(BLOG) && lines.contains("hosts"), "{lines}");
 
     // An app id that is no UUID cannot name files either.
@@ -311,11 +307,7 @@ fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_one_ser
 fn without_a_key_directory_the_tls_object_is_not_read() {
     let (a, proxy, _) = agent();
     let broken = app_json(SHOP, 18080, Some(r#"{"hosts":["*"],"listen":"x"}"#));
-    let lines = Arc::new(Mutex::new(Vec::new()));
-    tracing::subscriber::with_default(Collect(lines.clone()), || {
-        apply(&a, &bundle_of(&[broken]), 1).unwrap();
-    });
-    let lines = lines.lock().unwrap().join("\n");
+    let ((), lines) = logged(|| apply(&a, &bundle_of(&[broken]), 1).unwrap());
     assert!(
         lines.contains("1 app(s) are ignored") && lines.contains("plain HTTP"),
         "{lines}"
@@ -361,46 +353,111 @@ fn a_refusal_for_an_address_that_cannot_be_bound_is_told_apart() {
     );
 }
 
-/// Collects the text of every tracing event.
-struct Collect(Arc<Mutex<Vec<String>>>);
+/// Everything the process logs at `info` and above while the tests run, which `capture_logs`
+/// starts to keep.
+static LOG: Mutex<String> = Mutex::new(String::new());
 
-impl tracing::Subscriber for Collect {
+/// Texts that make the next log line holding one of them panic, once for each. It stands for an
+/// error in the middle of the code that logs, which a test cannot cause any other way.
+static PANIC_AT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// What this thread logs, at every level, while `logged` runs.
+    static MINE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The one subscriber of the test process. A subscriber set for a scope only would race with
+/// tracing's cache of which log sites are enabled: a site that another thread registers at that
+/// moment can stay cached as disabled, and the scope then sees no line from it.
+struct Capture;
+
+impl tracing::Subscriber for Capture {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }
+
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
     }
+
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
     fn event(&self, event: &tracing::Event<'_>) {
+        let mine = MINE.try_with(|m| m.borrow().is_some()).unwrap_or(false);
+        let shared = *event.metadata().level() <= tracing::Level::INFO;
+        if !mine && !shared {
+            return;
+        }
         struct Text(String);
         impl tracing::field::Visit for Text {
-            fn record_debug(&mut self, _: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{v:?} "));
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
             }
         }
-        let mut t = Text(String::new());
-        event.record(&mut t);
-        self.0.lock().unwrap().push(t.0);
+        let mut text = Text(String::new());
+        event.record(&mut text);
+        if mine {
+            let _ = MINE.try_with(|m| {
+                if let Some(lines) = m.borrow_mut().as_mut() {
+                    lines.push_str(&text.0);
+                    lines.push('\n');
+                }
+            });
+        }
+        if !shared {
+            return;
+        }
+        LOG.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_str(&format!("{}\n", text.0));
+        let hit = {
+            let mut at = PANIC_AT.lock().unwrap_or_else(|e| e.into_inner());
+            at.iter()
+                .position(|needle| text.0.contains(needle.as_str()))
+                .map(|i| at.remove(i))
+        };
+        if let Some(needle) = hit {
+            panic!("a log line with {needle:?}");
+        }
     }
+
     fn enter(&self, _: &tracing::span::Id) {}
+
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Sets [`Capture`] for the whole process, once, and makes every log site that was registered
+/// before it enabled again.
+fn capture_logs() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    SET.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(Capture);
+    });
+    tracing::callsite::rebuild_interest_cache();
+}
+
+/// Runs `f` and returns what this thread logged meanwhile, every level, one line per event.
+fn logged<R>(f: impl FnOnce() -> R) -> (R, String) {
+    capture_logs();
+    MINE.with(|m| *m.borrow_mut() = Some(String::new()));
+    let out = f();
+    let lines = MINE.with(|m| m.borrow_mut().take()).unwrap_or_default();
+    (out, lines)
 }
 
 #[test]
 fn a_default_bundle_logs_no_line_about_a_missing_engine() {
     let (a, _, _) = agent();
-    let lines = Arc::new(Mutex::new(Vec::new()));
-    tracing::subscriber::with_default(Collect(lines.clone()), || {
+    let ((), lines) = logged(|| {
         apply(
             &a,
             &format!(r#"{{"agent_id":"x","project_id":"p1","apps":[{APP}]}}"#),
             1,
         )
-        .unwrap();
+        .unwrap()
     });
-    let lines = lines.lock().unwrap().join("\n");
     for word in [
         "rule-based",
         "CRS",

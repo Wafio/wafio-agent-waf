@@ -27,60 +27,6 @@ thread_local! {
     static ORIGIN: tokio::time::Instant = tokio::time::Instant::now();
 }
 
-/// Everything the process logs while the tests run, which `capture_logs` starts to keep.
-static LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-
-/// Texts that make the next log line holding one of them panic, once for each. It stands for an
-/// error in the middle of the code that logs, which a test cannot cause any other way.
-static PANIC_AT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-struct Capture;
-
-impl tracing::Subscriber for Capture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        *metadata.level() <= tracing::Level::INFO
-    }
-
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        struct Text(String);
-        impl tracing::field::Visit for Text {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{}={value:?} ", field.name()));
-            }
-        }
-        let mut text = Text(String::new());
-        event.record(&mut text);
-        LOG.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_str(&format!("{}\n", text.0));
-        let hit = {
-            let mut at = PANIC_AT.lock().unwrap_or_else(|e| e.into_inner());
-            at.iter()
-                .position(|needle| text.0.contains(needle.as_str()))
-                .map(|i| at.remove(i))
-        };
-        if let Some(needle) = hit {
-            panic!("a log line with {needle:?}");
-        }
-    }
-
-    fn enter(&self, _: &tracing::span::Id) {}
-
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
-fn capture_logs() {
-    let _ = tracing::subscriber::set_global_default(Capture);
-}
-
 /// The time the worker reads: seconds since the epoch, moved by the clock of the test runtime.
 fn clock() -> i64 {
     BASE + i64::try_from(ORIGIN.with(|origin| origin.elapsed().as_secs())).unwrap()
