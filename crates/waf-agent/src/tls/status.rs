@@ -5,14 +5,14 @@
 //! This module decides what the status of an app is. When to send it, and how often, is for
 //! `pacer`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wafio_control::CertificateStatus;
 use wafio_proxy::cert_store::chain_pem;
 
 use super::acme::schedule::{Own, failed, held_by_authority, own, retry_at};
-use super::entry::{Certificate, Settings, Source};
+use super::entry::{Certificate, Settings, Source, is_uuid};
 use super::state_file::AppRecord;
 use super::{Applied, Served};
 use crate::bundle::BundleApp;
@@ -147,12 +147,50 @@ pub fn current(applied: &HashMap<String, Applied>, only: Option<&str>) -> Vec<Ce
     all
 }
 
+/// What the control plane hears of a bundle that was refused for a reason that concerns its HTTPS
+/// settings.
+#[derive(Debug, Default)]
+pub struct Refusal {
+    /// `failed` for its uploaded apps, as [`refused`] gives them.
+    pub failed: Vec<CertificateStatus>,
+    /// Its apps that it orders as the bundle in force does, with the same request id. They go on
+    /// reporting their order. Any other app would be told under a source or a request id that the
+    /// control plane no longer has for it, and it drops such a status.
+    pub ordered: HashSet<String>,
+}
+
+/// The [`Refusal`] of a bundle with the apps `apps`, `applied` being the bundle in force.
+pub fn refusal(
+    apps: &[BundleApp],
+    applied: &HashMap<String, Applied>,
+    why: &str,
+    retry_at: i64,
+) -> Refusal {
+    let ordered = apps
+        .iter()
+        .filter(|app| {
+            let (Some(entry), Some(now)) = (app.tls.as_ref(), applied.get(&app.app_id)) else {
+                return false;
+            };
+            entry.source == SOURCE_ACME
+                && now.settings.source == Source::Acme
+                && entry.acme_request_id == now.settings.request_id
+        })
+        .map(|app| app.app_id.clone())
+        .collect();
+    Refusal {
+        failed: refused(apps, applied, why, retry_at),
+        ordered,
+    }
+}
+
 /// `failed` for each app of a bundle that was refused for a reason that concerns its HTTPS
 /// settings, `why` being the reason. The apps are those of the refused bundle, read as sent: its
 /// settings may be what failed. The certificate each is served meanwhile stays described, from
 /// the bundle in force. `retry_at` is when the bundle is tried again, or 0 when nothing is
 /// planned. An ordered certificate has none until it reports through its order: a `failed` here
-/// would stay on its app after the bundle was taken.
+/// would stay on its app after the bundle was taken. An app id that is no UUID names no app of the
+/// control plane, so it gets none either.
 pub fn refused(
     apps: &[BundleApp],
     applied: &HashMap<String, Applied>,
@@ -163,7 +201,7 @@ pub fn refused(
     let mut all: Vec<CertificateStatus> = apps
         .iter()
         .filter_map(|app| {
-            let entry = app.tls.as_ref()?;
+            let entry = app.tls.as_ref().filter(|_| is_uuid(&app.app_id))?;
             let served = applied.get(&app.app_id).and_then(|a| a.served.as_ref());
             let status = match entry.source.as_str() {
                 SOURCE_UPLOADED if !entry.certificate_id.is_empty() => CertificateStatus {
@@ -549,13 +587,15 @@ mod tests {
             ),
         );
         let entries = [
-            (APP, uploaded),
+            (APP, uploaded.clone()),
             (
                 "1a2b3c4d-0000-4000-8000-000000000002",
                 tls("acme", r#","acme_request_id":"r1""#),
             ),
             ("1a2b3c4d-0000-4000-8000-000000000003", tls("", "")),
             ("1a2b3c4d-0000-4000-8000-000000000004", tls("uploaded", "")),
+            // An id that names no app of the control plane gets nothing, whatever its entry says.
+            ("not-an-app-id", uploaded),
         ];
         let list: Vec<String> = entries
             .iter()

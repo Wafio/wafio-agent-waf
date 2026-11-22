@@ -747,6 +747,11 @@ async fn an_agent_without_a_usable_key_directory_serves_the_app_as_its_bundle_sa
         log.contains("does not serve apps over HTTPS") && log.contains("missing/tls"),
         "{log}"
     );
+    // The bundle says again that the app is served in plain HTTP at its own address.
+    assert!(
+        log.contains("are ignored, and they are served in plain HTTP at their bundle address"),
+        "{log}"
+    );
 }
 
 /// Connects, asks for `/probe` and closes, over and over, and reports how many tries were made and

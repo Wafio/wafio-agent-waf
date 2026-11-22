@@ -29,7 +29,11 @@ impl From<instant_acme::Error> for CaError {
     fn from(e: instant_acme::Error) -> CaError {
         match e {
             instant_acme::Error::Api(problem) => CaError {
-                problem: problem.r#type.clone(),
+                // The marker of unusable credentials is ours: no type the authority sends is it.
+                problem: problem
+                    .r#type
+                    .clone()
+                    .filter(|kind| kind != CREDENTIALS_UNUSABLE),
                 text: problem
                     .detail
                     .clone()
@@ -64,7 +68,7 @@ impl Ca for InstantAcme {
         &self,
         directory: &str,
     ) -> Result<(Arc<dyn Account>, Zeroizing<Vec<u8>>), CaError> {
-        // No contact address, and the terms are agreed to: the dashboard's request button is the
+        // No contact address, and the terms are agreed to: a request to order a certificate is the
         // acceptance.
         let new = NewAccount {
             contact: &[],
@@ -469,6 +473,18 @@ mod tests {
             1_800_000_000,
         );
         assert_eq!(until, 1_800_000_000 + 7200);
+    }
+
+    #[test]
+    fn a_problem_type_the_authority_sends_is_never_the_marker_of_unusable_credentials() {
+        let problem = instant_acme::Problem {
+            r#type: Some(CREDENTIALS_UNUSABLE.to_owned()),
+            detail: Some("text\nof the authority".to_owned()),
+            status: Some(400),
+            subproblems: Vec::new(),
+        };
+        let e = CaError::from(instant_acme::Error::Api(problem));
+        assert!(!unusable(&e), "{e:?}");
     }
 
     fn unusable(e: &CaError) -> bool {

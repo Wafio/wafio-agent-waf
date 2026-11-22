@@ -1039,8 +1039,11 @@ async fn answer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     (status, head)
 }
 
-/// The leaf the server presents to `host` on `port`, and the status the app answers there.
-async fn over_tls(port: u16, host: &str) -> (String, u16) {
+/// A TLS connection to `host` on `port` that takes any certificate.
+async fn connect_tls(
+    port: u16,
+    host: &str,
+) -> std::io::Result<pingora::tls::ClientTlsStream<tokio::net::TcpStream>> {
     pingora::tls::install_default_crypto_provider();
     let mut config = pingora::tls::ClientConfig::builder()
         .dangerous()
@@ -1051,10 +1054,25 @@ async fn over_tls(port: u16, host: &str) -> (String, u16) {
         .await
         .unwrap();
     let name = pingora::tls::ServerName::try_from(host.to_owned()).unwrap();
-    let mut tls = pingora::tls::TlsConnector::from(Arc::new(config))
+    pingora::tls::TlsConnector::from(Arc::new(config))
         .connect(name, tcp)
         .await
+}
+
+/// The status line and head of what the redirect listener on `port` answers for `shop.test`.
+async fn on_redirect(port: u16) -> (u16, String) {
+    use tokio::io::AsyncReadExt;
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
         .unwrap();
+    let (status, head) = answer(&mut tcp, "shop.test").await;
+    let _ = tcp.read(&mut [0u8; 1]).await;
+    (status, head)
+}
+
+/// The leaf the server presents to `host` on `port`, and the status the app answers there.
+async fn over_tls(port: u16, host: &str) -> (String, u16) {
+    let mut tls = connect_tls(port, host).await.unwrap();
     let leaf = {
         let (_, session) = tls.get_ref();
         wafio_proxy::cert_store::sha256_hex(session.peer_certificates().unwrap()[0].as_ref())
@@ -1104,16 +1122,7 @@ async fn the_listeners_answer_503_while_only_the_placeholder_is_served_and_308_o
 
     // Only the placeholder: the redirect listener does not send anyone to HTTPS yet, and the
     // handshake gets the placeholder, whose app is not reached.
-    let redirect = |port| async move {
-        use tokio::io::AsyncReadExt;
-        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        let (status, head) = answer(&mut tcp, "shop.test").await;
-        let _ = tcp.read(&mut [0u8; 1]).await;
-        (status, head)
-    };
-    let (status, head) = redirect(plain).await;
+    let (status, head) = on_redirect(plain).await;
     assert_eq!(status, 503, "{head}");
     assert!(
         head.to_ascii_lowercase().contains("retry-after: 60"),
@@ -1139,7 +1148,7 @@ async fn the_listeners_answer_503_while_only_the_placeholder_is_served_and_308_o
     let book = agent.certificate_book().get(SHOP).unwrap();
     assert!(!book.placeholder);
     assert_eq!(served, leaf_sha256(&book.key));
-    let (status, head) = redirect(plain).await;
+    let (status, head) = on_redirect(plain).await;
     assert_eq!(status, 308, "{head}");
     assert!(
         head.contains(&format!("https://shop.test:{https}/cart")),
@@ -1151,6 +1160,63 @@ async fn the_listeners_answer_503_while_only_the_placeholder_is_served_and_308_o
         status, 503,
         "the app is reached now (its upstream is not there)"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordered_app_that_becomes_uploaded_before_its_first_certificate_holds_no_placeholder() {
+    let scratch = Arc::new(Scratch::new());
+    let stores = Stores::new();
+    let base = startup_executor(&stores, "", None).unwrap();
+    let proxy = Arc::new(wafio_proxy::Proxy::new(wafio_proxy::ProxyOptions::new(
+        Arc::new(|_| {}),
+    )));
+    // No authority is started, so no order runs and the app stays on its placeholder.
+    let agent = Arc::new(
+        Agent::new(
+            base,
+            stores,
+            proxy.clone(),
+            Arc::new(VerifiedBotChecker::new()),
+            Arc::new(Ready::new(ReadyActions::default())),
+        )
+        .with_key_dir(KeyDir::open(&scratch.dir(), my_uid()).unwrap()),
+    );
+    let (https, plain) = (free_port(), free_port());
+    let (listen, redirect) = (format!("127.0.0.1:{https}"), format!("127.0.0.1:{plain}"));
+    let apply_blocking = |json: String, generation: i64| {
+        let a = agent.clone();
+        async move {
+            tokio::task::spawn_blocking(move || apply(&a, &json, generation).unwrap())
+                .await
+                .unwrap();
+        }
+    };
+    let ordered = acme_object(&listen, Some(&redirect), &["shop.test"], "r1");
+    apply_blocking(bundle_of(&[app_json(SHOP, 18080, Some(&ordered))]), 1).await;
+    assert!(agent.certificate_book().get(SHOP).unwrap().placeholder);
+    assert_eq!(over_tls(https, "shop.test").await.1, 503);
+
+    // The user picks Upload and the bundle names a certificate the agent does not hold. Until it
+    // is installed nothing is served: no handshake, and the redirect listener says `503`.
+    let uploaded = format!(
+        r#"{{"listen":"{listen}","hosts":["shop.test"],"redirect_listen":"{redirect}","source":"uploaded","certificate_id":"{CERT}","leaf_sha256":"{}"}}"#,
+        "ab".repeat(32)
+    );
+    let json = bundle_of(&[app_json(SHOP, 18080, Some(&uploaded))]);
+    for generation in [2, 3] {
+        apply_blocking(json.clone(), generation).await;
+        assert!(
+            agent.certificate_book().get(SHOP).is_none(),
+            "generation {generation}"
+        );
+        assert!(connect_tls(https, "shop.test").await.is_err());
+        let (status, head) = on_redirect(plain).await;
+        assert_eq!(status, 503, "{head}");
+    }
+
+    // Back to an order: the placeholder returns.
+    apply_blocking(bundle_of(&[app_json(SHOP, 18080, Some(&ordered))]), 4).await;
+    assert!(agent.certificate_book().get(SHOP).unwrap().placeholder);
 }
 
 /// Whether the book answers a validation of `HOST` by either challenge.
@@ -1777,6 +1843,73 @@ async fn a_look_that_changes_an_order_offers_the_ordered_apps_and_leaves_the_upl
     );
 }
 
+#[tokio::test]
+async fn a_take_over_offers_the_ordered_apps_and_leaves_the_uploaded_ones_alone() {
+    let x = rig();
+    let mut y = rig_over(x.dir.clone(), None);
+    assert!(y.agent.waits_for_keys());
+    let acme = acme_object("0.0.0.0:443", None, &[HOST], "r1");
+    let uploaded = tls_object("blog.example.com", CERT, &"ab".repeat(32));
+    y.apply_json(
+        &bundle_of(&[
+            app_json(SHOP, 18080, Some(&acme)),
+            app_json(BLOG, 18081, Some(&uploaded)),
+        ]),
+        1,
+    );
+    y.offers.drain();
+
+    x.agent.close();
+    x.agent.release_keys();
+    assert!(y.agent.take_over_keys());
+    // An offer of the uploaded app's status would replace a `failed` that waits out its gap.
+    let offered: Vec<(String, String, String)> = y
+        .offers
+        .drain()
+        .into_iter()
+        .flat_map(|offer| offer.statuses)
+        .map(|s| (s.app_id, s.source, s.state))
+        .collect();
+    assert_eq!(
+        offered,
+        [(SHOP.to_owned(), "acme".to_owned(), "pending".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_take_over_serves_the_uploaded_certificate_the_other_process_installed_and_says_so() {
+    let x = rig();
+    let mut y = rig_over(x.dir.clone(), None);
+    let f = fixture();
+    let uploaded = tls_object("blog.example.com", CERT, &f.ec.leaf);
+    let json = bundle_of(&[app_json(BLOG, 18081, Some(&uploaded))]);
+    x.apply_json(&json, 1);
+    y.apply_json(&json, 1);
+    y.offers.drain();
+
+    // The process that holds the lock gets the install, which the other one could not write.
+    assert_eq!(
+        x.agent.install_certificate(&install_of(&f.ec, BLOG, CERT)),
+        Ok(())
+    );
+    assert!(y.book(BLOG).is_none());
+    x.agent.close();
+    x.agent.release_keys();
+    assert!(y.agent.take_over_keys());
+    assert_eq!(y.leaf(BLOG), f.ec.leaf);
+    let offered: Vec<(String, String, String)> = y
+        .offers
+        .drain()
+        .into_iter()
+        .flat_map(|offer| offer.statuses)
+        .map(|s| (s.app_id, s.source, s.state))
+        .collect();
+    assert_eq!(
+        offered,
+        [(BLOG.to_owned(), "uploaded".to_owned(), "active".to_owned())]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_second_unfinished_attempt_in_a_row_is_a_failure_with_the_backoff_and_no_order() {
     let state = format!(
@@ -1950,6 +2083,50 @@ async fn an_order_the_predecessor_ends_after_the_successor_read_its_note_is_adop
         (record.attempt_started, record.interrupted, record.failures),
         (0, 0, 0)
     );
+}
+
+#[tokio::test]
+async fn a_successor_that_takes_the_lock_before_its_first_bundle_starts_from_the_state_it_finds() {
+    let x = rig();
+    let go = Arc::new(Notify::new());
+    x.ca.script().pause = Some((Step::Certificate, go.clone()));
+    x.start();
+    x.apply(&[(SHOP, &[HOST], "r1")], 1);
+    x.ca.reached.notified().await;
+    // The successor starts in the middle of the order, so it reads the note of it, and has no
+    // bundle (no cached one, and a control plane that is slow) when the order ends.
+    let y = rig_over(x.dir.clone(), None);
+    y.start();
+    go.notify_one();
+    until("the certificate is kept", || {
+        x.issued(SHOP) && !x.ordering()
+    })
+    .await;
+    x.agent.close();
+    x.agent.release_keys();
+    assert!(y.agent.take_over_keys());
+
+    y.apply(&[(SHOP, &[HOST], "r1")], 1);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        y.ca.script().orders.is_empty(),
+        "no second issuance for the same names"
+    );
+    assert!(
+        y.issued(SHOP),
+        "served from the file the other process wrote"
+    );
+    let record = y.state().apps[SHOP].clone();
+    assert_eq!(
+        (
+            record.request_id.as_str(),
+            record.attempt_started,
+            record.interrupted,
+            record.failures
+        ),
+        ("r1", 0, 0, 0)
+    );
+    assert_eq!(y.status(SHOP).state, "active");
 }
 
 #[tokio::test]
