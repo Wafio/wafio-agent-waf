@@ -10,13 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+mod common;
+use common::free_port;
 
 /// A one-thread HTTP upstream answering every request `200 ok` (Content-Length, keep-alive).
 fn upstream() -> u16 {

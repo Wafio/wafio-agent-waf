@@ -17,9 +17,13 @@ test-owner = ["wafio-engine-loader/test-owner"]
 # An agent whose key directory is the one WAFIO_TEST_TLS_DIR names, for tests that cannot own the fixed path; a release
 # build never enables it.
 test-tls = []
+# An agent that waits WAFIO_TEST_CACHE_WRITE_DELAY_MS milliseconds before it writes the bundle cache, for tests that signal it
+# while a write is pending; a release build never enables it.
+test-cache-delay = []
 
 # These start the binary with a key directory of its own, which only a build with test-tls reads from the environment; the
-# control plane test also expects the Hello of an agent that has one.
+# control plane test also expects the Hello of an agent that has one; the part of it that holds cache writes back needs
+# test-cache-delay as well and is left out of a build without it.
 [[test]]
 name = "tls_bundle"
 required-features = ["test-tls"]

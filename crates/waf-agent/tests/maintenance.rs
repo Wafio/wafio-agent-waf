@@ -16,6 +16,9 @@ use wafio_waf_agent::bundle::decode_bundle;
 use wafio_waf_agent::executor::{Stores, startup_executor};
 use wafio_waf_agent::ready::{Ready, ReadyActions};
 
+mod common;
+use common::free_port;
+
 fn bundle(port: u16, upstream: &str, maintenance: &str) -> String {
     let key = if maintenance.is_empty() {
         String::new()
@@ -35,14 +38,6 @@ async fn reply(port: u16) -> String {
     let mut out = Vec::new();
     s.read_to_end(&mut out).await.unwrap();
     String::from_utf8_lossy(&out).into_owned()
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// An agent with a proxy, and a way to install a bundle for one app on `port` with the given

@@ -22,13 +22,8 @@ use wafio_waf_agent::executor::{Stores, startup_executor};
 use wafio_waf_agent::ready::{Ready, ReadyActions};
 use wafio_waf_agent::script_rules;
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+mod common;
+use common::free_port;
 
 /// An upstream answering every request `200 ok`.
 fn upstream() -> u16 {

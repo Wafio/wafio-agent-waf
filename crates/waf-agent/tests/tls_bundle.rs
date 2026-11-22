@@ -42,6 +42,8 @@ use wafio_proto::v1::{
     MalwareDatabaseRequest, ServerMessage, Welcome,
 };
 
+mod common;
+
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../control/tests/fixtures");
 const HOST: &str = "shop.test";
 const SHOP: &str = "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11";
@@ -1185,7 +1187,7 @@ async fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_o
     assert_eq!(client.send(&get("/two")).await.unwrap().status, 200);
     let mut fresh = Https::connect(s.https, &s.client, HOST).await.unwrap();
     assert_eq!(fresh.send(&get("/three")).await.unwrap().status, 200);
-    let cache = fs::read_to_string(s.dir.join("state/last-bundle.json")).unwrap();
+    let cache = common::cached_bundle(&s.dir.join("state"), 1).await;
     assert!(
         cache.contains("\"generation\":1,"),
         "the cache still has the first bundle: {cache}"
@@ -1498,7 +1500,9 @@ async fn an_uploaded_certificate_is_installed_acked_reported_and_replaced_withou
         keys.assert_absent_from_messages(&c.received);
         keys.assert_absent(
             "the bundle cache",
-            &fs::read(s.dir.join("state/last-bundle.json")).unwrap(),
+            common::cached_bundle(&s.dir.join("state"), 2)
+                .await
+                .as_bytes(),
         );
         keys.assert_absent("the log", s.log_text().as_bytes());
     }
@@ -1785,7 +1789,7 @@ fn assert_order_files_are_private(s: &Setup) {
 
 /// What would give away what the agent keeps secret about its orders: the account's key, as the
 /// file holds it, and the key of the certificate it was issued for.
-fn assert_orders_keep_their_keys(s: &Setup, stream: &Conn, issued: &str) {
+async fn assert_orders_keep_their_keys(s: &Setup, stream: &Conn, issued: &str, generation: i64) {
     let account = fs::read_to_string(s.keys.join("acme-account.json")).unwrap();
     let key = account
         .split("\"key_pkcs8\":\"")
@@ -1803,7 +1807,8 @@ fn assert_orders_keep_their_keys(s: &Setup, stream: &Conn, issued: &str) {
         !state.contains(key) && !state.contains("PRIVATE KEY"),
         "{state}"
     );
-    let cache = fs::read_to_string(s.dir.join("state/last-bundle.json")).unwrap_or_default();
+    // The bundle of `generation` is the newest the test sent; its cache write follows the ack.
+    let cache = common::cached_bundle(&s.dir.join("state"), generation).await;
     assert!(!cache.contains(key));
     // The key of the issued certificate is in its file and nowhere else.
     let end = "-----END PRIVATE KEY-----";
@@ -1903,7 +1908,9 @@ async fn pebble_issues_by_tls_alpn_on_the_tls_listener_and_a_placeholder_connect
         &s,
         &stream,
         &fs::read_to_string(s.keys.join(&file)).unwrap(),
-    );
+        1,
+    )
+    .await;
     let log = s.log_text();
     assert!(
         log.contains("[acme] made an account at") && log.contains("issued, served from"),
@@ -1953,7 +1960,7 @@ async fn pebble_validates_by_http_on_the_redirect_listener_when_tls_alpn_cannot_
     let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
     assert!(state.contains(r#""worked":"http-01""#), "{state}");
     let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
-    assert_orders_keep_their_keys(&s, &stream, &file);
+    assert_orders_keep_their_keys(&s, &stream, &file, 2).await;
 }
 
 /// What a CDN does that turns port 80 into HTTPS: every plain request is sent to the same
@@ -2013,7 +2020,7 @@ async fn pebble_validates_by_http_on_the_tls_listener_behind_a_redirect_to_https
     let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
     assert!(state.contains(r#""worked":"http-01""#), "{state}");
     let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
-    assert_orders_keep_their_keys(&s, &stream, &file);
+    assert_orders_keep_their_keys(&s, &stream, &file, 1).await;
 }
 
 // ── orders across a renewal, a failure, a kill and a reload ──────────────────────────────────
@@ -2210,7 +2217,7 @@ async fn pebble_renews_a_certificate_without_a_restart_and_a_connection_that_is_
     assert_eq!(record_number(&s, "failures"), 0);
     assert_eq!(s.log_text().matches("made an account").count(), 1);
     assert_eq!(s.log_text().matches("issued, served from").count(), 2);
-    assert_orders_keep_their_keys(&s, &stream, &file);
+    assert_orders_keep_their_keys(&s, &stream, &file, 1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2428,7 +2435,7 @@ async fn pebble_a_new_request_id_orders_again_at_once_while_the_certificate_is_w
     assert_directory_holds_only_the_order(&s);
     let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
     assert!(file.contains(String::from_utf8_lossy(&second.chain_pem).trim()));
-    assert_orders_keep_their_keys(&s, &stream, &file);
+    assert_orders_keep_their_keys(&s, &stream, &file, 2).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2461,6 +2468,8 @@ async fn pebble_an_agent_killed_in_the_middle_of_an_order_orders_again_at_start(
         "an order notes its start in the state file: {:?}",
         shop_record(&s)
     );
+    // The restart reads the bundle from the cache, which is written after the ack.
+    common::cached_bundle(&s.dir.join("state"), 1).await;
     agent.kill();
     assert!(!s.keys.join(format!("acme-{SHOP}.pem")).exists());
     // A kill in the middle of a write leaves a temporary file; the validation this one died in is
@@ -2504,7 +2513,7 @@ async fn pebble_an_agent_killed_in_the_middle_of_an_order_orders_again_at_start(
         "the start noted the unfinished order: {log}"
     );
     let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
-    assert_orders_keep_their_keys(&s, &stream, &file);
+    assert_orders_keep_their_keys(&s, &stream, &file, 1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2530,6 +2539,9 @@ async fn pebble_a_reload_in_the_middle_of_an_order_gives_the_successor_the_certi
     // The successor has no cached bundle, so it reports ready, which ends the hand-over, only
     // when the control plane gives it one. Until then the order runs on in the process that began
     // it, which is the only one that accepts.
+    // The write of the cache comes after the ack: remove the file once it is there, or it appears
+    // again.
+    common::cached_bundle(&s.dir.join("state"), 1).await;
     fs::remove_file(s.dir.join("state").join("last-bundle.json")).unwrap();
     signal(agent.first, "-USR2");
     until("the successor to wait for the key directory", || {
@@ -2602,8 +2614,8 @@ async fn pebble_a_reload_in_the_middle_of_an_order_gives_the_successor_the_certi
     // The successor read the certificate off the disk and reported it: nothing it sent, and
     // nothing the process before it sent, holds the key.
     let text = fs::read_to_string(&file).unwrap();
-    assert_orders_keep_their_keys(&s, &next, &text);
-    assert_orders_keep_their_keys(&s, &stream, &text);
+    assert_orders_keep_their_keys(&s, &next, &text, 2).await;
+    assert_orders_keep_their_keys(&s, &stream, &text, 2).await;
     signal(second, "-TERM");
 }
 
@@ -2656,5 +2668,5 @@ async fn pebble_reuse_a_new_request_id_after_an_issue_finalizes_with_no_challeng
     );
     assert_directory_holds_only_the_order(&s);
     let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
-    assert_orders_keep_their_keys(&s, &stream, &file);
+    assert_orders_keep_their_keys(&s, &stream, &file, 2).await;
 }

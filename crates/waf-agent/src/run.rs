@@ -18,8 +18,8 @@ use wafio_agent_pages::iprep::{
     ReputationChecker, parse_netset_partial,
 };
 use wafio_control::{
-    AckCode, AgentStats, CertificateInstall, CertificateSink, ControlConfig, ControlLink,
-    HeartbeatCounters, Hooks,
+    AckCode, AgentStats, CacheWrite, CertificateInstall, CertificateSink, ControlConfig,
+    ControlLink, HeartbeatCounters, Hooks,
 };
 
 use crate::agent::{Agent, Certificates, Sink};
@@ -115,6 +115,42 @@ pub fn test_hooks() -> Hooks {
         redact: crate::redact::mask_decision_event,
         on_dial,
     }
+}
+
+/// Waits for the queued bundle cache write once the runtime is gone. An apply that ran when the
+/// stream was cut finishes during the runtime drop, after the last wait in [`run_waf_agent`], and
+/// the end of the process does not wait for the writer thread.
+pub(crate) fn finish_cache_write_blocking() {
+    if let Some(link) = LINK.get() {
+        link.finish_cache_write_blocking();
+    }
+}
+
+/// How the link writes the bundle cache.
+#[cfg(not(feature = "test-cache-delay"))]
+fn cache_write() -> CacheWrite {
+    Arc::new(wafio_control::save_bundle_cache)
+}
+
+/// A build with `test-cache-delay` waits `WAFIO_TEST_CACHE_WRITE_DELAY_MS` milliseconds before each
+/// cache write, so a test can signal the agent while a write is still pending. No release build
+/// enables it.
+#[cfg(feature = "test-cache-delay")]
+fn cache_write() -> CacheWrite {
+    fn delayed(
+        dir: &std::path::Path,
+        bundle: &[u8],
+        generation: i64,
+        now: std::time::SystemTime,
+    ) -> Result<(), String> {
+        let delay = std::env::var("WAFIO_TEST_CACHE_WRITE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(delay));
+        wafio_control::save_bundle_cache(dir, bundle, generation, now)
+    }
+    Arc::new(delayed)
 }
 
 /// The link's `on_dial` hook: resolves the control-plane address for the jail in the background.
@@ -429,7 +465,7 @@ pub async fn run_waf_agent(
         );
     }
 
-    let link = ControlLink::new(
+    let link = ControlLink::with_cache_write(
         cfg,
         Hooks {
             bundles: Arc::new(Sink(agent.clone())),
@@ -439,6 +475,7 @@ pub async fn run_waf_agent(
             redact: crate::redact::mask_decision_event,
             on_dial,
         },
+        cache_write(),
     );
     let _ = LINK.set(link.clone());
     let status_link = link.clone();
@@ -582,6 +619,8 @@ pub async fn run_waf_agent(
                     env.push((crate::engine_lib::ENV_REQUIRED.to_string(), "1".to_string()));
                 }
                 agent.pause_orders();
+                // The successor reads the bundle cache as it starts.
+                link.finish_cache_write().await;
                 match spawn_successor(fds, &crate::reload::run_dir(), crate::reload::HANDOVER_TIMEOUT, env).await {
                     Ok(pid) => {
                         upgrade.finish(true);
@@ -603,6 +642,8 @@ pub async fn run_waf_agent(
         info!("[wafio-waf-agent] shutdown signal — stopping");
     }
     stream.abort();
+    // The next start reads the bundle cache, and so does a successor that is still starting up.
+    link.finish_cache_write().await;
     agent.close();
     // A successor writes in the key directory from the moment this process no longer accepts.
     proxy.stop_accepting(handed_over).await;

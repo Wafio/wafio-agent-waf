@@ -1,8 +1,10 @@
 //! The last applied live bundle is kept in `<state dir>/last-bundle.json` (temp file + fsync +
 //! rename, mode 0600) and applied at start before the stream connects, so a restart while the
-//! control plane is unreachable still serves the apps. The heartbeat reports where the
-//! configuration in force came from (`live` | `cache` | `cache_stale`). The envelope is the
-//! format earlier agent versions wrote and read, in both directions.
+//! control plane is unreachable still serves the apps. The write runs on a thread of its own after
+//! the bundle is acked, because an fsync on a busy disk can take seconds and the stream must go
+//! on with the commands behind the bundle. The heartbeat reports where the configuration in force
+//! came from (`live` | `cache` | `cache_stale`). The envelope is the format earlier agent versions
+//! wrote and read, in both directions.
 
 use crate::bundle_puller::{BundleError, BundleProbe};
 use crate::grpc_reconnect::random_u64;
@@ -12,7 +14,9 @@ use crate::timestamp::{Timestamp, duration_nanos, round_nanos, whole_seconds_tex
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 use tracing::info;
 
@@ -30,6 +34,11 @@ pub const BUNDLE_SOURCE_CACHE_STALE: &str = "cache_stale";
 
 /// The name of the cache envelope type, as its decode errors print it.
 const ENVELOPE: &str = "bundleCacheEnvelope";
+
+/// How a bundle reaches the disk, with the arguments of [`save_bundle_cache`]. The agent uses that
+/// function; a test passes its own to hold a write back or to make it fail.
+pub type CacheWrite =
+    Arc<dyn Fn(&Path, &[u8], i64, SystemTime) -> Result<(), String> + Send + Sync>;
 
 /// A cache file that passed every check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +117,121 @@ pub fn save_bundle_cache(
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+/// One bundle that waits to be written.
+struct PendingWrite {
+    /// Its place in the order of queuing, from 1.
+    ticket: u64,
+    dir: PathBuf,
+    bundle: Vec<u8>,
+    generation: i64,
+    /// When the bundle was applied, not when the disk got to it: the stale check reads it.
+    saved_at: SystemTime,
+}
+
+#[derive(Default)]
+struct WriterState {
+    /// The newest bundle that no write has taken yet.
+    pending: Option<PendingWrite>,
+    /// The writer thread lives: it has a write to do or is doing one.
+    busy: bool,
+    /// How many bundles were queued; the newest holds this number as its ticket.
+    queued: u64,
+    /// Every bundle up to this ticket is written, replaced, or failed.
+    done: u64,
+}
+
+struct WriterShared {
+    state: Mutex<WriterState>,
+    /// The writer moved `done` up.
+    advanced: Condvar,
+    write: CacheWrite,
+}
+
+/// Writes the bundle cache off the stream task. A single thread does the writes one after the
+/// other, and it keeps only the newest bundle that waits: a bundle that arrives while a write runs
+/// replaces the one that waits, so an older bundle never lands on the disk over a newer one and a
+/// slow disk costs one write, not one per bundle. The thread exists only while there is something
+/// to write.
+#[derive(Clone)]
+pub(crate) struct CacheWriter(Arc<WriterShared>);
+
+impl CacheWriter {
+    pub(crate) fn new(write: CacheWrite) -> CacheWriter {
+        CacheWriter(Arc::new(WriterShared {
+            state: Mutex::new(WriterState::default()),
+            advanced: Condvar::new(),
+            write,
+        }))
+    }
+
+    /// Queues `bundle` and returns at once.
+    pub(crate) fn submit(
+        &self,
+        dir: PathBuf,
+        bundle: Vec<u8>,
+        generation: i64,
+        saved_at: SystemTime,
+    ) {
+        let mut state = self.0.state.lock().unwrap();
+        state.queued += 1;
+        let ticket = state.queued;
+        state.pending = Some(PendingWrite {
+            ticket,
+            dir,
+            bundle,
+            generation,
+            saved_at,
+        });
+        if state.busy {
+            return;
+        }
+        let shared = self.0.clone();
+        match std::thread::Builder::new()
+            .name("bundle-cache".into())
+            .spawn(move || write_pending(&shared))
+        {
+            Ok(_) => state.busy = true,
+            Err(e) => {
+                state.pending = None;
+                state.done = ticket;
+                self.0.advanced.notify_all();
+                info!("[waf-bundle] cache write failed (bundle still applied): start writer: {e}");
+            }
+        }
+    }
+
+    /// Blocks until every bundle queued before the call is written, replaced, or failed. A bundle
+    /// queued while it waits does not hold it, so a steady stream of bundles cannot stall a reload.
+    pub(crate) fn finish(&self) {
+        let mut state = self.0.state.lock().unwrap();
+        let upto = state.queued;
+        while state.done < upto {
+            state = self.0.advanced.wait(state).unwrap();
+        }
+    }
+}
+
+/// The writer thread: takes the waiting bundle until none is left. A failed write is logged and
+/// the next bundle writes again.
+fn write_pending(shared: &WriterShared) {
+    let mut state = shared.state.lock().unwrap();
+    while let Some(w) = state.pending.take() {
+        drop(state);
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            (shared.write)(&w.dir, &w.bundle, w.generation, w.saved_at)
+        }))
+        .unwrap_or_else(|_| Err("the write panicked".into()));
+        if let Err(e) = res {
+            info!("[waf-bundle] cache write failed (bundle still applied): {e}");
+        }
+        state = shared.state.lock().unwrap();
+        // The bundle taken was the newest queued, so its ticket covers the ones it replaced.
+        state.done = w.ticket;
+        shared.advanced.notify_all();
+    }
+    state.busy = false;
 }
 
 /// A new file `<prefix><random><suffix>` in `dir`, created exclusively (so never through a link)
@@ -254,15 +378,33 @@ impl ControlLink {
         !dir.is_empty() && load_bundle_cache(Path::new(&dir), &|b| self.sink().check(b)).is_ok()
     }
 
-    /// Persists the applied bundle: failure is logged, never fatal.
-    pub(crate) fn save_applied_bundle(&self, bundle: &[u8], generation: i64) {
+    /// Hands the applied bundle to the cache writer and returns at once, so the ack does not wait
+    /// for the disk. A failed write is logged, never fatal.
+    pub(crate) fn queue_applied_bundle(&self, bundle: &[u8], generation: i64) {
         let (dir, _) = self.bundle_cache_config();
         if dir.is_empty() {
             return;
         }
-        if let Err(e) = save_bundle_cache(Path::new(&dir), bundle, generation, SystemTime::now()) {
-            info!("[waf-bundle] cache write failed (bundle still applied): {e}");
-        }
+        self.cache_writer.submit(
+            PathBuf::from(&dir),
+            bundle.to_vec(),
+            generation,
+            SystemTime::now(),
+        );
+    }
+
+    /// Returns once every bundle queued before the call is on the disk (or one that replaced it is),
+    /// or its write failed; later bundles do not hold it. The agent calls it before it starts a
+    /// successor and before it ends, since both read the cache next.
+    pub async fn finish_cache_write(&self) {
+        let writer = self.cache_writer.clone();
+        let _ = tokio::task::spawn_blocking(move || writer.finish()).await;
+    }
+
+    /// [`ControlLink::finish_cache_write`] for a caller with no runtime left: an apply still running
+    /// when the runtime drops finishes during the drop and queues its write after the last async wait.
+    pub fn finish_cache_write_blocking(&self) {
+        self.cache_writer.finish();
     }
 
     /// Apply the cached bundle, if any, through the sink. Run before the stream starts so a live
@@ -348,6 +490,230 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn bundle(generation: i64) -> Vec<u8> {
+        format!(r#"{{"agent_id":"a","generation":{generation},"apps":[]}}"#).into_bytes()
+    }
+
+    /// A cache write that a test holds back: it notes the generation it was asked to write, waits
+    /// until the test lets it go, and then writes the file as the agent does.
+    #[derive(Default)]
+    struct Held {
+        started: Mutex<Vec<i64>>,
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl Held {
+        fn writer(self: &Arc<Self>) -> CacheWrite {
+            let held = self.clone();
+            Arc::new(
+                move |dir: &Path, bundle: &[u8], generation: i64, now: SystemTime| {
+                    held.started.lock().unwrap().push(generation);
+                    let mut open = held.open.lock().unwrap();
+                    while !*open {
+                        let (guard, wait) = held
+                            .opened
+                            .wait_timeout(open, Duration::from_secs(30))
+                            .unwrap();
+                        open = guard;
+                        if wait.timed_out() {
+                            return Err("the test never let the write go".into());
+                        }
+                    }
+                    drop(open);
+                    save_bundle_cache(dir, bundle, generation, now)
+                },
+            )
+        }
+
+        fn let_go(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+
+        /// Waits until `n` writes have started.
+        fn wait_started(&self, n: usize) {
+            let end = std::time::Instant::now() + Duration::from_secs(30);
+            while self.started.lock().unwrap().len() < n {
+                assert!(std::time::Instant::now() < end, "{n} writes did not start");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn started(&self) -> Vec<i64> {
+            self.started.lock().unwrap().clone()
+        }
+    }
+
+    // The bundle that waits for a write that runs is replaced by a newer one: the older one is never
+    // written, so it cannot land on the disk over the newer one.
+    #[test]
+    fn a_bundle_that_arrives_during_a_write_replaces_the_one_that_waits() {
+        let dir = tmpdir("newest");
+        let held = Arc::new(Held::default());
+        let writer = CacheWriter::new(held.writer());
+        let at = SystemTime::now();
+        writer.submit(dir.clone(), bundle(1), 1, at);
+        held.wait_started(1);
+        writer.submit(dir.clone(), bundle(2), 2, at);
+        writer.submit(dir.clone(), bundle(3), 3, at);
+        held.let_go();
+        writer.finish();
+        assert_eq!(held.started(), [1, 3], "generation 2 was never written");
+        assert_eq!(load_bundle_cache(&dir, &ok).unwrap().generation, 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Real writes, one after the other as fast as they come: whatever the writer takes, the last
+    // bundle is the one on the disk.
+    #[test]
+    fn a_burst_of_bundles_leaves_the_last_one_on_disk() {
+        let dir = tmpdir("burst");
+        let writer = CacheWriter::new(Arc::new(save_bundle_cache));
+        for generation in 1..=300 {
+            writer.submit(
+                dir.clone(),
+                bundle(generation),
+                generation,
+                SystemTime::now(),
+            );
+        }
+        writer.finish();
+        assert_eq!(load_bundle_cache(&dir, &ok).unwrap().generation, 300);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // `finish` does not return while a write runs or waits: when it does, the file is there.
+    #[test]
+    fn finish_returns_only_once_the_write_is_on_the_disk() {
+        let dir = tmpdir("finish");
+        let held = Arc::new(Held::default());
+        let writer = CacheWriter::new(held.writer());
+        writer.submit(dir.clone(), bundle(1), 1, SystemTime::now());
+        held.wait_started(1);
+        writer.submit(dir.clone(), bundle(2), 2, SystemTime::now());
+        let h = held.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            h.let_go();
+        });
+        writer.finish();
+        assert_eq!(
+            load_bundle_cache(&dir, &ok).unwrap().generation,
+            2,
+            "finish waited for the write that runs and the one behind it"
+        );
+        // With nothing left it returns at once.
+        writer.finish();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A bundle queued after the call must not hold `finish`. The feeder queues faster than a write
+    // ends, so the writer never runs out of work.
+    #[test]
+    fn finish_does_not_wait_for_bundles_that_arrive_after_the_call() {
+        let dir = tmpdir("keeps-coming");
+        let writer = CacheWriter::new(Arc::new(
+            |dir: &Path, bundle: &[u8], generation: i64, now: SystemTime| {
+                std::thread::sleep(Duration::from_millis(20));
+                save_bundle_cache(dir, bundle, generation, now)
+            },
+        ));
+        writer.submit(dir.clone(), bundle(1), 1, SystemTime::now());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feeder = {
+            let (writer, dir, stop) = (writer.clone(), dir.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut generation = 2;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    writer.submit(
+                        dir.clone(),
+                        bundle(generation),
+                        generation,
+                        SystemTime::now(),
+                    );
+                    generation += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                generation - 1
+            })
+        };
+        let (done, returned) = std::sync::mpsc::channel();
+        let waiting = writer.clone();
+        std::thread::spawn(move || {
+            waiting.finish();
+            let _ = done.send(());
+        });
+        let returned = returned.recv_timeout(Duration::from_secs(10));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let last = feeder.join().unwrap();
+        assert!(
+            returned.is_ok(),
+            "finish kept waiting for bundles that arrived after the call"
+        );
+        assert!(load_bundle_cache(&dir, &ok).is_ok());
+        writer.finish();
+        assert_eq!(load_bundle_cache(&dir, &ok).unwrap().generation, last);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A write that fails, or panics, costs that bundle only: the writer takes the next one.
+    #[test]
+    fn a_failed_write_leaves_the_writer_ready_for_the_next_bundle() {
+        let dir = tmpdir("fails");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = calls.clone();
+        let writer = CacheWriter::new(Arc::new(
+            move |dir: &Path, bundle: &[u8], generation: i64, now: SystemTime| match n
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            {
+                0 => Err("disk full".into()),
+                1 => panic!("write panicked"),
+                _ => save_bundle_cache(dir, bundle, generation, now),
+            },
+        ));
+        for generation in 1..=2 {
+            writer.submit(
+                dir.clone(),
+                bundle(generation),
+                generation,
+                SystemTime::now(),
+            );
+            writer.finish();
+            assert!(
+                matches!(load_bundle_cache(&dir, &ok), Err(CacheReadError::NotFound)),
+                "nothing was written for generation {generation}"
+            );
+        }
+        writer.submit(dir.clone(), bundle(3), 3, SystemTime::now());
+        writer.finish();
+        assert_eq!(load_bundle_cache(&dir, &ok).unwrap().generation, 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // The process can end after the ack and before the write: what is on the disk then is the
+    // earlier cache, whole, and nothing else.
+    #[test]
+    fn the_earlier_cache_stays_readable_while_a_write_is_pending() {
+        let dir = tmpdir("pending");
+        save_bundle_cache(&dir, &bundle(1), 1, SystemTime::now()).unwrap();
+        let held = Arc::new(Held::default());
+        let writer = CacheWriter::new(held.writer());
+        writer.submit(dir.clone(), bundle(2), 2, SystemTime::now());
+        held.wait_started(1);
+        assert_eq!(load_bundle_cache(&dir, &ok).unwrap().generation, 1);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [BUNDLE_CACHE_FILE_NAME]);
+        held.let_go();
+        writer.finish();
+        assert_eq!(load_bundle_cache(&dir, &ok).unwrap().generation, 2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
