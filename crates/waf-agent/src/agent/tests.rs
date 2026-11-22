@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use wafio_application::RateLimitStore;
 use wafio_application::blocklist::BlockStore;
+use wafio_control::CertificateStatus;
 
 use super::*;
 use crate::executor::startup_executor;
@@ -949,6 +950,56 @@ fn a_refused_bundle_is_answered_for_the_ordered_apps_in_force_with_the_state_of_
     assert_eq!(
         summary(&offer.in_force),
         [(ACME_APP.into(), "acme".into(), "pending".into())]
+    );
+}
+
+#[test]
+fn a_refused_bundle_answers_an_ordered_app_only_while_it_orders_it_as_the_bundle_in_force() {
+    let (a, proxy, _dir, mut offers) = agent_with_statuses();
+    let acme = |port: u16, host: &str, id: &str| {
+        format!(
+            r#"{{"listen":"127.0.0.1:{port}","hosts":["{host}"],"source":"acme","acme_request_id":"{id}"}}"#
+        )
+    };
+    let in_force = [
+        app_json(
+            ACME_APP,
+            18081,
+            Some(&acme(18444, "acme.example.com", "r1")),
+        ),
+        app_json(SHOP, 18083, Some(&acme(18445, "shop.example.com", "r1"))),
+    ];
+    apply(&a, &bundle_of(&in_force), 1).unwrap();
+    a.report_bundle();
+    offers.drain();
+
+    // The refused bundle switches one ordered app to an upload and asks the other for a new
+    // certificate: the control plane holds neither the old source nor the old id for them now.
+    let upload = tls_object("acme.example.com", CERT, &"ab".repeat(32));
+    *proxy.fail.lock().unwrap() = Some(wafio_proxy::listeners::BIND_ERROR.into());
+    *proxy.unbound.lock().unwrap() = Some(("0.0.0.0:443".into(), std::io::ErrorKind::AddrInUse));
+    let refused = apply(
+        &a,
+        &bundle_of(&[
+            app_json(ACME_APP, 18081, Some(&upload)),
+            app_json(SHOP, 18083, Some(&acme(18445, "shop.example.com", "r2"))),
+        ]),
+        2,
+    );
+    assert_eq!(
+        refused,
+        Err(BundleError::Bind(wafio_proxy::listeners::BIND_ERROR.into()))
+    );
+    a.report_bundle();
+    let offer = only(&mut offers);
+    assert_eq!(
+        states(&offer),
+        [(ACME_APP.into(), "uploaded".into(), "failed".into())],
+        "one status for the switched app, the refusal; none under an id the control plane dropped"
+    );
+    assert_eq!(
+        offer.statuses[0].error,
+        "cannot listen on 0.0.0.0:443: address in use"
     );
 }
 

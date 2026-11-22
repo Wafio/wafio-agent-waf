@@ -5,7 +5,7 @@
 //! This module decides what the status of an app is. When to send it, and how often, is for
 //! `pacer`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wafio_control::CertificateStatus;
@@ -145,6 +145,43 @@ pub fn current(applied: &HashMap<String, Applied>, only: Option<&str>) -> Vec<Ce
         .collect();
     all.sort_by(|a, b| a.app_id.cmp(&b.app_id));
     all
+}
+
+/// What the control plane hears of a bundle that was refused for a reason that concerns its HTTPS
+/// settings.
+#[derive(Debug, Default)]
+pub struct Refusal {
+    /// `failed` for its uploaded apps, as [`refused`] gives them.
+    pub failed: Vec<CertificateStatus>,
+    /// Its apps that it orders as the bundle in force does, with the same request id. They go on
+    /// reporting their order. Any other app would be told under a source or a request id that the
+    /// control plane no longer has for it, and it drops such a status.
+    pub ordered: HashSet<String>,
+}
+
+/// The [`Refusal`] of a bundle with the apps `apps`, `applied` being the bundle in force.
+pub fn refusal(
+    apps: &[BundleApp],
+    applied: &HashMap<String, Applied>,
+    why: &str,
+    retry_at: i64,
+) -> Refusal {
+    let ordered = apps
+        .iter()
+        .filter(|app| {
+            let (Some(entry), Some(now)) = (app.tls.as_ref(), applied.get(&app.app_id)) else {
+                return false;
+            };
+            entry.source == SOURCE_ACME
+                && now.settings.source == Source::Acme
+                && entry.acme_request_id == now.settings.request_id
+        })
+        .map(|app| app.app_id.clone())
+        .collect();
+    Refusal {
+        failed: refused(apps, applied, why, retry_at),
+        ordered,
+    }
 }
 
 /// `failed` for each app of a bundle that was refused for a reason that concerns its HTTPS

@@ -9,8 +9,7 @@ use wafio_agent_pages::goodbot::VerifiedBotChecker;
 use wafio_application::RateLimitStore;
 use wafio_application::blocklist::BlockStore;
 use wafio_control::{
-    AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink, CertificateStatus,
-    WAF_BUNDLE_RETRY_MAX,
+    AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink, WAF_BUNDLE_RETRY_MAX,
 };
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
@@ -73,9 +72,9 @@ struct State {
     /// The key directory and what the apps with a `tls` object are served with; `None` when the
     /// agent has no usable key directory, which leaves the `tls` objects unread.
     tls: Option<Keys>,
-    /// The statuses of the apps of a bundle that was refused for a reason that concerns their
-    /// HTTPS settings; taken by `bundle_finished`, and cleared by the next apply.
-    refusal: Option<Vec<CertificateStatus>>,
+    /// What the control plane hears of a bundle that was refused for a reason that concerns the
+    /// HTTPS settings of its apps; taken by `bundle_finished`, and cleared by the next apply.
+    refusal: Option<status::Refusal>,
 }
 
 /// The agent state minus the request path (the proxy crate's).
@@ -347,7 +346,7 @@ impl Agent {
                     rejected.app_id.chars().take(64).collect::<String>(),
                     rejected.refusal
                 );
-                status::refused(&b.apps, keys.applied(), status::REFUSED_SETTINGS, 0)
+                status::refusal(&b.apps, keys.applied(), status::REFUSED_SETTINGS, 0)
             }),
             None => {
                 // Said at every bundle: such an app is served in plain HTTP at its bundle address.
@@ -483,14 +482,14 @@ impl Agent {
                 // The bundle is tried again after the longest wait, for as long as it takes.
                 let retry_at =
                     status::unix_now().saturating_add_unsigned(WAF_BUNDLE_RETRY_MAX.as_secs());
-                st.refusal = Some(status::refused(apps, keys.applied(), &why, retry_at));
+                st.refusal = Some(status::refusal(apps, keys.applied(), &why, retry_at));
             }
             BundleError::Bind(error)
         } else {
             if error == TLS_SETTINGS_REFUSED
                 && let Some(keys) = &st.tls
             {
-                st.refusal = Some(status::refused(
+                st.refusal = Some(status::refusal(
                     apps,
                     keys.applied(),
                     status::REFUSED_SETTINGS,
@@ -535,10 +534,16 @@ impl Agent {
         let st = &mut *guard;
         let Some(keys) = &st.tls else { return };
         match st.refusal.take() {
-            Some(mut failed) => {
+            Some(refusal) => {
                 // An ordered app gets no `failed` from the refusal, but a live bundle is answered
-                // for it too: with the state of its order now.
-                failed.extend(keys.ordered_statuses());
+                // for it too, with the state of its order now, while the refused bundle orders it
+                // as the bundle in force does.
+                let mut failed = refusal.failed;
+                failed.extend(
+                    keys.ordered_statuses()
+                        .into_iter()
+                        .filter(|s| refusal.ordered.contains(&s.app_id)),
+                );
                 out.after_refusal(failed, keys.statuses(None));
             }
             None => out.after_bundle(keys.statuses(None), true),

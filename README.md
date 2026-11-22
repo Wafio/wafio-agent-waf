@@ -601,7 +601,7 @@ exactly as before.
   of the answer (seconds, or a date in the form `Sun, 06 Nov 1994 08:49:37 GMT`; one that is missing, malformed, in the past or in one
   of the two obsolete date forms asks for nothing) and at most 7 days, so an authority cannot park an app for good. A new request id does
   not lift that wait, and neither does a change of source: the status under the new id is `failed` with its time. An app that leaves
-  the bundle loses its record, the wait included. At each look the agent drops a wait that has passed and cuts
+  the bundle or gateway mode loses its record, the wait included. At each look the agent drops a wait that has passed and cuts
   one that reaches further than it ever sets (the authority's to 7 days, its own to a day), so a clock that was set ahead and back parks
   no app. A renewal that fails keeps serving the certificate the app has, expired or not, and reports `failed` with that chain. A
   certificate that is due for renewal the moment the authority gives it, or within a minute of that (a host clock far ahead, or an
