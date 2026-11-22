@@ -12,6 +12,10 @@
 #   WAFIO_PEBBLE_HTTP_PORT   the port Pebble connects to for an HTTP-01 validation
 #   WAFIO_PEBBLE_TLS_PORT    the port Pebble connects to for a TLS-ALPN-01 validation
 #   WAFIO_PEBBLE_RUN         the run directory, for `down`
+#   WAFIO_PEBBLE_VA_NOSLEEP, WAFIO_PEBBLE_VA_SLEEPTIME, WAFIO_PEBBLE_AUTHZREUSE
+#                            what this Pebble was started with (SLEEPTIME is empty when none was given), which is how a test
+#                            knows the Pebble it has: a case that needs random validation sleeps or a reused authorization
+#                            stops with a message when it is run against another one
 # Pebble connects to every name at 127.0.0.1: the DNS server answers all names with that address, and gives no IPv6 one.
 # The two validation ports are the ones the test's agent listens on; nothing here binds them, so each run notes its two in
 # its directory and the next run picks others.
@@ -20,6 +24,9 @@
 # that runs started together do not meet. Certificates last two minutes. These variables of the caller are passed to
 # Pebble as they are: PEBBLE_VA_NOSLEEP (default 1), PEBBLE_AUTHZREUSE (default 0), PEBBLE_VA_SLEEPTIME and any other
 # PEBBLE_*. PEBBLE_WFE_NONCEREJECT is always 0: a nonce Pebble refuses at random makes a run that cannot be repeated.
+#
+# A caller that sets WAFIO_PEBBLE_OWNER=<pid> for `up` owns the run: the next `up` takes it down once that process is gone, so a
+# caller that was killed with no chance to run `down` leaves a Pebble up only until then. A run with no owner stays until `down`.
 #
 # Needs docker (the user in the docker group), python3 and curl.
 set -euo pipefail
@@ -44,6 +51,17 @@ down() {
   rm -rf "$run"
 }
 
+# Takes down the runs whose owner is gone (see the header); a run with no owner, or an owner that is not a process number, stays.
+sweep() {
+  local dir owner
+  for dir in "$base"/run.*; do
+    [ -f "$dir/owner" ] || continue
+    read -r owner <"$dir/owner" || true
+    [[ $owner =~ ^[0-9]+$ ]] || continue
+    kill -0 "$owner" 2>/dev/null || down "$dir"
+  done
+}
+
 # What `up` has made, for the cleanup when it stops half way.
 run= box=
 undo() {
@@ -62,6 +80,7 @@ up() {
   # Ports are picked and the containers started with the lock held, so that the next run picks others.
   exec 9>"$base/lock"
   flock 9
+  sweep
   local ports directory management dns challenge http tls
   # Six ports, free on TCP and UDP, held until all are chosen.
   # The last two are the validation ports another live run has noted for itself, which are skipped.
@@ -95,6 +114,7 @@ PY
   )
   read -r directory management dns challenge http tls <<<"$ports"
   echo "$http $tls" >"$run/ports"
+  [ -z "${WAFIO_PEBBLE_OWNER:-}" ] || echo "$WAFIO_PEBBLE_OWNER" >"$run/owner"
 
   cat >"$run/pebble-config.json" <<JSON
 {
@@ -143,6 +163,9 @@ JSON
       printf 'export WAFIO_PEBBLE_ROOT=%q\n' "$run/root.pem"
       printf 'export WAFIO_PEBBLE_HTTP_PORT=%q\n' "$http"
       printf 'export WAFIO_PEBBLE_TLS_PORT=%q\n' "$tls"
+      printf 'export WAFIO_PEBBLE_VA_NOSLEEP=%q\n' "${PEBBLE_VA_NOSLEEP:-1}"
+      printf 'export WAFIO_PEBBLE_VA_SLEEPTIME=%q\n' "${PEBBLE_VA_SLEEPTIME:-}"
+      printf 'export WAFIO_PEBBLE_AUTHZREUSE=%q\n' "${PEBBLE_AUTHZREUSE:-0}"
       trap - EXIT
       return 0
     fi

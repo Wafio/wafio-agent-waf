@@ -6,9 +6,9 @@
 //! the whole bundle. Keys are made by `openssl` at test time into a scratch directory that is
 //! removed when the test ends.
 //!
-//! The last tests order certificates from Pebble, the ACME test server of Let's Encrypt. They run
-//! when `WAFIO_PEBBLE_DIRECTORY` is set, which `eval "$(scripts/pebble.sh up)"` does, and print that
-//! they are skipped when it is not.
+//! The tests named `pebble_*` order certificates from Pebble, the ACME test server of Let's Encrypt.
+//! They run when `WAFIO_PEBBLE_DIRECTORY` is set, which `eval "$(scripts/pebble.sh up)"` does, and
+//! print that they are skipped when it is not. `scripts/acme-gate.sh` runs them in the gate.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -18,7 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -604,12 +604,20 @@ impl Agent {
     /// Starts the agent against the control plane at `grpc`; it has not said READY yet.
     fn spawn(setup: &Setup, grpc: &str, tweak: impl FnOnce(&mut Command)) -> Agent {
         let notify_path = setup.dir.join("notify.sock");
+        // A process started again in the same directory finds the socket of the one before it.
+        let _ = fs::remove_file(&notify_path);
         let notify = UnixDatagram::bind(&notify_path).unwrap();
         let mut cmd = setup.command(grpc);
         tweak(&mut cmd);
         let child = cmd
             .env("NOTIFY_SOCKET", &notify_path)
-            .stderr(Stdio::from(fs::File::create(setup.log()).unwrap()))
+            .stderr(Stdio::from(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(setup.log())
+                    .unwrap(),
+            ))
             .spawn()
             .unwrap();
         Agent {
@@ -627,6 +635,13 @@ impl Agent {
                 .await
                 .unwrap();
         assert_eq!(message, format!("READY=1\nMAINPID={}\n", self.first));
+    }
+
+    /// Ends the process the way an out-of-memory kill or a power cut does: no handler runs.
+    fn kill(&mut self) {
+        let child = self.child.as_mut().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     /// Starts the agent from its bundle cache, with no control plane, and waits for READY.
@@ -936,7 +951,12 @@ impl Conn {
     }
 
     async fn read(&mut self) -> AgentMessage {
-        let message = tokio::time::timeout(Duration::from_secs(30), self.inbound.message())
+        self.read_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+    }
+
+    async fn read_until(&mut self, end: tokio::time::Instant) -> AgentMessage {
+        let message = tokio::time::timeout_at(end, self.inbound.message())
             .await
             .expect("agent message")
             .unwrap()
@@ -964,12 +984,22 @@ impl Conn {
 
     /// The first message `pick` takes. What comes before it waits for the next call.
     async fn wait_for<T>(&mut self, pick: impl Fn(&AgentMessage) -> Option<T>) -> T {
+        self.wait_for_within(Duration::from_secs(30), pick).await
+    }
+
+    /// As `wait_for`, for a message that may be minutes away.
+    async fn wait_for_within<T>(
+        &mut self,
+        limit: Duration,
+        pick: impl Fn(&AgentMessage) -> Option<T>,
+    ) -> T {
         if let Some(at) = self.backlog.iter().position(|m| pick(m).is_some()) {
             let message = self.backlog.remove(at).unwrap();
             return pick(&message).unwrap();
         }
+        let end = tokio::time::Instant::now() + limit;
         loop {
-            let message = self.read().await;
+            let message = self.read_until(end).await;
             match pick(&message) {
                 Some(found) => return found,
                 None => self.backlog.push_back(message),
@@ -1027,10 +1057,19 @@ impl Conn {
 
     /// The next status of `app` in `state`.
     async fn status(&mut self, app: &str, state: &str) -> CertificateStatus {
-        self.wait_for(|m| match &m.kind {
-            Some(Out::CertificateStatus(s)) if s.app_id == app && s.state == state => {
-                Some(s.clone())
-            }
+        self.status_where(Duration::from_secs(30), app, |s| s.state == state)
+            .await
+    }
+
+    /// The next status of `app` that `pick` takes, within `limit`.
+    async fn status_where(
+        &mut self,
+        limit: Duration,
+        app: &str,
+        pick: impl Fn(&CertificateStatus) -> bool,
+    ) -> CertificateStatus {
+        self.wait_for_within(limit, |m| match &m.kind {
+            Some(Out::CertificateStatus(s)) if s.app_id == app && pick(s) => Some(s.clone()),
             _ => None,
         })
         .await
@@ -1563,25 +1602,65 @@ struct Pebble {
     /// The port Pebble connects to for HTTP-01, and for TLS-ALPN-01.
     http: u16,
     tls: u16,
+    /// Whether Pebble waits a random time before it validates, and how long at most.
+    sleeps: Option<u32>,
+    /// The percentage of orders that Pebble gives an authorization it already holds as valid.
+    reuse: u32,
+}
+
+/// The Pebble a case needs, by the settings `scripts/pebble.sh up` was run with.
+#[derive(Clone, Copy)]
+enum Wants {
+    /// No validation sleep and no reuse of authorizations: what `up` does without settings.
+    Quick,
+    /// Every order is given the valid authorization of an earlier one.
+    Reusing,
 }
 
 static PEBBLE_IN_USE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl Pebble {
-    fn from_env() -> Option<Pebble> {
+    /// `None` when no Pebble is set up, which is how a plain `cargo test` runs these tests. A
+    /// Pebble of another kind than the case needs is a mistake of the caller and stops the test.
+    fn from_env(wants: Wants) -> Option<Pebble> {
         let directory = std::env::var("WAFIO_PEBBLE_DIRECTORY").ok()?;
-        let port = |name: &str| {
-            std::env::var(name)
-                .unwrap_or_else(|_| panic!("{name} is not set"))
-                .parse()
-                .unwrap()
+        let text = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set by scripts/pebble.sh"))
         };
-        Some(Pebble {
+        let sleeps = (!matches!(
+            text("WAFIO_PEBBLE_VA_NOSLEEP")
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true"
+        ))
+        .then(|| {
+            // Pebble's own longest sleep, when it is not told another.
+            text("WAFIO_PEBBLE_VA_SLEEPTIME").parse().unwrap_or(5)
+        });
+        let pebble = Pebble {
             directory,
             root: std::env::var("WAFIO_PEBBLE_ROOT").expect("WAFIO_PEBBLE_ROOT is not set"),
-            http: port("WAFIO_PEBBLE_HTTP_PORT"),
-            tls: port("WAFIO_PEBBLE_TLS_PORT"),
-        })
+            http: text("WAFIO_PEBBLE_HTTP_PORT").parse().unwrap(),
+            tls: text("WAFIO_PEBBLE_TLS_PORT").parse().unwrap(),
+            sleeps,
+            reuse: text("WAFIO_PEBBLE_AUTHZREUSE").parse().unwrap(),
+        };
+        let (fits, needs) = match wants {
+            Wants::Quick => (
+                pebble.sleeps.is_none() && pebble.reuse == 0,
+                "no validation sleep and no authorization reuse (scripts/pebble.sh up without settings)",
+            ),
+            Wants::Reusing => (
+                pebble.sleeps.is_none() && pebble.reuse == 100,
+                "every authorization reused (PEBBLE_AUTHZREUSE=100 scripts/pebble.sh up)",
+            ),
+        };
+        assert!(
+            fits,
+            "this case needs a Pebble with {needs}; this one has sleeps {:?}, reuse {}%",
+            pebble.sleeps, pebble.reuse
+        );
+        Some(pebble)
     }
 
     /// The agent orders from Pebble, which the platform's roots do not know: it is given Pebble's
@@ -1602,8 +1681,8 @@ impl Pebble {
 }
 
 macro_rules! pebble {
-    () => {
-        match Pebble::from_env() {
+    ($wants:ident) => {
+        match Pebble::from_env(Wants::$wants) {
             Some(pebble) => pebble,
             None => {
                 eprintln!("WAFIO_PEBBLE_DIRECTORY is not set: this test is skipped");
@@ -1692,6 +1771,18 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// The ordered certificate and the account are in files that only the agent's user can read.
+fn assert_order_files_are_private(s: &Setup) {
+    for name in [format!("acme-{SHOP}.pem"), "acme-account.json".to_owned()] {
+        let mode = fs::metadata(s.keys.join(&name)).unwrap().permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+            0o600,
+            "{name}"
+        );
+    }
+}
+
 /// What would give away what the agent keeps secret about its orders: the account's key, as the
 /// file holds it, and the key of the certificate it was issued for.
 fn assert_orders_keep_their_keys(s: &Setup, stream: &Conn, issued: &str) {
@@ -1726,7 +1817,7 @@ fn assert_orders_keep_their_keys(s: &Setup, stream: &Conn, issued: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pebble_issues_by_tls_alpn_on_the_tls_listener_and_a_placeholder_connection_goes_on() {
-    let pebble = pebble!();
+    let pebble = pebble!(Quick);
     let _only = PEBBLE_IN_USE.lock().await;
     let s = Setup::new("pebble-alpn");
     // The app has been waiting for a few seconds: it has nothing but the placeholder meanwhile.
@@ -1800,14 +1891,7 @@ async fn pebble_issues_by_tls_alpn_on_the_tls_listener_and_a_placeholder_connect
     // What the agent keeps: the certificate and the account in files only the agent reads, and the
     // state that says how it was made.
     let file = format!("acme-{SHOP}.pem");
-    for name in [file.as_str(), "acme-account.json"] {
-        let mode = fs::metadata(s.keys.join(name)).unwrap().permissions();
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
-            0o600,
-            "{name}"
-        );
-    }
+    assert_order_files_are_private(&s);
     let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
     assert!(
         state.contains(&pebble.directory) && state.contains("tls-alpn-01"),
@@ -1829,7 +1913,7 @@ async fn pebble_issues_by_tls_alpn_on_the_tls_listener_and_a_placeholder_connect
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pebble_validates_by_http_on_the_redirect_listener_when_tls_alpn_cannot_reach() {
-    let pebble = pebble!();
+    let pebble = pebble!(Quick);
     let _only = PEBBLE_IN_USE.lock().await;
     let s = Setup::new("pebble-http");
     let (cp, mut conns) = serve_fake().await;
@@ -1902,7 +1986,7 @@ async fn redirecting_to_https(port: u16, https: u16) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pebble_validates_by_http_on_the_tls_listener_behind_a_redirect_to_https() {
-    let pebble = pebble!();
+    let pebble = pebble!(Quick);
     let _only = PEBBLE_IN_USE.lock().await;
     let s = Setup::new("pebble-cdn");
     // The challenge that worked last is HTTP-01, and the app has no listener on plain HTTP: only
@@ -1928,6 +2012,649 @@ async fn pebble_validates_by_http_on_the_tls_listener_behind_a_redirect_to_https
     assert_eq!(served.send(&get("/")).await.unwrap().status, 200);
     let state = fs::read_to_string(s.keys.join("state.json")).unwrap();
     assert!(state.contains(r#""worked":"http-01""#), "{state}");
+    let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
+    assert_orders_keep_their_keys(&s, &stream, &file);
+}
+
+// ── orders across a renewal, a failure, a kill and a reload ──────────────────────────────────
+
+impl Https {
+    /// When the leaf the server presented is valid from and until, in seconds since the epoch.
+    fn peer_validity(&self) -> (i64, i64) {
+        let (_, session) = self.0.get_ref().get_ref();
+        let chain = session
+            .peer_certificates()
+            .expect("the server sent a chain");
+        wafio_waf_agent::tls::acme::names::validity(chain[0].as_ref()).expect("a readable leaf")
+    }
+}
+
+/// Stands where Pebble connects for a validation and holds every connection until `open` is called,
+/// so an order waits in its middle for as long as the test wants. Then it passes them to `target`.
+struct Relay {
+    gate: tokio::sync::watch::Sender<bool>,
+    reached: Arc<AtomicUsize>,
+}
+
+impl Relay {
+    async fn start(port: u16, target: u16) -> Relay {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (gate, open) = tokio::sync::watch::channel(false);
+        let reached = Arc::new(AtomicUsize::new(0));
+        let counted = reached.clone();
+        tokio::spawn(async move {
+            while let Ok((mut from, _)) = listener.accept().await {
+                let (mut open, counted) = (open.clone(), counted.clone());
+                tokio::spawn(async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    if open.wait_for(|open| *open).await.is_err() {
+                        return;
+                    }
+                    if let Ok(mut to) = TcpStream::connect(("127.0.0.1", target)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut from, &mut to).await;
+                    }
+                });
+            }
+        });
+        Relay { gate, reached }
+    }
+
+    /// How many connections the authority has made.
+    fn reached(&self) -> usize {
+        self.reached.load(Ordering::SeqCst)
+    }
+
+    /// Lets the connections held so far, and every later one, through.
+    fn open(&self) {
+        self.gate.send_replace(true);
+    }
+}
+
+/// What `state.json` keeps of the shop, when the file is there and has a record of it.
+fn shop_record(s: &Setup) -> Option<serde_json::Value> {
+    let text = fs::read_to_string(s.keys.join("state.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text).ok()?["apps"]
+        .get(SHOP)
+        .cloned()
+}
+
+/// A number of the shop's record, 0 when the record or the field is not there.
+fn record_number(s: &Setup, field: &str) -> i64 {
+    shop_record(s)
+        .and_then(|record| record[field].as_i64())
+        .unwrap_or(0)
+}
+
+/// Watches the state file for `window` and fails when an order begins in it: an order notes its
+/// start there before it asks the authority anything.
+async fn assert_no_order_begins(s: &Setup, window: Duration) {
+    let end = Instant::now() + window;
+    while Instant::now() < end {
+        assert_eq!(
+            record_number(s, "attempt_started"),
+            0,
+            "an order began: {:?}",
+            shop_record(s)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The key directory of an app that has its ordered certificate and nothing else: the certificate,
+/// the account, the state and the lock, and no temporary file.
+fn assert_directory_holds_only_the_order(s: &Setup) {
+    let mut wanted = vec![
+        format!("acme-{SHOP}.pem"),
+        "acme-account.json".to_owned(),
+        "state.json".to_owned(),
+        "tls.lock".to_owned(),
+    ];
+    wanted.sort();
+    assert_eq!(files(&s.keys), wanted);
+}
+
+/// Sends a request every 3 seconds on `client` until `stop` is set, or until one fails. Returns the
+/// client and what each request got.
+async fn keep_busy(mut client: Https, stop: Arc<AtomicBool>) -> (Https, Vec<Result<u16, String>>) {
+    let mut answers = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        let answer = client
+            .send(&get("/busy"))
+            .await
+            .map(|r| r.status)
+            .map_err(|e| e.to_string());
+        let failed = answer.is_err();
+        answers.push(answer);
+        if failed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    (client, answers)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_renews_a_certificate_without_a_restart_and_a_connection_that_is_open_goes_on() {
+    let pebble = pebble!(Quick);
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-renew");
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    let tls = acme_object(pebble.tls, Some(pebble.http), "r1");
+    let (ok, error) = stream.bundle("b1", 1, s.bundle(&[s.shop(&tls)])).await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    let first = stream.status(SHOP, "active").await;
+
+    // A connection made while the first certificate is served, kept busy until the renewal is in.
+    let any = client_taking_any();
+    let open = Https::connect(pebble.tls, &any, HOST).await.unwrap();
+    assert_eq!(open.peer_leaf(), first.leaf_sha256);
+    let (from, until) = open.peer_validity();
+    // Two minutes as Pebble counts them: the dates of the certificate are a second short of it.
+    let lifetime = until - from;
+    assert!(
+        (118..=120).contains(&lifetime),
+        "Pebble issues certificates of two minutes, not {lifetime} seconds"
+    );
+    // The certificate is renewed when a third of its lifetime is left.
+    let renew_at = until - lifetime / 3;
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = tokio::spawn(keep_busy(open, stop.clone()));
+
+    let renewed = stream
+        .status_where(Duration::from_secs(150), SHOP, |s| {
+            s.state == "active" && s.leaf_sha256 != first.leaf_sha256
+        })
+        .await;
+    let reported = i64::try_from(unix_now()).unwrap();
+    assert_eq!(renewed.request_id, "r1");
+    assert!(
+        reported >= renew_at && reported < until,
+        "renewed at {reported}, between {renew_at} (a third left) and {until} (the end)"
+    );
+    // The new certificate is served from the next handshake, and was ordered when it was time.
+    let mut fresh = Https::connect(pebble.tls, &any, HOST).await.unwrap();
+    assert_eq!(fresh.peer_leaf(), renewed.leaf_sha256);
+    let (new_from, new_until) = fresh.peer_validity();
+    assert!(
+        new_from + 1 >= renew_at && new_from < renew_at + 20 && new_until > until,
+        "the new certificate is valid {new_from} to {new_until}, the first {from} to {until}"
+    );
+    assert_eq!(fresh.send(&get("/fresh")).await.unwrap().status, 200);
+
+    // The connection that was open across the switch was answered all along, and goes on.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    stop.store(true, Ordering::Relaxed);
+    let (open, answers) = busy.await.unwrap();
+    assert!(
+        answers.len() >= 20 && answers.iter().all(|a| *a == Ok(200)),
+        "{} requests on the open connection: {answers:?}",
+        answers.len()
+    );
+    assert_eq!(
+        open.peer_leaf(),
+        first.leaf_sha256,
+        "it was never handshaken again"
+    );
+    assert!(alive(agent.first), "the agent was not restarted");
+
+    // One certificate in the directory, the one the agent serves, and no temporary file.
+    assert_directory_holds_only_the_order(&s);
+    let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
+    assert!(file.contains(String::from_utf8_lossy(&renewed.chain_pem).trim()));
+    assert!(!file.contains(String::from_utf8_lossy(&first.chain_pem).trim()));
+    assert_eq!(record_number(&s, "failures"), 0);
+    assert_eq!(s.log_text().matches("made an account").count(), 1);
+    assert_eq!(s.log_text().matches("issued, served from").count(), 2);
+    assert_orders_keep_their_keys(&s, &stream, &file);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_a_failed_order_is_reported_and_none_starts_before_its_next_attempt() {
+    let pebble = pebble!(Quick);
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-failed");
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    // Pebble connects to its own TLS-ALPN-01 port, where this app does not listen.
+    let [elsewhere] = free_ports::<1>();
+    let bundle = s.bundle(&[s.shop(&acme_object(elsewhere, None, "r1"))]);
+    let (ok, error) = stream.bundle("b1", 1, bundle.clone()).await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    let failed = stream.status(SHOP, "failed").await;
+    assert_eq!(failed.request_id, "r1");
+    assert!(
+        failed.error.contains("tls-alpn-01") && failed.error.contains("port 443"),
+        "{}",
+        failed.error
+    );
+    assert!(
+        failed.chain_pem.is_empty(),
+        "there is no certificate to report"
+    );
+    // The first wait is 10 minutes, counted from the end of the order a moment ago.
+    let wait = failed.next_attempt_unix - i64::try_from(unix_now()).unwrap();
+    assert!(
+        (580..=600).contains(&wait),
+        "the next attempt is {wait} seconds away"
+    );
+    let at = failed.next_attempt_unix;
+
+    // Meanwhile the app is served its placeholder, which does not reach it.
+    let mut placeholder = Https::connect(elsewhere, &client_taking_any(), HOST)
+        .await
+        .unwrap();
+    assert_eq!(placeholder.send(&get("/")).await.unwrap().status, 503);
+    assert!(s.upstream.heads().is_empty(), "the app was not reached");
+
+    // No order starts, and a bundle that asks for the same thing again does not start one.
+    assert_no_order_begins(&s, Duration::from_secs(5)).await;
+    let (ok, error) = stream.bundle("b2", 2, bundle.clone()).await;
+    assert!(ok, "{error}");
+    let again = stream.status(SHOP, "failed").await;
+    assert_eq!(
+        (again.request_id.as_str(), again.next_attempt_unix),
+        ("r1", at)
+    );
+    assert_no_order_begins(&s, Duration::from_secs(3)).await;
+    let record = shop_record(&s).unwrap();
+    assert_eq!(
+        (
+            record["failures"].as_i64(),
+            record["next_attempt_unix"].as_i64()
+        ),
+        (Some(1), Some(at)),
+        "one failed order, and one only: {record}"
+    );
+    assert_eq!(
+        files(&s.keys),
+        ["acme-account.json", "state.json", "tls.lock"],
+        "an order that failed leaves its account and its state, and no certificate"
+    );
+
+    // A restart does not shorten the wait: the state file remembers it.
+    signal(agent.first, "-TERM");
+    let mut stopped = agent;
+    exit_of(stopped.child.as_mut().unwrap(), Duration::from_secs(20)).await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    agent.ready().await;
+    let (ok, error) = stream.bundle("b3", 3, bundle).await;
+    assert!(ok, "{error}");
+    let restarted = stream.status(SHOP, "failed").await;
+    assert_eq!(
+        (restarted.request_id.as_str(), restarted.next_attempt_unix),
+        ("r1", at)
+    );
+    assert_no_order_begins(&s, Duration::from_secs(3)).await;
+    assert_eq!(record_number(&s, "failures"), 1);
+    assert_eq!(record_number(&s, "next_attempt_unix"), at);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_a_failed_order_is_tried_again_at_its_next_attempt_with_the_other_challenge() {
+    let pebble = pebble!(Quick);
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-retry");
+    // The last order answered TLS-ALPN-01 and failed; the next one may start in 15 seconds.
+    let at = unix_now() + 15;
+    seed_state(
+        &s,
+        &format!(
+            r#"{{"request_id":"r1","tried":"tls-alpn-01","tried_hosts":["{HOST}"],"failures":1,"next_attempt_unix":{at},"error":"the order failed (tls-alpn-01): the authority could not connect"}}"#
+        ),
+    );
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    let [elsewhere] = free_ports::<1>();
+    let tls = acme_object(elsewhere, Some(pebble.http), "r1");
+    let (ok, error) = stream.bundle("b1", 1, s.bundle(&[s.shop(&tls)])).await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    let failed = stream.status(SHOP, "failed").await;
+    assert_eq!(
+        (failed.request_id.as_str(), failed.next_attempt_unix),
+        ("r1", i64::try_from(at).unwrap())
+    );
+
+    // Nothing is asked of the authority until then: no account, no order.
+    while unix_now() + 1 < at {
+        assert_eq!(record_number(&s, "attempt_started"), 0);
+        assert!(!s.keys.join("acme-account.json").exists());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let active = stream
+        .status_where(Duration::from_secs(60), SHOP, |s| s.state == "active")
+        .await;
+    assert!(unix_now() >= at, "the order was not early");
+    assert_eq!(
+        (
+            active.request_id.as_str(),
+            active.error.as_str(),
+            active.next_attempt_unix
+        ),
+        ("r1", "", 0)
+    );
+    let served = Https::connect(elsewhere, &client_taking_any(), HOST)
+        .await
+        .unwrap();
+    assert_eq!(served.peer_leaf(), active.leaf_sha256);
+    let record = shop_record(&s).unwrap();
+    assert_eq!(record["worked"], "http-01", "the other challenge: {record}");
+    assert!(
+        record.get("failures").is_none() && record.get("tried").is_none(),
+        "a success forgets the failure: {record}"
+    );
+    assert_directory_holds_only_the_order(&s);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_a_new_request_id_orders_again_at_once_while_the_certificate_is_whole() {
+    let pebble = pebble!(Quick);
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-again");
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    let (ok, error) = stream
+        .bundle(
+            "b1",
+            1,
+            s.bundle(&[s.shop(&acme_object(pebble.tls, Some(pebble.http), "r1"))]),
+        )
+        .await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    let first = stream.status(SHOP, "active").await;
+    let any = client_taking_any();
+    let mut old = Https::connect(pebble.tls, &any, HOST).await.unwrap();
+    let (from, until) = old.peer_validity();
+    // The certificate is renewed when a third of its lifetime is left: the new order below must
+    // come from the new request id, which has to be well before that.
+    let renew_at = until - (until - from) / 3;
+    assert!(
+        i64::try_from(unix_now()).unwrap() + 60 < until,
+        "the first certificate is far from its renewal"
+    );
+    // What came before the new id is not what the case looks at.
+    stream.backlog.clear();
+
+    let (ok, error) = stream
+        .bundle(
+            "b2",
+            2,
+            s.bundle(&[s.shop(&acme_object(pebble.tls, Some(pebble.http), "r2"))]),
+        )
+        .await;
+    assert!(ok, "{error}");
+    // The control plane hears the latest state of an app at most once in 10 seconds, so what comes
+    // for the new id is its `active` with another leaf, the order having run in the meantime.
+    let second = stream
+        .status_where(Duration::from_secs(40), SHOP, |s| {
+            s.state == "active" && s.request_id == "r2"
+        })
+        .await;
+    assert!(
+        i64::try_from(unix_now()).unwrap() < renew_at,
+        "the order was made before the renewal was due, so it was the new id that made it"
+    );
+    assert_ne!(second.leaf_sha256, first.leaf_sha256);
+    assert!(
+        !stream.backlog.iter().any(|m| matches!(
+            &m.kind,
+            Some(Out::CertificateStatus(s)) if s.app_id == SHOP && s.request_id == "r1"
+        )),
+        "a status of the old id came after the new one was sent: {:?}",
+        stream.backlog
+    );
+    let mut fresh = Https::connect(pebble.tls, &any, HOST).await.unwrap();
+    assert_eq!(fresh.peer_leaf(), second.leaf_sha256);
+    assert_eq!(fresh.send(&get("/")).await.unwrap().status, 200);
+    assert_eq!(
+        old.send(&get("/old")).await.unwrap().status,
+        200,
+        "the connection made before goes on"
+    );
+    assert_eq!(old.peer_leaf(), first.leaf_sha256);
+    let record = shop_record(&s).unwrap();
+    assert_eq!(record["request_id"], "r2");
+    assert_directory_holds_only_the_order(&s);
+    let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
+    assert!(file.contains(String::from_utf8_lossy(&second.chain_pem).trim()));
+    assert_orders_keep_their_keys(&s, &stream, &file);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_an_agent_killed_in_the_middle_of_an_order_orders_again_at_start() {
+    let pebble = pebble!(Quick);
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-kill");
+    // The app listens on a port of its own, and Pebble's validation waits at the relay in front of
+    // it: the order is begun and nothing more.
+    let [listen] = free_ports::<1>();
+    let relay = Relay::start(pebble.tls, listen).await;
+    let (cp, mut conns) = serve_fake().await;
+    let mut agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    let (ok, error) = stream
+        .bundle(
+            "b1",
+            1,
+            s.bundle(&[s.shop(&acme_object(listen, None, "r1"))]),
+        )
+        .await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    until("the authority to look for the answer", || {
+        relay.reached() > 0
+    })
+    .await;
+    assert!(
+        record_number(&s, "attempt_started") != 0,
+        "an order notes its start in the state file: {:?}",
+        shop_record(&s)
+    );
+    agent.kill();
+    assert!(!s.keys.join(format!("acme-{SHOP}.pem")).exists());
+    // A kill in the middle of a write leaves a temporary file; the validation this one died in is
+    // not a write, so the file is made here.
+    fs::write(s.keys.join(".tmp-1"), "half a write").unwrap();
+    // What Pebble held goes to a listener that is gone, and every later check is answered.
+    relay.open();
+
+    let restarted = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    restarted.ready().await;
+    let active = stream
+        .status_where(Duration::from_secs(60), SHOP, |s| s.state == "active")
+        .await;
+    assert_eq!(active.request_id, "r1");
+    let served = Https::connect(listen, &client_taking_any(), HOST)
+        .await
+        .unwrap();
+    assert_eq!(served.peer_leaf(), active.leaf_sha256);
+    // A start that finds an unfinished order orders again, and an order that ends leaves nothing of
+    // the one that did not: no note of a start, no failure, and the temporary file of the cut-short
+    // write is cleared out.
+    let record = shop_record(&s).unwrap();
+    for field in [
+        "attempt_started",
+        "interrupted",
+        "failures",
+        "next_attempt_unix",
+    ] {
+        assert!(record.get(field).is_none(), "{field} in {record}");
+    }
+    assert_directory_holds_only_the_order(&s);
+    assert_order_files_are_private(&s);
+    let log = s.log_text();
+    assert_eq!(
+        log.matches(&format!(
+            "[acme] app {SHOP}: the agent stopped during an order; ordering again"
+        ))
+        .count(),
+        1,
+        "the start noted the unfinished order: {log}"
+    );
+    let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
+    assert_orders_keep_their_keys(&s, &stream, &file);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_a_reload_in_the_middle_of_an_order_gives_the_successor_the_certificate() {
+    let pebble = pebble!(Quick);
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-reload");
+    let [listen] = free_ports::<1>();
+    let relay = Relay::start(pebble.tls, listen).await;
+    let (cp, mut conns) = serve_fake().await;
+    let mut agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    let bundle = s.bundle(&[s.shop(&acme_object(listen, None, "r1"))]);
+    let (ok, error) = stream.bundle("b1", 1, bundle.clone()).await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    until("the authority to look for the answer", || {
+        relay.reached() > 0
+    })
+    .await;
+    assert!(record_number(&s, "attempt_started") != 0);
+
+    // The successor has no cached bundle, so it reports ready, which ends the hand-over, only
+    // when the control plane gives it one. Until then the order runs on in the process that began
+    // it, which is the only one that accepts.
+    fs::remove_file(s.dir.join("state").join("last-bundle.json")).unwrap();
+    signal(agent.first, "-USR2");
+    until("the successor to wait for the key directory", || {
+        s.log_text()
+            .contains("[tls] another process holds the key directory lock")
+    })
+    .await;
+    relay.open();
+    let active = stream
+        .status_where(Duration::from_secs(60), SHOP, |s| s.state == "active")
+        .await;
+    assert_eq!(active.request_id, "r1");
+    let file = s.keys.join(format!("acme-{SHOP}.pem"));
+    let issued = fs::read(&file).unwrap();
+    assert!(
+        s.log_text().contains("issued, served from"),
+        "the process that ordered took the certificate in"
+    );
+
+    // The control plane gives the successor its bundle: it is ready, the process before it lets go
+    // of the directory, and the successor finds the certificate there.
+    let (_, mut next) = connect_agent(&mut conns).await;
+    let (ok, error) = next.bundle("b2", 2, bundle).await;
+    assert!(ok, "{error}");
+    let notify = agent.notify.try_clone().unwrap();
+    let message =
+        tokio::task::spawn_blocking(move || ready_message(&notify, Duration::from_secs(60)))
+            .await
+            .unwrap();
+    let second: u32 = message
+        .strip_prefix("READY=1\nMAINPID=")
+        .and_then(|rest| rest.trim_end().parse().ok())
+        .expect(&message);
+    assert_ne!(second, agent.first);
+    exit_of(agent.child.as_mut().unwrap(), Duration::from_secs(40)).await;
+    until("the successor to take the directory", || {
+        s.log_text()
+            .contains("[tls] this process writes in the key directory now")
+    })
+    .await;
+
+    // Nothing is ordered again: the successor serves what the process before it was given.
+    assert_no_order_begins(&s, Duration::from_secs(5)).await;
+    let adopted = next
+        .status_where(Duration::from_secs(30), SHOP, |s| s.state == "active")
+        .await;
+    assert_eq!(
+        (adopted.request_id.as_str(), adopted.leaf_sha256.as_str()),
+        ("r1", active.leaf_sha256.as_str())
+    );
+    let mut served = Https::connect(listen, &client_taking_any(), HOST)
+        .await
+        .unwrap();
+    assert_eq!(served.peer_leaf(), active.leaf_sha256);
+    assert_eq!(served.send(&get("/")).await.unwrap().status, 200);
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        issued,
+        "the certificate was not replaced"
+    );
+    assert_directory_holds_only_the_order(&s);
+    assert_order_files_are_private(&s);
+    let log = s.log_text();
+    assert_eq!(log.matches("made an account").count(), 1, "{log}");
+    assert_eq!(log.matches("issued, served from").count(), 1, "{log}");
+    let record = shop_record(&s).unwrap();
+    for field in ["attempt_started", "interrupted", "failures"] {
+        assert!(record.get(field).is_none(), "{field} in {record}");
+    }
+    // The successor read the certificate off the disk and reported it: nothing it sent, and
+    // nothing the process before it sent, holds the key.
+    let text = fs::read_to_string(&file).unwrap();
+    assert_orders_keep_their_keys(&s, &next, &text);
+    assert_orders_keep_their_keys(&s, &stream, &text);
+    signal(second, "-TERM");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pebble_reuse_a_new_request_id_after_an_issue_finalizes_with_no_challenge() {
+    let pebble = pebble!(Reusing);
+    let _only = PEBBLE_IN_USE.lock().await;
+    let s = Setup::new("pebble-reuse");
+    let (cp, mut conns) = serve_fake().await;
+    let agent = Agent::spawn(&s, &cp, |cmd| pebble.set(cmd));
+    let (_, mut stream) = connect_agent(&mut conns).await;
+    let (ok, error) = stream
+        .bundle(
+            "b1",
+            1,
+            s.bundle(&[s.shop(&acme_object(pebble.tls, Some(pebble.http), "r1"))]),
+        )
+        .await;
+    assert!(ok, "{error}");
+    agent.ready().await;
+    let first = stream.status(SHOP, "active").await;
+
+    // The app now listens where Pebble does not connect, on neither port: no challenge can be
+    // answered, so an order that succeeds was not asked for one.
+    let [elsewhere] = free_ports::<1>();
+    let (ok, error) = stream
+        .bundle(
+            "b2",
+            2,
+            s.bundle(&[s.shop(&acme_object(elsewhere, None, "r2"))]),
+        )
+        .await;
+    assert!(ok, "{error}");
+    let second = stream
+        .status_where(Duration::from_secs(40), SHOP, |s| {
+            s.state == "active" && s.request_id == "r2"
+        })
+        .await;
+    assert_ne!(second.leaf_sha256, first.leaf_sha256, "a new certificate");
+    assert_eq!(second.error, "");
+    let served = Https::connect(elsewhere, &client_taking_any(), HOST)
+        .await
+        .unwrap();
+    assert_eq!(served.peer_leaf(), second.leaf_sha256);
+    let record = shop_record(&s).unwrap();
+    assert_eq!(record["worked"], "tls-alpn-01");
+    assert!(
+        record.get("failures").is_none() && record.get("tried").is_none(),
+        "{record}"
+    );
+    assert_directory_holds_only_the_order(&s);
     let file = fs::read_to_string(s.keys.join(format!("acme-{SHOP}.pem"))).unwrap();
     assert_orders_keep_their_keys(&s, &stream, &file);
 }

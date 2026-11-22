@@ -109,21 +109,43 @@ scripts/ci-local.sh
 
 In order: agent-material check (`scripts/check-ai.sh`), secret scan (`gitleaks`), proto copy check
 (`scripts/sync-proto.sh --check`), notices (`scripts/gen-notices.py`), advisories, the test certificates,
-`cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets --features wafio-waf-agent/test-tls -- -D warnings` and
-`cargo test --locked --workspace --features wafio-waf-agent/test-tls`. In a copy of the tree without `.git` the gate skips the agent-material check
+`cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets --features wafio-waf-agent/test-tls -- -D warnings`,
+`cargo test --locked --workspace --features wafio-waf-agent/test-tls` and the certificate orders against Pebble (below). In a copy of the tree without `.git` the gate skips the agent-material check
 and scans the files for secrets instead of the history; run `scripts/check-ai.sh` in the checkout then.
 
 The feature `test-tls` of `wafio-waf-agent` lets `WAFIO_TEST_TLS_DIR` name the key directory, so that the tests of the binary can use a
 directory that the user they run as owns (the fixed path needs the user of the unit); `tests/tls_bundle.rs` and `tests/control_plane.rs`
 are built only with it. No release build enables it.
 
-`scripts/pebble.sh up` starts Pebble, the ACME test server of Let's Encrypt, and its DNS server in two containers pinned by digest
-(it needs docker; see the header of the script). `eval "$(scripts/pebble.sh up)"` sets `WAFIO_PEBBLE_DIRECTORY` and the settings that go
-with it, and the tests of `tests/tls_bundle.rs` whose names start with `pebble` then order certificates from it with the real
-binary and a fake control plane: with TLS-ALPN-01, with HTTP-01 on the redirect listener, and with HTTP-01 on the HTTPS listener behind
-something that sends port 80 to HTTPS. Without `WAFIO_PEBBLE_DIRECTORY` they print that they are skipped. `scripts/pebble.sh down` stops
-the containers. The gate does not run them. Run them after `scripts/gen-test-certs.sh`, one at a time:
-`cargo test -p wafio-waf-agent --features test-tls --test tls_bundle pebble -- --test-threads=1 --nocapture`.
+Pebble is the ACME test server of Let's Encrypt. The tests of `tests/tls_bundle.rs` named `pebble_*` have the real binary order
+certificates from it, with a fake control plane. They cover TLS-ALPN-01 and HTTP-01 (on the redirect listener, and on the HTTPS listener
+behind something that sends port 80 to HTTPS), the renewal of a two minute certificate while a connection is open, a failed order and its
+next attempt, a new request id, an agent killed in the middle of an order, a reload in the middle of one, and a new request id after an
+issue when Pebble gives the valid authorization back, which finalizes with no challenge. Without `WAFIO_PEBBLE_DIRECTORY` they print that
+they are skipped, so a plain `cargo test` needs no docker.
+
+`eval "$(scripts/pebble.sh up)"` starts Pebble and its DNS server in two containers pinned by digest (docker is needed; the header of the
+script lists what it sets) and sets `WAFIO_PEBBLE_DIRECTORY`. Several runs can be up at once. The ports Pebble connects to for a validation
+are free ports of the run, which the test's agent, or a relay in front of it, listens on. A test knows which Pebble it has from
+`WAFIO_PEBBLE_VA_NOSLEEP`, `WAFIO_PEBBLE_VA_SLEEPTIME` and `WAFIO_PEBBLE_AUTHZREUSE`, the values `up` started Pebble with (the
+`PEBBLE_*` variables of the same name, defaults `1`, none and `0`). Most cases want the defaults. The case that needs `PEBBLE_AUTHZREUSE=100`
+has a name that starts with `pebble_reuse_`, and stops with a message when it runs against another Pebble. A case that needs a setting of
+its own gets a name prefix of its own and a second `up` in `scripts/acme-gate.sh`.
+
+The gate ends with the step `acme` (`scripts/acme-gate.sh`): it starts a Pebble, runs the cases against it, and starts another with
+`PEBBLE_AUTHZREUSE=100` for the `pebble_reuse_` cases. It takes about four minutes, holds the first run to 400 seconds and the second to 60,
+and takes every Pebble it started down however it ends, a `kill` included. A gate that is killed with `kill -9` cannot, so the next
+`scripts/pebble.sh up` takes down the Pebble of a caller that is gone (the step names itself as the owner with `WAFIO_PEBBLE_OWNER`).
+`WAFIO_SKIP_ACME=1` skips the step and prints `acme: skipped`, and where docker is missing or cannot be used the step is skipped with a
+line that says so. Neither is allowed in the private gate, which `WAFIO_TARGET=private` marks: there the step fails, so a green private gate always has the Pebble cases behind it. The step prints which
+gate it saw. `scripts/test-acme-gate.sh` checks all this with a PATH that has no docker and with stubs for the rest, at the start of the
+step. By hand, after `scripts/gen-test-certs.sh`:
+
+```sh
+eval "$(scripts/pebble.sh up)"
+cargo test -p wafio-waf-agent --features test-tls --test tls_bundle pebble_ -- --test-threads=1 --skip pebble_reuse_
+scripts/pebble.sh down
+```
 
 The gate needs nothing from the private repository. The loader's file checks are tested here (`crates/engine-loader`) and the
 encodings with random and damaged buffers of a fixed seed (`crates/engine-abi/tests`); loading a real library, the failure cases that need
@@ -768,7 +790,7 @@ crates/
                              bounded LRU, malware hashes, byte-level text helpers (UTF-8, URL, HTML, patterns, transforms)
   proto                      generated gRPC client and server
 proto/                       vendored protocol file and its SOURCE
-scripts/                     ci-local.sh  build-dist.sh  gen-test-certs.sh  gen-notices.py  sync-proto.sh  check-ai.sh  advisories.py  pebble.sh
+scripts/                     ci-local.sh  build-dist.sh  gen-test-certs.sh  gen-notices.py  sync-proto.sh  check-ai.sh  advisories.py  pebble.sh  acme-gate.sh  test-acme-gate.sh
 scripts/notices/             notices.json and the licence texts that gen-notices.py puts into NOTICES.txt
 tools/core-gen               Go generators for the bytetext Unicode and HTML entity tables
 ```
