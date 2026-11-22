@@ -2,8 +2,9 @@
 # The `acme` step of scripts/ci-local.sh: the tests of crates/waf-agent/tests/tls_bundle.rs named pebble_*, which have the real
 # agent order certificates from Pebble (scripts/pebble.sh). Run it after the test step, whose build it reuses.
 #
-# The private gate is the one with WAFIO_TARGET=private, or with a cargo target directory named target-<workspace>: the remote
-# runner passes no WAFIO_TARGET to the build host, only that directory, so either one marks it. The step says which it saw.
+# The private gate is the one with WAFIO_TARGET=private, or with a cargo target directory of the shape <dir>/wr/target-<name>: the
+# runner that starts the gate on the build host passes no WAFIO_TARGET, only that directory, so either one marks it. The step says
+# which it saw.
 #
 #   private gate          docker missing or unusable fails the step, and WAFIO_SKIP_ACME=1 is refused, so that a green private
 #                         gate always has the Pebble cases behind it.
@@ -20,7 +21,7 @@ cd "$here/.."
 
 target=shared
 case ${WAFIO_TARGET:-} in private) target=private ;; esac
-case ${CARGO_TARGET_DIR:-} in target-* | */target-*) target=private ;; esac
+case ${CARGO_TARGET_DIR:-} in */wr/target-*) target=private ;; esac
 echo "acme: $target gate (WAFIO_TARGET=${WAFIO_TARGET-unset}, CARGO_TARGET_DIR=${CARGO_TARGET_DIR-unset})"
 
 if [ "${WAFIO_SKIP_ACME:-}" = 1 ]; then
