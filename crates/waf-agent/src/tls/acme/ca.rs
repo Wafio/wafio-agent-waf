@@ -17,6 +17,8 @@ pub struct CaError {
     pub problem: Option<String>,
     /// What the authority or the transport said.
     pub text: String,
+    /// The `Retry-After` the authority sent with it, as it was written.
+    pub retry_after: Option<String>,
 }
 
 impl CaError {
@@ -24,6 +26,7 @@ impl CaError {
         CaError {
             problem: None,
             text: text.into(),
+            retry_after: None,
         }
     }
 
@@ -75,6 +78,13 @@ pub trait Ca: Send + Sync + 'static {
     /// The account that kept credentials stand for. Credentials that cannot be used at all, whatever
     /// the authority is, fail with the problem `CREDENTIALS_UNUSABLE`; any other failure may pass.
     async fn restore_account(&self, credentials: &[u8]) -> Result<Arc<dyn Account>, CaError>;
+
+    /// The `Retry-After` header of the last answer of the authority, as it was written, if it
+    /// had one. The client library does not hand it over with an error, so it is read here after
+    /// the request that failed.
+    fn retry_after(&self) -> Option<String> {
+        None
+    }
 }
 
 #[async_trait]

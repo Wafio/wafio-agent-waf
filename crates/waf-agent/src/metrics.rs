@@ -15,6 +15,8 @@ use wafio_proxy::metrics::{
     latency_percentiles,
 };
 
+use crate::tls::metrics::TlsMetrics;
+
 /// The heartbeat counters the agent owns.
 pub fn heartbeat_counters() -> HeartbeatCounters {
     let (p50, p95, p99, n) = latency_percentiles();
@@ -55,7 +57,8 @@ fn threads() -> f64 {
 }
 
 /// `RegisterWAFMetrics`.
-pub fn register_agent_metrics(reg: &Registry, link: Arc<ControlLink>) {
+pub fn register_agent_metrics(reg: &Registry, link: Arc<ControlLink>, tls: &Arc<TlsMetrics>) {
+    tls.register(reg);
     let start = Instant::now();
     reg.gauge(
         "wafio_agent_uptime_seconds",
@@ -254,7 +257,7 @@ mod tests {
     fn registry_has_the_agent_series() {
         let reg = Registry::new();
         let link = test_link();
-        register_agent_metrics(&reg, link);
+        register_agent_metrics(&reg, link, &Arc::new(TlsMetrics::default()));
         let text = String::from_utf8(reg.write()).unwrap();
         for name in [
             "wafio_agent_uptime_seconds",
@@ -269,6 +272,10 @@ mod tests {
             "wafio_waf_challenge_verify_limited_total",
             "wafio_waf_body_decode_budget_in_use_bytes",
             "wafio_waf_telemetry_queue_length",
+            r#"wafio_waf_acme_orders_total{result="issued"}"#,
+            r#"wafio_waf_acme_orders_total{result="failed"}"#,
+            r#"wafio_waf_certificate_installs_total{result="ok"}"#,
+            "wafio_waf_tls_certificate_expiry_seconds",
         ] {
             assert!(text.contains(name), "{name} missing");
         }

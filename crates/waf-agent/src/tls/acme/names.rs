@@ -1,4 +1,4 @@
-//! The names a certificate covers.
+//! The names a certificate covers and the time it is valid for.
 
 use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
@@ -20,6 +20,14 @@ pub fn dns_names(der: &[u8]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// The time a certificate is valid for, `(not before, not after)` in seconds since the epoch. `None`
+/// for one that cannot be read.
+pub fn validity(der: &[u8]) -> Option<(i64, i64)> {
+    let (_, cert) = parse_x509_certificate(der).ok()?;
+    let valid = cert.validity();
+    Some((valid.not_before.timestamp(), valid.not_after.timestamp()))
 }
 
 /// Whether the certificate name `name` answers for `host`: the same name, or a wildcard in the
@@ -44,7 +52,7 @@ pub fn covers_all(der: &[u8], hosts: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rcgen::{CertificateParams, KeyPair};
+    use rcgen::{CertificateParams, KeyPair, date_time_ymd};
 
     use super::*;
 
@@ -93,6 +101,18 @@ mod tests {
         ] {
             assert!(!covers_all(&der, &lacking), "{lacking:?}");
         }
+    }
+
+    #[test]
+    fn a_certificate_says_when_it_is_valid() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["shop.example.com".to_owned()]).unwrap();
+        params.not_before = date_time_ymd(2026, 12, 1);
+        params.not_after = date_time_ymd(2027, 3, 1);
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        // Midnight UTC of the first of December 2026 and of March 2027: 90 days.
+        assert_eq!(validity(&der), Some((1_796_083_200, 1_803_859_200)));
+        assert_eq!(validity(b"not a certificate"), None);
     }
 
     #[test]

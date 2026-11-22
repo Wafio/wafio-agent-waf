@@ -103,8 +103,9 @@ impl Agent {
         self.orders.wake.notified().await;
     }
 
-    /// The order to start next, if one is due. A started order is reported `pending`.
-    pub(crate) fn next_order(&self, now: i64) -> Option<NextOrder> {
+    /// The order to start next, if one is due, when the authority at `directory` is the one the
+    /// agent orders from. A started order is reported `pending`. Blocking: it may write.
+    pub(crate) fn next_order(&self, now: i64, directory: &str) -> Option<NextOrder> {
         let mut guard = self.lock();
         let st = &mut *guard;
         if st.closed {
@@ -114,11 +115,19 @@ impl Agent {
             return Some(NextOrder::Wait(None));
         }
         let keys = st.tls.as_mut()?;
-        let next = keys.next_order(now);
+        let next = keys.next_order(now, directory);
         if let (NextOrder::Order(job), Some(out)) = (&next, &self.statuses) {
             out.changed(keys.statuses(Some(&job.app_id)));
         }
         Some(next)
+    }
+
+    /// Notes the start of the order of `job` in the state file, before the authority is asked
+    /// anything; see `Keys::begin_attempt`. Blocking: it writes.
+    pub(crate) fn begin_attempt(&self, job: &Job, now: i64) -> Result<(), String> {
+        let mut guard = self.lock();
+        let keys = guard.tls.as_mut().ok_or("there is no key directory")?;
+        keys.begin_attempt(job, now)
     }
 
     /// An order ended on an internal error while it was taken in; see `Keys::stop_order`.

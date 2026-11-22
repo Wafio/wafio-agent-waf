@@ -475,7 +475,7 @@ pub async fn run_waf_agent(
         None
     } else {
         let reg = wafio_agent_io::metrics::Registry::new();
-        crate::metrics::register_agent_metrics(&reg, link.clone());
+        crate::metrics::register_agent_metrics(&reg, link.clone(), &agent.tls_metrics());
         let ln = match metrics_inherited {
             Some(s) => {
                 s.set_nonblocking(true).map_err(|e| e.to_string())?;

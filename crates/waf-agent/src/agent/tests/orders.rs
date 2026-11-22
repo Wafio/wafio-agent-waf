@@ -6,13 +6,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use wafio_proxy::cert_store::{BookEntry, leaf_sha256};
+use wafio_proxy::cert_store::{BookEntry, chain_pem, leaf_sha256};
 
 use super::*;
 use crate::tls::acme::ACCOUNT_FILE;
 use crate::tls::acme::Kind;
 use crate::tls::acme::ca::CaError;
-use crate::tls::acme::mock::{ACCOUNT_KEY, Issue, MockCa, Step};
+use crate::tls::acme::mock::{ACCOUNT_KEY, Issue, MockCa, Step, dated_pair};
 use crate::tls::acme::names::dns_names;
 use crate::tls::acme::order::Job;
 use crate::tls::state_file::{STATE_FILE, StateFile};
@@ -20,7 +20,8 @@ use crate::tls::state_file::{STATE_FILE, StateFile};
 const BASE: i64 = 1_800_000_000;
 const DIRECTORY: &str = "https://ca.test/directory";
 const HOST: &str = "shop.example.com";
-const RATE_LIMITED: &str = "urn:ietf:params:acme:error:rateLimited";
+const RATE_LIMITED: &str = crate::tls::acme::wait::RATE_LIMITED;
+const CONNECTION: &str = "urn:ietf:params:acme:error:connection";
 
 thread_local! {
     static ORIGIN: tokio::time::Instant = tokio::time::Instant::now();
@@ -152,6 +153,9 @@ impl Rig {
     }
 
     fn start_at(&self, directory: &str) {
+        // The clock counts from its first reading, so a test that moves the time before the
+        // worker has read it would move nothing.
+        let _ = clock();
         self.agent
             .start_acme_with(Arc::new(self.ca.clone()), directory.into(), clock);
     }
@@ -445,6 +449,7 @@ async fn the_account_is_taken_from_its_file_after_a_restart_and_made_again_for_a
 const A: &str = "1a2b3c4d-0000-4000-8000-00000000000a";
 const B: &str = "1a2b3c4d-0000-4000-8000-00000000000b";
 const C: &str = "1a2b3c4d-0000-4000-8000-00000000000c";
+const D: &str = "1a2b3c4d-0000-4000-8000-00000000001d";
 /// The apps of the two tests that make the code panic through the log, one each: the needles
 /// are shared by every test thread, so a needle must match the lines of one test only.
 const PANICS_ONCE: &str = "1a2b3c4d-0000-4000-8000-00000000000d";
@@ -679,8 +684,9 @@ async fn a_failed_order_is_reported_failed_and_the_next_one_waits_ten_minutes_wi
     r.ca.script().fail = Some((
         Step::Finalize,
         CaError {
-            problem: Some(RATE_LIMITED.into()),
-            text: "too many certificates".into(),
+            problem: Some(CONNECTION.into()),
+            text: "cannot reach the validation address".into(),
+            retry_after: None,
         },
     ));
     r.start();
@@ -691,7 +697,9 @@ async fn a_failed_order_is_reported_failed_and_the_next_one_waits_ten_minutes_wi
     let status = r.status(SHOP);
     assert_eq!(
         status.error,
-        format!("the order failed (tls-alpn-01): {RATE_LIMITED}: too many certificates")
+        format!(
+            "the order failed (tls-alpn-01): {CONNECTION}: cannot reach the validation address"
+        )
     );
     assert!(
         (BASE + 600..BASE + 620).contains(&status.next_attempt_unix),
@@ -1203,6 +1211,7 @@ async fn an_authority_that_does_not_know_the_account_gets_a_new_one_for_the_next
         CaError {
             problem: Some(crate::tls::acme::account::ACCOUNT_UNKNOWN.into()),
             text: "no account here".into(),
+            retry_after: None,
         },
     ));
     r.start();
@@ -1626,4 +1635,597 @@ async fn the_placeholder_is_not_made_again_while_the_hosts_are_the_same() {
         dns_names(third.key.cert[0].as_ref()),
         [HOST, "www.example.com"]
     );
+}
+
+// Renewal, backoff, the authority's wait, and an order that is cut short.
+
+/// A key directory whose `state.json` says `state` and that holds these files.
+fn seeded_with(state: &str, files: &[(&str, &[u8])]) -> Arc<Scratch> {
+    let dir = seeded(state);
+    for (name, bytes) in files {
+        let path = dir.dir().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    dir
+}
+
+/// The record of an app that was served `acme-<app>.pem` by the order of request id `r1`, from
+/// the authority at `directory`.
+fn record_of_issued(app: &str, directory: &str) -> String {
+    format!(
+        r#"{{"served":"acme-{app}.pem","request_id":"r1","directory":"{directory}","worked":"tls-alpn-01"}}"#
+    )
+}
+
+/// The record of an app whose order for `host` failed and that waits until `at`.
+fn record_of_failed(host: &str, at: i64) -> String {
+    format!(
+        r#"{{"request_id":"r1","failures":1,"tried":"tls-alpn-01","tried_hosts":["{host}"],"next_attempt_unix":{at},"error":"no"}}"#
+    )
+}
+
+/// What a process that is started finds: an order begins, or the app waits for its time. The wait
+/// is read from a failed status, which a process that counted a crash or read a failure gives at
+/// once.
+async fn begins_or_waits(r: &Rig) -> bool {
+    tokio::select! {
+        () = r.ca.reached.notified() => true,
+        () = until("the app waits", || r.status(SHOP).state == "failed") => false,
+    }
+}
+
+/// The process ends as a killed one does: nothing runs on, no hand-over is made, and the system
+/// takes the lock.
+fn kill(r: &Rig) {
+    r.agent.orders.stop();
+    r.agent.lock().tls = None;
+}
+
+fn metrics_text(r: &Rig) -> String {
+    let reg = wafio_agent_io::metrics::Registry::new();
+    r.agent.tls_metrics().register(&reg);
+    String::from_utf8(reg.write()).unwrap()
+}
+
+#[tokio::test]
+async fn the_first_request_to_the_authority_finds_the_start_of_the_order_in_the_state_file() {
+    let r = rig();
+    r.ca.script().watch = Some(r.dir.dir());
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the certificate is served", || r.issued(SHOP)).await;
+    until("it is taken in", || !r.ordering()).await;
+    let seen = r.ca.script().state_seen.clone();
+    assert!(seen.len() >= 2, "the account and the order: {seen:?}");
+    for text in &seen {
+        let state: StateFile = serde_json::from_str(text).expect("a state file was there");
+        let record = &state.apps[SHOP];
+        assert!(record.attempt_started >= BASE, "{text}");
+        assert_eq!(record.attempt_request_id, "r1", "{text}");
+    }
+    // The order is over: nothing is left unfinished.
+    let record = r.state().apps[SHOP].clone();
+    assert_eq!(
+        (
+            record.attempt_started,
+            record.attempt_request_id.as_str(),
+            record.interrupted
+        ),
+        (0, "", 0)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_unfinished_attempt_at_start_orders_again_at_once() {
+    let state = format!(
+        r#"{{"apps":{{"{SHOP}":{{"request_id":"r1","attempt_started":{},"attempt_request_id":"r1"}}}}}}"#,
+        BASE - 5
+    );
+    let mut r = rig_over(seeded(&state), None);
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the certificate is served", || r.issued(SHOP)).await;
+    until("it is taken in", || !r.ordering()).await;
+    assert_eq!(r.ca.script().orders.len(), 1);
+    assert!(
+        !r.told().contains(&pair("failed", "r1")),
+        "no failure is told of"
+    );
+    let record = r.state().apps[SHOP].clone();
+    assert_eq!(
+        (record.failures, record.interrupted, record.attempt_started),
+        (0, 0, 0)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_unfinished_attempt_in_a_row_is_a_failure_with_the_backoff_and_no_order() {
+    let state = format!(
+        r#"{{"apps":{{"{SHOP}":{{"request_id":"r1","attempt_started":{},"attempt_request_id":"r1","interrupted":1}}}}}}"#,
+        BASE - 5
+    );
+    let r = rig_over(seeded(&state), None);
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the failure is counted", || {
+        r.status(SHOP).state == "failed"
+    })
+    .await;
+    let status = r.status(SHOP);
+    assert_eq!(status.error, crate::tls::INTERRUPTED);
+    assert!((BASE + 600..BASE + 620).contains(&status.next_attempt_unix));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(r.ca.script().orders.is_empty(), "no order before its time");
+    let record = r.state().apps[SHOP].clone();
+    assert_eq!(
+        (
+            record.failures,
+            record.attempt_started,
+            record.request_id.as_str()
+        ),
+        (1, 0, "r1")
+    );
+    assert!(metrics_text(&r).contains("wafio_waf_acme_orders_total{result=\"failed\"} 1\n"));
+
+    // At its time the order is made, and ends as any other.
+    tokio::time::advance(Duration::from_secs(620)).await;
+    until("the order is made", || r.ca.script().orders.len() == 1).await;
+    until("the certificate is served", || r.issued(SHOP)).await;
+    until("it is taken in", || !r.ordering()).await;
+    assert_eq!(r.state().apps[SHOP].interrupted, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_process_that_is_killed_over_and_over_orders_twice_and_then_waits_for_its_backoff() {
+    let first = rig();
+    let (authority, dir) = (first.ca.clone(), first.dir.clone());
+    // An order never ends by itself: the process is killed while it runs.
+    authority.script().pause = Some((Step::WaitReady, Arc::new(Notify::new())));
+    let mut r = first;
+    let mut began = Vec::new();
+    for _ in 0..4 {
+        r.start();
+        r.apply(&[(SHOP, &[HOST], "r1")], 1);
+        began.push(begins_or_waits(&r).await);
+        kill(&r);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        r = rig_over(dir.clone(), Some(&authority));
+    }
+    assert_eq!(
+        began,
+        [true, true, false, false],
+        "two attempts, then the failure counts and the app waits"
+    );
+    assert_eq!(authority.script().orders.len(), 2);
+
+    // The restarts inside the wait order nothing. After it one order is made, and its end in a
+    // kill counts at once, with the next rung of the ladder.
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    assert!(!begins_or_waits(&r).await);
+    let at = r.status(SHOP).next_attempt_unix;
+    assert!((BASE + 610..BASE + 640).contains(&at), "{at}");
+    tokio::time::advance(Duration::from_secs(
+        u64::try_from(at - clock()).unwrap() + 1,
+    ))
+    .await;
+    until("the order is made at its time", || {
+        r.ca.script().orders.len() == 3
+    })
+    .await;
+    kill(&r);
+    r = rig_over(dir.clone(), Some(&authority));
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the second failure is counted", || {
+        r.state()
+            .apps
+            .get(SHOP)
+            .is_some_and(|rec| rec.failures == 2)
+    })
+    .await;
+    let status = r.status(SHOP);
+    assert!(
+        (clock() + 3590..clock() + 3610).contains(&status.next_attempt_unix),
+        "an hour: {} at {}",
+        status.next_attempt_unix,
+        clock()
+    );
+    assert_eq!(authority.script().orders.len(), 3);
+    assert_eq!(r.state().apps[SHOP].failures, 2);
+}
+
+#[tokio::test]
+async fn an_order_cut_short_by_a_hand_over_is_ordered_again_by_the_successor_as_no_crash() {
+    let x = rig();
+    x.ca.script().pause = Some((Step::WaitReady, Arc::new(Notify::new())));
+    x.start();
+    x.apply(&[(SHOP, &[HOST], "r1")], 1);
+    x.ca.reached.notified().await;
+    // The successor starts during the order and reads the note of its start.
+    let y = rig_over(x.dir.clone(), None);
+    y.ca.script().pause = Some((Step::WaitReady, Arc::new(Notify::new())));
+    y.start();
+    y.apply(&[(SHOP, &[HOST], "r1")], 1);
+    assert!(y.state().apps[SHOP].attempt_started != 0);
+
+    x.agent.close();
+    x.agent.release_keys();
+    assert!(y.agent.take_over_keys());
+    y.ca.reached.notified().await;
+    let record = y.state().apps[SHOP].clone();
+    assert_eq!(
+        (
+            record.interrupted,
+            record.failures,
+            record.next_attempt_unix
+        ),
+        (0, 0, 0),
+        "neither a crash nor a failure: the order is made again at once"
+    );
+    assert!(
+        record.attempt_started != 0,
+        "the successor's own order is noted"
+    );
+}
+
+#[tokio::test]
+async fn an_order_the_predecessor_ends_after_the_successor_read_its_note_is_adopted_and_not_ordered_again()
+ {
+    let x = rig();
+    let go = Arc::new(Notify::new());
+    x.ca.script().pause = Some((Step::Certificate, go.clone()));
+    x.start();
+    x.apply(&[(SHOP, &[HOST], "r1")], 1);
+    x.ca.reached.notified().await;
+    let mut y = rig_over(x.dir.clone(), None);
+    y.start();
+    y.apply(&[(SHOP, &[HOST], "r1")], 1);
+    go.notify_one();
+    until("the certificate is kept", || {
+        x.issued(SHOP) && !x.ordering()
+    })
+    .await;
+    served_without_a_second_order(&x, &mut y).await;
+    let record = y.state().apps[SHOP].clone();
+    assert_eq!(
+        (record.attempt_started, record.interrupted, record.failures),
+        (0, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn an_order_a_killed_predecessor_left_unfinished_counts_for_the_successor() {
+    let x = rig();
+    x.ca.script().pause = Some((Step::WaitReady, Arc::new(Notify::new())));
+    x.start();
+    x.apply(&[(SHOP, &[HOST], "r1")], 1);
+    x.ca.reached.notified().await;
+    let y = rig_over(x.dir.clone(), None);
+    y.ca.script().pause = Some((Step::WaitReady, Arc::new(Notify::new())));
+    y.start();
+    y.apply(&[(SHOP, &[HOST], "r1")], 1);
+    kill(&x);
+    assert!(y.agent.take_over_keys());
+    y.ca.reached.notified().await;
+    let record = y.state().apps[SHOP].clone();
+    assert_eq!(
+        (record.interrupted, record.failures),
+        (1, 0),
+        "counted once, and ordered again at once"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_certificate_is_renewed_when_a_third_of_its_lifetime_is_left_without_a_restart() {
+    // 90 days from 2026-12-01: a third is left from 2027-01-30 00:00 UTC.
+    let renew_at = 1_801_267_200;
+    let (pem, key) = dated_pair(&[HOST], (2026, 12, 1), (2027, 3, 1));
+    let leaf = leaf_sha256(&key);
+    let state = format!(
+        r#"{{"apps":{{"{SHOP}":{}}}}}"#,
+        record_of_issued(SHOP, DIRECTORY)
+    );
+    let mut r = rig_over(seeded_with(&state, &[(&acme_file(), &pem)]), None);
+    r.ca.script().validity = Some(((2027, 1, 30), (2027, 4, 30)));
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    assert_eq!(r.leaf(SHOP), leaf, "served from the first handshake");
+    assert_eq!(r.status(SHOP).state, "active");
+
+    // Not a second before.
+    let before = u64::try_from(renew_at - 1 - BASE).unwrap();
+    tokio::time::advance(Duration::from_secs(before)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        r.ca.script().orders.is_empty(),
+        "a second before it is time"
+    );
+    assert_eq!(r.status(SHOP).state, "active");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    until("the renewal is ordered", || r.ca.script().orders.len() == 1).await;
+    until("the new certificate is served", || {
+        r.issued(SHOP) && r.leaf(SHOP) != leaf
+    })
+    .await;
+    until("it is taken in", || !r.ordering()).await;
+    let status = r.status(SHOP);
+    assert_eq!(
+        (status.state.as_str(), status.next_attempt_unix),
+        ("active", 0)
+    );
+    assert_ne!(status.leaf_sha256, leaf);
+    assert_eq!(r.told().last(), Some(&pair("active", "r1")));
+    // The new certificate is 90 days long: it is not due again for a long while.
+    tokio::time::advance(Duration::from_secs(20 * 86_400)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(r.ca.script().orders.len(), 1);
+    assert!(metrics_text(&r).contains("wafio_waf_acme_orders_total{result=\"issued\"} 1\n"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_renewal_keeps_serving_the_old_certificate_and_reports_failed_with_its_chain() {
+    // Valid until 2027-01-01 and the clock is at 2027-01-15: it has expired.
+    let (pem, key) = dated_pair(&[HOST], (2026, 10, 1), (2027, 1, 1));
+    let (leaf, chain) = (leaf_sha256(&key), chain_pem(&key.cert));
+    let state = format!(
+        r#"{{"apps":{{"{SHOP}":{}}}}}"#,
+        record_of_issued(SHOP, DIRECTORY)
+    );
+    let r = rig_over(seeded_with(&state, &[(&acme_file(), &pem)]), None);
+    r.ca.script().fail = Some((Step::Finalize, CaError::new("the authority said no")));
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    assert_eq!(r.status(SHOP).state, "active", "in use, whatever its dates");
+    until("the renewal failed", || r.status(SHOP).state == "failed").await;
+    until("the failure is taken in", || !r.ordering()).await;
+
+    let status = r.status(SHOP);
+    assert_eq!(
+        status.error,
+        "the order failed (tls-alpn-01): the authority said no"
+    );
+    assert!((BASE + 600..BASE + 620).contains(&status.next_attempt_unix));
+    assert_eq!(
+        (status.leaf_sha256.as_str(), status.chain_pem.as_slice()),
+        (leaf.as_str(), chain.as_slice()),
+        "the old chain is described"
+    );
+    assert_eq!(r.leaf(SHOP), leaf, "and still served");
+    assert!(!r.book(SHOP).unwrap().placeholder);
+    assert!(r.files().contains(&acme_file()), "its file stays");
+
+    // The second try is an hour away, with the other challenge.
+    tokio::time::advance(Duration::from_secs(620)).await;
+    until("the second order", || r.ca.script().orders.len() == 2).await;
+    until("its failure is taken in", || !r.ordering()).await;
+    let status = r.status(SHOP);
+    assert!(
+        (clock() + 3590..clock() + 3610).contains(&status.next_attempt_unix),
+        "{}",
+        status.next_attempt_unix
+    );
+    assert_eq!(r.leaf(SHOP), leaf);
+    assert_eq!(r.state().apps[SHOP].failures, 2);
+
+    // The authority recovers: the third try replaces the certificate, and the failures are gone.
+    {
+        let mut script = r.ca.script();
+        script.fail = None;
+        script.validity = Some(((2027, 1, 15), (2027, 4, 15)));
+    }
+    tokio::time::advance(Duration::from_secs(3700)).await;
+    until("the new certificate is served", || r.leaf(SHOP) != leaf).await;
+    until("it is taken in", || !r.ordering()).await;
+    let status = r.status(SHOP);
+    assert_eq!(
+        (
+            status.state.as_str(),
+            status.error.as_str(),
+            status.next_attempt_unix
+        ),
+        ("active", "", 0)
+    );
+    let record = r.state().apps[SHOP].clone();
+    assert_eq!((record.failures, record.next_attempt_unix), (0, 0));
+
+    // Counted, and the series names the app and nothing else.
+    let text = metrics_text(&r);
+    assert!(
+        text.contains("wafio_waf_acme_orders_total{result=\"failed\"} 2\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("wafio_waf_acme_orders_total{result=\"issued\"} 1\n"),
+        "{text}"
+    );
+    let series: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("wafio_waf_tls_certificate_expiry_seconds{"))
+        .collect();
+    assert_eq!(series.len(), 1, "{text}");
+    assert!(series[0].starts_with(&format!(
+        "wafio_waf_tls_certificate_expiry_seconds{{app_id=\"{SHOP}\"}} "
+    )));
+}
+
+#[tokio::test(start_paused = true)]
+async fn renewals_and_backoffs_are_taken_in_the_order_of_their_time_and_the_statuses_name_it() {
+    // A and C are renewed (a third of 90 days is left at their times); B and D failed before.
+    let (a_pem, _) = dated_pair(&["a.example.com"], (2026, 12, 1), (2027, 3, 1));
+    let (c_pem, _) = dated_pair(&["c.example.com"], (2026, 12, 15), (2027, 3, 15));
+    let a_at = 1_801_267_200;
+    let c_at = 1_802_476_800;
+    let (b_at, d_at) = (BASE + 600, BASE + 1_000_000);
+    let state = format!(
+        r#"{{"apps":{{"{A}":{},"{B}":{},"{C}":{},"{D}":{}}}}}"#,
+        record_of_issued(A, DIRECTORY),
+        record_of_failed("b.example.com", b_at),
+        record_of_issued(C, DIRECTORY),
+        record_of_failed("d.example.com", d_at),
+    );
+    let r = rig_over(
+        seeded_with(
+            &state,
+            &[
+                (&format!("acme-{A}.pem"), &a_pem),
+                (&format!("acme-{C}.pem"), &c_pem),
+            ],
+        ),
+        None,
+    );
+    r.start();
+    r.apply(
+        &[
+            (A, &["a.example.com"], "r1"),
+            (B, &["b.example.com"], "r1"),
+            (C, &["c.example.com"], "r1"),
+            (D, &["d.example.com"], "r1"),
+        ],
+        1,
+    );
+    // What the statuses say is what the worker waits for.
+    let said = |app: &str| {
+        let status = r.status(app);
+        (status.state, status.next_attempt_unix)
+    };
+    assert_eq!(said(A), ("active".to_owned(), 0));
+    assert_eq!(said(B), ("failed".to_owned(), b_at));
+    assert_eq!(said(C), ("active".to_owned(), 0));
+    assert_eq!(said(D), ("failed".to_owned(), d_at));
+
+    let mut elapsed = 0;
+    for (n, (at, host)) in [
+        (b_at, "b.example.com"),
+        (d_at, "d.example.com"),
+        (a_at, "a.example.com"),
+        (c_at, "c.example.com"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before = u64::try_from(at - 1 - BASE - elapsed).unwrap();
+        tokio::time::advance(Duration::from_secs(before)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(r.ca.script().orders.len(), n, "a second before {host}");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        until("the next order", || r.ca.script().orders.len() == n + 1).await;
+        assert_eq!(r.ca.script().orders[n], [host]);
+        until("it is taken in", || !r.ordering()).await;
+        elapsed = at - BASE;
+    }
+    assert_eq!(r.ca.script().most_running, 1);
+    for app in [A, B, C, D] {
+        assert_eq!(r.status(app).state, "active", "{app}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_order_holds_every_request_id_until_the_time_the_authority_named() {
+    let r = rig();
+    {
+        let mut script = r.ca.script();
+        script.fail = Some((
+            Step::Finalize,
+            CaError {
+                problem: Some(RATE_LIMITED.into()),
+                text: "too many certificates already issued".into(),
+                retry_after: None,
+            },
+        ));
+        script.retry_after = Some("7200".into());
+    }
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    until("the order failed", || r.status(SHOP).state == "failed").await;
+    until("the failure is taken in", || !r.ordering()).await;
+    let status = r.status(SHOP);
+    assert!(
+        (BASE + 7200..BASE + 7220).contains(&status.next_attempt_unix),
+        "the later of the backoff and what the authority asked: {}",
+        status.next_attempt_unix
+    );
+    let record = r.state().apps[SHOP].clone();
+    assert_eq!(record.ca_wait_unix, status.next_attempt_unix);
+    assert!((BASE + 600..BASE + 620).contains(&record.next_attempt_unix));
+
+    // A new request id lifts the agent's backoff and not the authority's wait: it reports failed
+    // under the new id, with the same time.
+    r.ca.script().fail = None;
+    r.apply(&[(SHOP, &[HOST], "r2")], 2);
+    tokio::time::advance(Duration::from_secs(1000)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(r.ca.script().orders.len(), 1, "held back");
+    let held = r.status(SHOP);
+    assert_eq!(
+        (
+            held.state.as_str(),
+            held.request_id.as_str(),
+            held.next_attempt_unix
+        ),
+        ("failed", "r2", status.next_attempt_unix)
+    );
+    assert!(
+        held.error.contains("too many certificates"),
+        "{}",
+        held.error
+    );
+
+    // Not a second before the time, and an order for the new id at it.
+    let rest = status.next_attempt_unix - clock();
+    tokio::time::advance(Duration::from_secs(u64::try_from(rest - 1).unwrap())).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(r.ca.script().orders.len(), 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    until("the order for the new id", || {
+        r.ca.script().orders.len() == 2
+    })
+    .await;
+    until("the certificate is served", || r.issued(SHOP)).await;
+    until("it is taken in", || !r.ordering()).await;
+    let status = r.status(SHOP);
+    assert_eq!(
+        (
+            status.state.as_str(),
+            status.request_id.as_str(),
+            status.next_attempt_unix
+        ),
+        ("active", "r2", 0)
+    );
+    let record = r.state().apps[SHOP].clone();
+    assert_eq!((record.ca_wait_unix, record.failures), (0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_certificate_from_another_directory_is_ordered_again_and_served_until_it_is_replaced() {
+    // A year long, so no renewal is due: only the directory is.
+    let (pem, key) = dated_pair(&[HOST], (2026, 12, 1), (2027, 12, 1));
+    let (leaf, chain) = (leaf_sha256(&key), chain_pem(&key.cert));
+    let state = format!(
+        r#"{{"apps":{{"{SHOP}":{}}}}}"#,
+        record_of_issued(SHOP, "https://staging.ca.test/directory")
+    );
+    let mut r = rig_over(seeded_with(&state, &[(&acme_file(), &pem)]), None);
+    let go = Arc::new(Notify::new());
+    r.ca.script().pause = Some((Step::Certificate, go.clone()));
+    r.start();
+    r.apply(&[(SHOP, &[HOST], "r1")], 1);
+    r.ca.reached.notified().await;
+    // The old certificate is served and described while the new one is ordered.
+    assert_eq!(r.leaf(SHOP), leaf);
+    let status = r.status(SHOP);
+    assert_eq!(
+        (status.state.as_str(), status.chain_pem.as_slice()),
+        ("pending", chain.as_slice())
+    );
+    go.notify_one();
+    until("the new certificate is served", || r.leaf(SHOP) != leaf).await;
+    until("it is taken in", || !r.ordering()).await;
+    assert_eq!(r.state().apps[SHOP].directory, DIRECTORY);
+    assert_eq!(r.status(SHOP).state, "active");
+    assert_eq!(r.told().last(), Some(&pair("active", "r1")));
+    tokio::time::advance(Duration::from_secs(86_400)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(r.ca.script().orders.len(), 1, "once is enough");
 }

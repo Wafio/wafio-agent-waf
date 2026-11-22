@@ -34,6 +34,7 @@ impl From<instant_acme::Error> for CaError {
                     .detail
                     .clone()
                     .unwrap_or_else(|| problem.to_string()),
+                retry_after: None,
             },
             other => CaError::new(other.to_string()),
         }
@@ -85,6 +86,7 @@ impl Ca for InstantAcme {
         let unusable = || CaError {
             problem: Some(CREDENTIALS_UNUSABLE.to_owned()),
             text: "the kept account cannot be used".to_owned(),
+            retry_after: None,
         };
         let credentials: AccountCredentials =
             serde_json::from_slice(credentials).map_err(|_| unusable())?;
@@ -98,6 +100,10 @@ impl Ca for InstantAcme {
                 other => CaError::from(other),
             })?;
         Ok(Arc::new(CaAccount(account)))
+    }
+
+    fn retry_after(&self) -> Option<String> {
+        self.http.last_retry_after()
     }
 }
 
@@ -228,6 +234,7 @@ impl CaOrder {
                 return CaError {
                     problem: problem.r#type.clone(),
                     text: problem.detail.clone().unwrap_or_default(),
+                    retry_after: None,
                 };
             }
         }
@@ -350,6 +357,11 @@ mod tests {
                 format!("Location: {base}/account/1\r\n"),
                 r#"{"status":"valid"}"#.to_owned(),
             ),
+            ("POST", "/order") if order == "limited" => (
+                "429 Too Many Requests",
+                "Retry-After: 7200\r\n".to_owned(),
+                r#"{"type":"urn:ietf:params:acme:error:rateLimited","detail":"too many certificates already issued","status":429}"#.to_owned(),
+            ),
             ("POST", "/order") => (
                 "201 Created",
                 format!("Location: {base}/order/1\r\n"),
@@ -439,6 +451,24 @@ mod tests {
         // For each name one fetch and one refresh, and the fetch of the first one over.
         let asked = fake.count("POST /authz/");
         assert!(asked <= 2 * 2 + 1, "{asked} requests");
+    }
+
+    #[tokio::test]
+    async fn the_retry_after_of_a_rate_limited_answer_is_there_for_the_order_that_failed_on_it() {
+        let fake = Fake::start(1, "limited").await;
+        let ca = InstantAcme::new(Http::allowing_plain());
+        let (account, _) = ca.create_account(&fake.directory()).await.unwrap();
+        assert_eq!(ca.retry_after(), None, "the answers before it had none");
+        let e = account.new_order(&names(1)).await.err().expect("refused");
+        assert_eq!(e.problem.as_deref(), Some(super::super::wait::RATE_LIMITED));
+        assert_eq!(ca.retry_after().as_deref(), Some("7200"));
+        // What the schedule makes of it.
+        let until = super::super::wait::ca_wait_until(
+            e.problem.as_deref(),
+            ca.retry_after().as_deref(),
+            1_800_000_000,
+        );
+        assert_eq!(until, 1_800_000_000 + 7200);
     }
 
     fn unusable(e: &CaError) -> bool {

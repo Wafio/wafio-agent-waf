@@ -224,6 +224,7 @@ mod tests {
         ca.script().restore_error = Some(CaError {
             problem: Some(CREDENTIALS_UNUSABLE.into()),
             text: "the kept account cannot be used".into(),
+            retry_after: None,
         });
         accounts(&ca, &file, ONE).get().await.unwrap();
         assert_eq!(ca.script().restored.len(), 1, "it was tried");
