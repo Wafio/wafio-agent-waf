@@ -16,7 +16,8 @@ plane. It builds without a detection engine. The workspace needs a checkout of u
     scripts/ci-local.sh                                                   # the gate: must pass before a pull request
 
 The gate runs the secret scan, the notices and advisory checks, `cargo fmt --check`, `cargo clippy` with
-`-D warnings` and the tests. Fix what it reports; do not disable a check.
+`-D warnings`, the tests, and with docker the certificate orders against Pebble (`WAFIO_SKIP_ACME=1` skips that step). Fix what it
+reports; do not disable a check.
 
 ## Rules
 

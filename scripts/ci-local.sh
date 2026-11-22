@@ -52,3 +52,8 @@ cargo clippy --locked --workspace --all-targets --profile "$profile" --features 
 
 echo '== test'
 cargo test --locked --workspace --profile "$profile" --features wafio-waf-agent/test-tls
+
+# The agent against Pebble, the ACME test server (needs docker). test-acme-gate.sh checks the step on a host with no docker.
+echo '== acme'
+scripts/test-acme-gate.sh
+scripts/acme-gate.sh

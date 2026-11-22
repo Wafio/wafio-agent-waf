@@ -12,6 +12,10 @@
 #   WAFIO_PEBBLE_HTTP_PORT   the port Pebble connects to for an HTTP-01 validation
 #   WAFIO_PEBBLE_TLS_PORT    the port Pebble connects to for a TLS-ALPN-01 validation
 #   WAFIO_PEBBLE_RUN         the run directory, for `down`
+#   WAFIO_PEBBLE_VA_NOSLEEP, WAFIO_PEBBLE_VA_SLEEPTIME, WAFIO_PEBBLE_AUTHZREUSE
+#                            what this Pebble was started with (SLEEPTIME is empty when none was given), which is how a test
+#                            knows the Pebble it has: a case that needs random validation sleeps or a reused authorization
+#                            stops with a message when it is run against another one
 # Pebble connects to every name at 127.0.0.1: the DNS server answers all names with that address, and gives no IPv6 one.
 # The two validation ports are the ones the test's agent listens on; nothing here binds them, so each run notes its two in
 # its directory and the next run picks others.
@@ -143,6 +147,9 @@ JSON
       printf 'export WAFIO_PEBBLE_ROOT=%q\n' "$run/root.pem"
       printf 'export WAFIO_PEBBLE_HTTP_PORT=%q\n' "$http"
       printf 'export WAFIO_PEBBLE_TLS_PORT=%q\n' "$tls"
+      printf 'export WAFIO_PEBBLE_VA_NOSLEEP=%q\n' "${PEBBLE_VA_NOSLEEP:-1}"
+      printf 'export WAFIO_PEBBLE_VA_SLEEPTIME=%q\n' "${PEBBLE_VA_SLEEPTIME:-}"
+      printf 'export WAFIO_PEBBLE_AUTHZREUSE=%q\n' "${PEBBLE_AUTHZREUSE:-0}"
       trap - EXIT
       return 0
     fi
