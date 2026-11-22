@@ -507,8 +507,8 @@ impl Keys {
     /// handshake on in place of the placeholder or the certificate it replaces, and remembered in
     /// `state.json`. A new request id in the bundle does not drop it: the same hosts and source
     /// still ask for it, and the new id orders next. A certificate that is due for renewal the
-    /// moment it is kept is served too, and counts as a failed order, so the next one waits for
-    /// the backoff.
+    /// moment it is kept, or within a minute of it, is served too, and counts as a failed order,
+    /// so the next one waits for the backoff.
     ///
     /// The app counts as ordering until this is done, so `stop_order` can note an error in it.
     pub fn finish_order(
