@@ -22,14 +22,15 @@ test-tls = []
 test-cache-delay = []
 
 # These start the binary with a key directory of its own, which only a build with test-tls reads from the environment; the
-# control plane test also expects the Hello of an agent that has one, and holds cache writes back with test-cache-delay.
+# control plane test also expects the Hello of an agent that has one; the part of it that holds cache writes back needs
+# test-cache-delay as well and is left out of a build without it.
 [[test]]
 name = "tls_bundle"
 required-features = ["test-tls"]
 
 [[test]]
 name = "control_plane"
-required-features = ["test-tls", "test-cache-delay"]
+required-features = ["test-tls"]
 
 [dependencies]
 wafio-agent-io.workspace = true

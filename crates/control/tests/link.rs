@@ -30,10 +30,9 @@ fn read(name: &str) -> Vec<u8> {
 }
 
 /// The state directory of one test, in memory where the host has /dev/shm. The link writes the
-/// bundle cache with an fsync after it acks a bundle, off the stream, so a slow disk no longer holds
-/// the messages behind the bundle; the tests that read the cache still wait for it, and on tmpfs
-/// an fsync returns at once. The cache's own disk handling is tested in the crate's bundle cache
-/// tests.
+/// bundle cache with an fsync after it acks a bundle, off the stream. A test that reads the cache
+/// waits for the write, and on tmpfs the fsync returns at once, so the waits measure the link and
+/// not the host's disk. The cache's own disk handling is tested in the crate's bundle cache tests.
 fn tmpdir(tag: &str) -> PathBuf {
     let n = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -531,6 +530,8 @@ async fn stream_session_end_to_end() {
     }))
     .await;
     assert!(c.next_ack("u1").await.ok);
+    // A write for the command, if the link queued one, is finished before the file is read.
+    link.finish_cache_write().await;
     assert_eq!(
         load_bundle_cache(&state, &|_| Ok(())).unwrap().generation,
         7
@@ -1283,16 +1284,17 @@ async fn a_slow_cache_write_holds_back_neither_the_ack_of_a_bundle_nor_the_comma
     clean_up(&link, state).await;
 }
 
-/// Every line the link logs, from any thread: the cache writer logs from a thread of its own, which
-/// a subscriber set for one thread would miss.
+/// Every line the link logs at info or above, from any thread: the cache writer logs from a thread
+/// of its own, which a subscriber set for one thread would miss.
 fn logged_lines() -> &'static Mutex<Vec<String>> {
     static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static ONCE: std::sync::Once = std::sync::Once::new();
 
     struct Collect;
     impl tracing::Subscriber for Collect {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
+        // Only the lines of this crate: the frame events of h2, hyper and tonic would fill the list.
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.target().starts_with("wafio_control") && *meta.level() <= tracing::Level::INFO
         }
         fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
             tracing::span::Id::from_u64(1)
@@ -1365,4 +1367,61 @@ async fn a_failed_cache_write_is_logged_and_the_next_bundle_writes_again() {
     cached(&state, 2).await;
     task.abort();
     clean_up(&link, state).await;
+}
+
+/// A stop that cuts the stream while a bundle is still being applied. Dropping the runtime waits
+/// for the apply on its blocking thread, which then queues its cache write after every wait inside
+/// the runtime has returned: the wait that follows the drop is the one that gets the bundle on the
+/// disk.
+#[test]
+fn a_bundle_that_finishes_applying_after_the_stream_is_cut_is_cached_once_the_runtime_is_gone() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let state = tmpdir("cut-in-apply");
+    let slow_write: CacheWrite = Arc::new(
+        |dir: &Path, bundle: &[u8], generation: i64, now: SystemTime| {
+            std::thread::sleep(Duration::from_millis(300));
+            save_bundle_cache(dir, bundle, generation, now)
+        },
+    );
+    let file = state.join(BUNDLE_CACHE_FILE_NAME);
+    let link = rt.block_on(async {
+        let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+        let sink = Arc::new(Sink::default());
+        *sink.delay.lock().unwrap() = Duration::from_millis(1500);
+        let link = link_writing(
+            config(&addr, "localhost", "client", &state),
+            sink.clone(),
+            Arc::default(),
+            slow_write,
+        );
+        let task = link.start();
+        let mut c = next_conn(&mut conns).await;
+        hello(c.next().await.unwrap());
+        c.send(bundle_message("b1", 1)).await;
+        until("the apply to start", || {
+            sink.log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "apply 1 start")
+        })
+        .await;
+        task.abort();
+        // Nothing is queued yet, so this returns at once, as the one in the agent's shutdown does.
+        link.finish_cache_write().await;
+        assert!(!file.exists());
+        link
+    });
+    drop(rt);
+    link.finish_cache_write_blocking();
+    assert_eq!(
+        load_bundle_cache(&state, &|_| Ok(())).unwrap().generation,
+        1,
+        "the bundle that finished applying during the drop is on the disk"
+    );
+    std::fs::remove_dir_all(state).unwrap();
 }

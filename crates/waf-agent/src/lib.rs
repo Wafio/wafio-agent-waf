@@ -120,5 +120,10 @@ fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     let rt = wafio_proxy::runtime_builder()
         .build()
         .map_err(|e| e.to_string())?;
-    rt.block_on(run::run_waf_agent(f, metrics_addr, keys))
+    let res = rt.block_on(run::run_waf_agent(f, metrics_addr, keys));
+    // The drop waits for an apply on a blocking thread; the write that apply queues is waited for
+    // after it.
+    drop(rt);
+    run::finish_cache_write_blocking();
+    res
 }

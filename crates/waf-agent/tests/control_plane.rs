@@ -11,9 +11,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixDatagram;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -331,7 +331,7 @@ async fn agent_talks_to_the_control_plane() {
         format!("READY=1\nMAINPID={}\n", child.id())
     );
     // The ack does not wait for the cache write.
-    let cache = common::cached_bundle(&dir.join("state")).await;
+    let cache = common::cached_bundle(&dir.join("state"), 3).await;
     assert!(cache.contains("\"generation\":3"), "{cache}");
     let ok = tokio::task::spawn_blocking(move || get(listen, "/hello", ""))
         .await
@@ -515,206 +515,216 @@ async fn agent_talks_to_the_control_plane() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// How long the agent holds a cache write back in the tests below: longer than any of them needs
-/// to reach its signal, short enough to wait for.
-const HOLD_MS: u64 = 4000;
+/// The tests that hold the cache write back need the feature `test-cache-delay`; the one above runs
+/// without it.
+#[cfg(feature = "test-cache-delay")]
+mod held_writes {
+    use super::*;
+    use std::path::PathBuf;
+    use std::process::Child;
+    use std::time::SystemTime;
 
-fn bundle_json(listen: u16, up: u16, generation: i64) -> String {
-    format!(
-        r#"{{"agent_id":"cf4","project_id":"p","generation":{generation},"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block"}}]}}"#
-    )
-}
+    /// How long the agent holds a cache write back in the tests below: longer than any of them needs
+    /// to reach its signal, short enough to wait for.
+    const HOLD_MS: u64 = 4000;
 
-fn signal(pid: u32, name: &str) {
-    assert!(
-        Command::new("kill")
-            .args([name, &pid.to_string()])
-            .status()
-            .unwrap()
-            .success()
-    );
-}
-
-async fn next_conn(conns: &mut mpsc::UnboundedReceiver<Conn>) -> Conn {
-    tokio::time::timeout(Duration::from_secs(60), conns.recv())
-        .await
-        .expect("a connection")
-        .expect("the control plane runs")
-}
-
-/// The Hello that a new stream opens with.
-async fn hello_of(c: &mut Conn) -> Hello {
-    let Some(Out::Hello(h)) = c.next().await.kind else {
-        panic!("no Hello")
-    };
-    h
-}
-
-/// An agent that holds each cache write back for [`HOLD_MS`], with a stream to the fake control
-/// plane that has said Hello.
-struct Held {
-    dir: PathBuf,
-    notify: UnixDatagram,
-    child: Child,
-    _stop: KillOnDrop,
-    conns: mpsc::UnboundedReceiver<Conn>,
-    stream: Conn,
-    /// The generation the agent started from, 0 without a cache.
-    hello_generation: i64,
-    listen: u16,
-    up: u16,
-}
-
-/// `cached`: the generation of a cache the agent finds at start.
-async fn start_held(tag: &str, cached: Option<i64>) -> Held {
-    let dir = scratch(tag);
-    let (listen, up) = (common::free_port(), upstream());
-    if let Some(generation) = cached {
-        let bundle = bundle_json(listen, up, generation);
-        wafio_control::save_bundle_cache(
-            &dir.join("state"),
-            bundle.as_bytes(),
-            generation,
-            SystemTime::now(),
+    fn bundle_json(listen: u16, up: u16, generation: i64) -> String {
+        format!(
+            r#"{{"agent_id":"cf4","project_id":"p","generation":{generation},"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block"}}]}}"#
         )
-        .unwrap();
     }
-    let (cp, mut conns) = serve_fake(malware_snapshot()).await;
-    let notify_path = dir.join("notify.sock");
-    let notify = UnixDatagram::bind(&notify_path).unwrap();
-    notify
-        .set_read_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
-    let child = agent_command(&dir, &cp, &notify_path)
-        .env("WAFIO_TEST_CACHE_WRITE_DELAY_MS", HOLD_MS.to_string())
-        .spawn()
-        .unwrap();
-    let stop = KillOnDrop(child.id());
-    // The start probe, then the stream.
-    hello_of(&mut next_conn(&mut conns).await).await;
-    let mut stream = next_conn(&mut conns).await;
-    let hello_generation = hello_of(&mut stream).await.bundle_generation;
-    Held {
-        dir,
-        notify,
-        child,
-        _stop: stop,
-        conns,
-        stream,
-        hello_generation,
-        listen,
-        up,
-    }
-}
 
-impl Held {
-    /// Sends the bundle of `generation` and waits for its ack. The cache write is held back, so
-    /// the ack is all there is to see of the bundle.
-    async fn send_bundle(&mut self, generation: i64) -> CommandAck {
-        let bundle = bundle_json(self.listen, self.up, generation);
-        self.stream
-            .out
-            .send(Ok(ServerMessage {
-                kind: Some(In::Bundle(BundleUpdate {
-                    command_id: "b".into(),
-                    generation,
-                    bundle_json: bundle.into_bytes(),
-                })),
-            }))
+    fn signal(pid: u32, name: &str) {
+        assert!(
+            Command::new("kill")
+                .args([name, &pid.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    async fn next_conn(conns: &mut mpsc::UnboundedReceiver<Conn>) -> Conn {
+        tokio::time::timeout(Duration::from_secs(60), conns.recv())
             .await
+            .expect("a connection")
+            .expect("the control plane runs")
+    }
+
+    /// The Hello that a new stream opens with.
+    async fn hello_of(c: &mut Conn) -> Hello {
+        let Some(Out::Hello(h)) = c.next().await.kind else {
+            panic!("no Hello")
+        };
+        h
+    }
+
+    /// An agent that holds each cache write back for [`HOLD_MS`], with a stream to the fake control
+    /// plane that has said Hello.
+    struct Held {
+        dir: PathBuf,
+        notify: UnixDatagram,
+        child: Child,
+        _stop: KillOnDrop,
+        conns: mpsc::UnboundedReceiver<Conn>,
+        stream: Conn,
+        /// The generation the agent started from, 0 without a cache.
+        hello_generation: i64,
+        listen: u16,
+        up: u16,
+    }
+
+    /// `cached`: the generation of a cache the agent finds at start.
+    async fn start_held(tag: &str, cached: Option<i64>) -> Held {
+        let dir = scratch(tag);
+        let (listen, up) = (common::free_port(), upstream());
+        if let Some(generation) = cached {
+            let bundle = bundle_json(listen, up, generation);
+            wafio_control::save_bundle_cache(
+                &dir.join("state"),
+                bundle.as_bytes(),
+                generation,
+                SystemTime::now(),
+            )
             .unwrap();
-        loop {
-            if let Some(Out::Ack(a)) = self.stream.next().await.kind
-                && a.command_id == "b"
-            {
-                return a;
-            }
+        }
+        let (cp, mut conns) = serve_fake(malware_snapshot()).await;
+        let notify_path = dir.join("notify.sock");
+        let notify = UnixDatagram::bind(&notify_path).unwrap();
+        notify
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let child = agent_command(&dir, &cp, &notify_path)
+            .env("WAFIO_TEST_CACHE_WRITE_DELAY_MS", HOLD_MS.to_string())
+            .spawn()
+            .unwrap();
+        let stop = KillOnDrop(child.id());
+        // The start probe, then the stream.
+        hello_of(&mut next_conn(&mut conns).await).await;
+        let mut stream = next_conn(&mut conns).await;
+        let hello_generation = hello_of(&mut stream).await.bundle_generation;
+        Held {
+            dir,
+            notify,
+            child,
+            _stop: stop,
+            conns,
+            stream,
+            hello_generation,
+            listen,
+            up,
         }
     }
 
-    fn cache_file(&self) -> PathBuf {
-        self.dir.join("state/last-bundle.json")
+    impl Held {
+        /// Sends the bundle of `generation` and waits for its ack. The cache write is held back, so
+        /// the ack is all there is to see of the bundle.
+        async fn send_bundle(&mut self, generation: i64) -> CommandAck {
+            let bundle = bundle_json(self.listen, self.up, generation);
+            self.stream
+                .out
+                .send(Ok(ServerMessage {
+                    kind: Some(In::Bundle(BundleUpdate {
+                        command_id: "b".into(),
+                        generation,
+                        bundle_json: bundle.into_bytes(),
+                    })),
+                }))
+                .await
+                .unwrap();
+            loop {
+                if let Some(Out::Ack(a)) = self.stream.next().await.kind
+                    && a.command_id == "b"
+                {
+                    return a;
+                }
+            }
+        }
+
+        fn cache_file(&self) -> PathBuf {
+            self.dir.join("state/last-bundle.json")
+        }
     }
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bundle_that_was_acked_is_cached_before_the_agent_ends() {
-    let mut h = start_held("end", None).await;
-    let ack = h.send_bundle(4).await;
-    assert!(ack.ok, "{}", ack.error);
-    assert!(
-        !h.cache_file().exists(),
-        "the ack came before the write, which is held back"
-    );
-    signal(h.child.id(), "-TERM");
-    let mut child = h.child;
-    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
-        .await
-        .unwrap();
-    assert!(status.success(), "{status:?}");
-    let cache = std::fs::read_to_string(h.dir.join("state/last-bundle.json"))
-        .expect("the write was finished before the agent ended");
-    assert!(cache.contains("\"generation\":4"), "{cache}");
-    let _ = std::fs::remove_dir_all(&h.dir);
-}
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bundle_that_was_acked_is_cached_before_the_agent_ends() {
+        let mut h = start_held("end", None).await;
+        let ack = h.send_bundle(4).await;
+        assert!(ack.ok, "{}", ack.error);
+        assert!(
+            !h.cache_file().exists(),
+            "the ack came before the write, which is held back"
+        );
+        signal(h.child.id(), "-TERM");
+        let mut child = h.child;
+        let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+            .await
+            .unwrap();
+        assert!(status.success(), "{status:?}");
+        let cache = std::fs::read_to_string(h.dir.join("state/last-bundle.json"))
+            .expect("the write was finished before the agent ended");
+        assert!(cache.contains("\"generation\":4"), "{cache}");
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_successor_starts_from_the_bundle_its_predecessor_acked() {
-    let mut h = start_held("successor", None).await;
-    let ack = h.send_bundle(4).await;
-    assert!(ack.ok, "{}", ack.error);
-    assert!(
-        !h.cache_file().exists(),
-        "the ack came before the write, which is held back"
-    );
-    let mut buf = [0u8; 128];
-    h.notify.recv(&mut buf).expect("READY after the bundle");
-    signal(h.child.id(), "-USR2");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_successor_starts_from_the_bundle_its_predecessor_acked() {
+        let mut h = start_held("successor", None).await;
+        let ack = h.send_bundle(4).await;
+        assert!(ack.ok, "{}", ack.error);
+        assert!(
+            !h.cache_file().exists(),
+            "the ack came before the write, which is held back"
+        );
+        let mut buf = [0u8; 128];
+        h.notify.recv(&mut buf).expect("READY after the bundle");
+        signal(h.child.id(), "-USR2");
 
-    // The successor's start probe, then its stream, which carries the generation it started from.
-    hello_of(&mut next_conn(&mut h.conns).await).await;
-    let mut stream = next_conn(&mut h.conns).await;
-    assert_eq!(
-        hello_of(&mut stream).await.bundle_generation,
-        4,
-        "the successor started from the bundle the predecessor had acked"
-    );
-    let n = h.notify.recv(&mut buf).expect("the successor's READY");
-    let second: u32 = std::str::from_utf8(&buf[..n])
-        .unwrap()
-        .strip_prefix("READY=1\nMAINPID=")
-        .and_then(|r| r.trim_end().parse().ok())
-        .expect("MAINPID");
-    let _stop_successor = KillOnDrop(second);
-    let mut child = h.child;
-    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
-        .await
-        .unwrap();
-    assert!(status.success(), "predecessor: {status:?}");
-    let _ = std::fs::remove_dir_all(&h.dir);
-}
+        // The successor's start probe, then its stream, which carries the generation it started from.
+        hello_of(&mut next_conn(&mut h.conns).await).await;
+        let mut stream = next_conn(&mut h.conns).await;
+        assert_eq!(
+            hello_of(&mut stream).await.bundle_generation,
+            4,
+            "the successor started from the bundle the predecessor had acked"
+        );
+        let n = h.notify.recv(&mut buf).expect("the successor's READY");
+        let second: u32 = std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .strip_prefix("READY=1\nMAINPID=")
+            .and_then(|r| r.trim_end().parse().ok())
+            .expect("MAINPID");
+        let _stop_successor = KillOnDrop(second);
+        let mut child = h.child;
+        let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+            .await
+            .unwrap();
+        assert!(status.success(), "predecessor: {status:?}");
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_crash_between_the_ack_and_the_cache_write_leaves_the_earlier_cache_readable() {
-    let mut h = start_held("crash", Some(3)).await;
-    assert_eq!(h.hello_generation, 3, "the agent started from the cache");
-    let ack = h.send_bundle(4).await;
-    assert!(ack.ok, "{}", ack.error);
-    // No handler runs: an out-of-memory kill or a power cut.
-    h.child.kill().unwrap();
-    h.child.wait().unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crash_between_the_ack_and_the_cache_write_leaves_the_earlier_cache_readable() {
+        let mut h = start_held("crash", Some(3)).await;
+        assert_eq!(h.hello_generation, 3, "the agent started from the cache");
+        let ack = h.send_bundle(4).await;
+        assert!(ack.ok, "{}", ack.error);
+        // No handler runs: an out-of-memory kill or a power cut.
+        h.child.kill().unwrap();
+        h.child.wait().unwrap();
 
-    let state = h.dir.join("state");
-    let cached = wafio_control::load_bundle_cache(&state, &|_| Ok(()))
-        .expect("the cache the agent started from is still readable");
-    assert_eq!(cached.generation, 3);
-    let names: Vec<String> = std::fs::read_dir(&state)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert!(
-        names.iter().all(|n| !n.starts_with(".last-bundle-")),
-        "no half-written file stays: {names:?}"
-    );
-    let _ = std::fs::remove_dir_all(&h.dir);
+        let state = h.dir.join("state");
+        let cached = wafio_control::load_bundle_cache(&state, &|_| Ok(()))
+            .expect("the cache the agent started from is still readable");
+        assert_eq!(cached.generation, 3);
+        let names: Vec<String> = std::fs::read_dir(&state)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.starts_with(".last-bundle-")),
+            "no half-written file stays: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
 }

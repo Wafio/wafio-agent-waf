@@ -118,8 +118,8 @@ directory that the user they run as owns (the fixed path needs the user of the u
 are built only with it. No release build enables it.
 
 The feature `test-cache-delay` makes the agent wait `WAFIO_TEST_CACHE_WRITE_DELAY_MS` milliseconds before it writes the bundle
-cache, so that `tests/control_plane.rs` can signal an agent while a write is pending; that file is built only with it too, and
-no release build enables it.
+cache, so that the last tests of `tests/control_plane.rs` can signal an agent while a write is pending; those tests are built
+only with it, and no release build enables it.
 
 Pebble is the ACME test server of Let's Encrypt. The tests of `tests/tls_bundle.rs` named `pebble_*` have the real binary order
 certificates from it, with a fake control plane. They cover TLS-ALPN-01 and HTTP-01 (on the redirect listener, and on the HTTPS listener
@@ -455,9 +455,11 @@ the control plane is down still serves the protected applications, and the chall
 The agent acks a bundle once it is applied and writes the file after that, on a thread of its own (temp file, fsync, rename).
 A slow disk therefore does not hold up the commands that come after the bundle. A bundle that arrives while a write runs
 replaces one that is still waiting, so the file never goes back to an older bundle. A successor and the next start read the
-file, so the agent finishes a pending write before it starts a successor and before it ends. If the process dies between the
-ack and the write, the file still holds the bundle before it, and the control plane sends the current one when the agent
-connects again.
+file, so the agent finishes the pending writes before it starts a successor and before it ends. That wait covers the bundles
+queued when it starts, so a control plane that keeps sending bundles cannot hold a reload or a stop. A stop that cuts a bundle
+apply short waits once more, after that apply has ended, for the write the apply queued. If the process dies between the ack
+and the write, the file still holds the bundle before it, and the control plane sends the current one when the agent connects
+again.
 
 systemd: the unit is wafio-release `deploy/systemd/wafio-waf-agent.service`, the only copy.
 It is `Type=notify`, `NotifyAccess=all`, runs the binary from

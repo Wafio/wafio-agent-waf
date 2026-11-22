@@ -23,21 +23,23 @@ pub fn free_port() -> u16 {
     port
 }
 
-/// The text of `<state>/last-bundle.json` once the file is there. The agent acks a bundle before
-/// it writes the cache, so a test that reads the cache waits for it; the file appears whole, as
-/// the write renames it into place.
-pub async fn cached_bundle(state: &Path) -> String {
+/// The text of `<state>/last-bundle.json` once it holds `generation` or a later one. The agent acks
+/// a bundle before it writes the cache, and an older file would pass a check the newer one fails.
+pub async fn cached_bundle(state: &Path, generation: i64) -> String {
     let file = state.join("last-bundle.json");
     let end = Instant::now() + Duration::from_secs(60);
     loop {
-        match std::fs::read_to_string(&file) {
-            Ok(text) => return text,
-            Err(e) => assert!(
-                Instant::now() < end,
-                "{} not written within a minute: {e}",
-                file.display()
-            ),
+        if let Ok(cached) = wafio_control::load_bundle_cache(state, &|_| Ok(()))
+            && cached.generation >= generation
+            && let Ok(text) = std::fs::read_to_string(&file)
+        {
+            return text;
         }
+        assert!(
+            Instant::now() < end,
+            "generation {generation} not in {} within a minute",
+            file.display()
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

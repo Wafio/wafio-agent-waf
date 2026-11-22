@@ -117,6 +117,15 @@ pub fn test_hooks() -> Hooks {
     }
 }
 
+/// Waits for the queued bundle cache write once the runtime is gone. An apply that ran when the
+/// stream was cut finishes during the runtime drop, after the last wait in [`run_waf_agent`], and
+/// the end of the process does not wait for the writer thread.
+pub(crate) fn finish_cache_write_blocking() {
+    if let Some(link) = LINK.get() {
+        link.finish_cache_write_blocking();
+    }
+}
+
 /// How the link writes the bundle cache.
 #[cfg(not(feature = "test-cache-delay"))]
 fn cache_write() -> CacheWrite {

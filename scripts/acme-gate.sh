@@ -39,7 +39,7 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
 fi
 
 profile=${WAFIO_CARGO_PROFILE:-conformance}
-cargo_test=(cargo test --locked --workspace --profile "$profile" --features wafio-waf-agent/test-tls --test tls_bundle)
+cargo_test=(cargo test --locked --workspace --profile "$profile" --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay --test tls_bundle)
 
 # What is up and not yet taken down: the output of `pebble.sh up` of the Pebble that runs, and the pid of the cargo run against
 # it. Each is set as soon as the command that makes it returns, and a signal waits for that, so the clean-up always sees it.
