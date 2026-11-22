@@ -1,7 +1,9 @@
 //! The WAF agent's mTLS gRPC stream to the control plane (`AgentControl.Stream`). Its state lives
 //! in one [`ControlLink`] per process.
 
-use crate::bundle_cache::{BUNDLE_SOURCE_LIVE, CacheStart, CachedBundle};
+use crate::bundle_cache::{
+    BUNDLE_SOURCE_LIVE, CacheStart, CacheWrite, CacheWriter, CachedBundle, save_bundle_cache,
+};
 use crate::bundle_puller::{BundleError, BundleProbe, BundleSink, is_management_only};
 use crate::certificates::{AckCode, CertificateSink, run_install};
 use crate::grpc_reconnect::{
@@ -316,12 +318,19 @@ pub struct ControlLink {
     /// Orders the applies and retries of bundles, the cached one at start included, so a retry
     /// never lands after a newer bundle.
     bundle_retry: Arc<BundleRetry>,
+    /// Writes the bundle cache after the bundle is acked.
+    pub(crate) cache_writer: CacheWriter,
 }
 
 impl ControlLink {
     /// Arms the link and starts the decision drainer and the certificate status task. Call inside
     /// a Tokio runtime, before the proxy emits decisions.
     pub fn new(cfg: ControlConfig, hooks: Hooks) -> Arc<Self> {
+        Self::with_cache_write(cfg, hooks, Arc::new(save_bundle_cache))
+    }
+
+    /// [`ControlLink::new`] with `write` as the way a bundle reaches the cache directory.
+    pub fn with_cache_write(cfg: ControlConfig, hooks: Hooks, write: CacheWrite) -> Arc<Self> {
         let (status_wake, status_wake_rx) = mpsc::channel(1);
         let link = Arc::new(ControlLink {
             control_config: Mutex::new(cfg),
@@ -334,6 +343,7 @@ impl ControlLink {
             statuses: Mutex::new(BTreeMap::new()),
             status_wake,
             bundle_retry: Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX)),
+            cache_writer: CacheWriter::new(write),
         });
         (link.hooks.on_dial)(&link.config().server_address);
         if let Some(rx) = link.telemetry.rx.lock().unwrap().take() {
@@ -630,8 +640,9 @@ impl ControlLink {
         })
     }
 
-    /// Decodes and applies a bundle update, and on success records the generation, the
-    /// provenance and the cache. Returns whether and how a later attempt could succeed.
+    /// Decodes and applies a bundle update, and on success records the generation and the
+    /// provenance and queues the cache write. Returns whether and how a later attempt could
+    /// succeed.
     pub(crate) fn apply_bundle_update(&self, bu: &BundleUpdate) -> (Retry, Result<(), String>) {
         let probe = match BundleProbe::parse(&bu.bundle_json) {
             Ok(p) => p,
@@ -666,7 +677,7 @@ impl ControlLink {
         if !probe.management_only {
             *self.last_gen.lock().unwrap() = generation;
             self.set_bundle_status(BUNDLE_SOURCE_LIVE, generation);
-            self.save_applied_bundle(&bu.bundle_json, generation);
+            self.queue_applied_bundle(&bu.bundle_json, generation);
         }
         (Retry::No, Ok(()))
     }
@@ -1641,6 +1652,8 @@ mod tests {
         );
         assert_eq!(l.bundle_status(), ("live".to_string(), 9));
         task.abort();
+        // The live bundle's cache write runs on its own thread: wait for it before the directory goes.
+        l.cache_writer.finish();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

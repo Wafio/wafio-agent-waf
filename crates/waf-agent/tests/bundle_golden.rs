@@ -13,6 +13,9 @@ use wafio_waf_agent::executor::{Stores, startup_executor};
 use wafio_waf_agent::ready::{Ready, ReadyActions};
 use wafio_waf_agent::tls::dir::KeyDir;
 
+mod common;
+use common::free_port;
+
 fn exec_dump(e: &wafio_proxy::AppAnalysisSetup) -> Value {
     let c = &e.analyze;
     let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
@@ -100,15 +103,12 @@ fn state(a: &Agent, p: &wafio_proxy::Proxy, prev: &mut Prev) -> Value {
 const FIXTURE_PORTS: [&str; 5] = ["41871", "41872", "41873", "41874", "41875"];
 
 /// Free loopback ports standing in for [`FIXTURE_PORTS`]: a fixed port failed the test with
-/// "failed to bind WAF route listener" whenever another run on the host held it.
+/// "failed to bind WAF route listener" whenever another run on the host held it. They stay
+/// reserved until the process ends, so no other test takes one before the proxy binds it.
 fn free_ports() -> Vec<String> {
     loop {
-        let held: Vec<_> = (0..FIXTURE_PORTS.len())
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        let ports: Vec<String> = held
-            .iter()
-            .map(|l| l.local_addr().unwrap().port().to_string())
+        let ports: Vec<String> = (0..FIXTURE_PORTS.len())
+            .map(|_| free_port().to_string())
             .collect();
         // A substituted number must not contain another fixture port.
         if !ports

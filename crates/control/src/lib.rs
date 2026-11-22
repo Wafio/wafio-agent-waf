@@ -16,8 +16,8 @@ mod waf_telemetry;
 
 pub use bundle_cache::{
     BUNDLE_CACHE_FILE_NAME, BUNDLE_SOURCE_CACHE, BUNDLE_SOURCE_CACHE_STALE, BUNDLE_SOURCE_LIVE,
-    CacheReadError, CacheStart, CachedBundle, DEFAULT_BUNDLE_CACHE_MAX_AGE, TempGuard, create_temp,
-    load_bundle_cache, save_bundle_cache,
+    CacheReadError, CacheStart, CacheWrite, CachedBundle, DEFAULT_BUNDLE_CACHE_MAX_AGE, TempGuard,
+    create_temp, load_bundle_cache, save_bundle_cache,
 };
 pub use bundle_puller::{BundleError, BundleProbe, BundleSink};
 pub use certificates::{AckCode, CertificateSink};

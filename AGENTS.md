@@ -11,9 +11,9 @@ plane. It builds without a detection engine. The workspace needs a checkout of u
 
 ## Commands
 
-    cargo build --release -p wafio-waf-agent                              # the agent, as wafio-waf-agent-open
-    cargo test --locked --workspace --features wafio-waf-agent/test-tls   # the tests
-    scripts/ci-local.sh                                                   # the gate: must pass before a pull request
+    cargo build --release -p wafio-waf-agent   # the agent, as wafio-waf-agent-open
+    scripts/ci-local.sh                        # the gate: must pass before a pull request
+    cargo test --locked --workspace --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay   # the tests
 
 The gate runs the secret scan, the notices and advisory checks, `cargo fmt --check`, `cargo clippy` with
 `-D warnings`, the tests, and with docker the certificate orders against Pebble (`WAFIO_SKIP_ACME=1` skips that step). Fix what it
