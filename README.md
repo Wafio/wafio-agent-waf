@@ -137,8 +137,7 @@ The gate ends with the step `acme` (`scripts/acme-gate.sh`): it starts a Pebble,
 and takes every Pebble it started down however it ends, a `kill` included. A gate that is killed with `kill -9` cannot, so the next
 `scripts/pebble.sh up` takes down the Pebble of a caller that is gone (the step names itself as the owner with `WAFIO_PEBBLE_OWNER`).
 `WAFIO_SKIP_ACME=1` skips the step and prints `acme: skipped`, and where docker is missing or cannot be used the step is skipped with a
-line that says so. Neither is allowed in the private gate, which `WAFIO_TARGET=private` marks, and so does a `CARGO_TARGET_DIR` inside a
-directory `wr/target-<name>`: there the step fails, so a green private gate always has the Pebble cases behind it. The step prints which
+line that says so. Neither is allowed in the private gate, which `WAFIO_TARGET=private` marks: there the step fails, so a green private gate always has the Pebble cases behind it. The step prints which
 gate it saw. `scripts/test-acme-gate.sh` checks all this with a PATH that has no docker and with stubs for the rest, at the start of the
 step. By hand, after `scripts/gen-test-certs.sh`:
 

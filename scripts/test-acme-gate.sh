@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Checks the step `acme` (scripts/acme-gate.sh) and the clean-up of scripts/pebble.sh without a Pebble:
-#   - on a host where docker is missing or cannot be used, which is made to look like through PATH: the private gate (by
-#     WAFIO_TARGET, or by a cargo directory <dir>/wr/target-<name>) fails and refuses WAFIO_SKIP_ACME=1, any other gate, a cargo
-#     directory that only has target- in its name included, skips and says why;
+#   - on a host where docker is missing or cannot be used, which is made to look like through PATH: the private gate
+#     (WAFIO_TARGET=private) fails and refuses WAFIO_SKIP_ACME=1, any other gate skips and says why, whatever its cargo directory;
 #   - with a stub docker, cargo and pebble.sh: a Pebble is taken down once when the cases pass or fail, and when the step is
 #     stopped by TERM while the Pebble starts or while the cases run, which also ends the cases;
 #   - pebble.sh up takes down the run of an owner that is gone and leaves the others.
@@ -38,8 +37,8 @@ for kind in missing unusable; do
   [ "$kind" = missing ] || printf '#!/bin/sh\nexit 1\n' >"$bin/docker"
   [ "$kind" = missing ] || chmod +x "$bin/docker"
 
-  # The private gate, as WAFIO_TARGET says and as the cargo directory of the remote runner says.
-  for private in WAFIO_TARGET=private CARGO_TARGET_DIR=/home/u/wr/target-ws; do
+  # The private gate, as WAFIO_TARGET says.
+  for private in WAFIO_TARGET=private; do
     gate "$private"
     [ "$status" != 0 ] || fail "$kind docker passed the private gate ($private)"
     case $output in *'docker'*) ;; *) fail "$kind docker: the failure does not name docker ($private)" ;; esac
@@ -51,8 +50,8 @@ for kind in missing unusable; do
     case $output in *'WAFIO_SKIP_ACME=1 is not allowed'*) ;; *) fail "$kind docker: no reason for the refusal ($private)" ;; esac
   done
 
-  # A cargo directory with target- in its name that is not under wr/ is a contributor's own, not the private gate.
-  for shared in 'CARGO_TARGET_DIR=/home/u/wr/target WAFIO_TARGET=shared' CARGO_TARGET_DIR=/home/u/target-cache/rust CARGO_TARGET_DIR=target-ws; do
+  # Only WAFIO_TARGET marks the private gate, whatever the cargo directory.
+  for shared in 'CARGO_TARGET_DIR=/home/u/wr/target WAFIO_TARGET=shared' CARGO_TARGET_DIR=/home/u/wr/target-ws CARGO_TARGET_DIR=target-ws; do
     # shellcheck disable=SC2086 # the words are separate variables on purpose
     gate $shared
     { [ "$status" = 0 ] && [ "${output#*'acme: shared gate'}" != "$output" ]; } || fail "$kind docker: the shared target ($shared)"
