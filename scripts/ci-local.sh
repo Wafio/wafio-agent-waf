@@ -50,8 +50,10 @@ cargo fmt --all --check
 echo '== clippy'
 cargo clippy --locked --workspace --all-targets --profile "$profile" --features wafio-waf-agent/test-tls -- -D warnings
 
+# The Pebble cases run in the step `acme`; a Pebble the caller's shell still points at (the README's by-hand flow leaves its variables)
+# must not make this step run them against a Pebble that is down.
 echo '== test'
-cargo test --locked --workspace --profile "$profile" --features wafio-waf-agent/test-tls
+env -u WAFIO_PEBBLE_DIRECTORY cargo test --locked --workspace --profile "$profile" --features wafio-waf-agent/test-tls
 
 # The agent against Pebble, the ACME test server (needs docker). test-acme-gate.sh checks the step on a host with no docker.
 echo '== acme'

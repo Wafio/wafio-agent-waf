@@ -133,10 +133,14 @@ has a name that starts with `pebble_reuse_`, and stops with a message when it ru
 its own gets a name prefix of its own and a second `up` in `scripts/acme-gate.sh`.
 
 The gate ends with the step `acme` (`scripts/acme-gate.sh`): it starts a Pebble, runs the cases against it, and starts another with
-`PEBBLE_AUTHZREUSE=100` for the `pebble_reuse_` cases. It takes about four minutes, and takes every Pebble it started down however it ends.
-`WAFIO_SKIP_ACME=1` skips it and prints `acme: skipped`. Where docker is missing or cannot be used the step is skipped with a line that
-says so, and under `WAFIO_TARGET=private` it fails. `scripts/test-acme-gate.sh` checks that with a PATH that has no docker, at the start of
-the step. By hand, after `scripts/gen-test-certs.sh`:
+`PEBBLE_AUTHZREUSE=100` for the `pebble_reuse_` cases. It takes about four minutes, holds the first run to 400 seconds and the second to 60,
+and takes every Pebble it started down however it ends, a `kill` included. A gate that is killed with `kill -9` cannot, so the next
+`scripts/pebble.sh up` takes down the Pebble of a caller that is gone (the step names itself as the owner with `WAFIO_PEBBLE_OWNER`).
+`WAFIO_SKIP_ACME=1` skips the step and prints `acme: skipped`, and where docker is missing or cannot be used the step is skipped with a
+line that says so. Neither is allowed in the private gate (`WAFIO_TARGET=private`, which is also what a cargo target directory named
+`target-<workspace>` stands for, as the remote runner gives no variable to the build host): there the step fails, so a green private gate
+always has the Pebble cases behind it. The step prints which gate it saw. `scripts/test-acme-gate.sh` checks all this with a PATH that has no
+docker and with stubs for the rest, at the start of the step. By hand, after `scripts/gen-test-certs.sh`:
 
 ```sh
 eval "$(scripts/pebble.sh up)"

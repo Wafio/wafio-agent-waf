@@ -25,6 +25,9 @@
 # Pebble as they are: PEBBLE_VA_NOSLEEP (default 1), PEBBLE_AUTHZREUSE (default 0), PEBBLE_VA_SLEEPTIME and any other
 # PEBBLE_*. PEBBLE_WFE_NONCEREJECT is always 0: a nonce Pebble refuses at random makes a run that cannot be repeated.
 #
+# A caller that sets WAFIO_PEBBLE_OWNER=<pid> for `up` owns the run: the next `up` takes it down once that process is gone, so a
+# caller that was killed with no chance to run `down` leaves a Pebble up only until then. A run with no owner stays until `down`.
+#
 # Needs docker (the user in the docker group), python3 and curl.
 set -euo pipefail
 
@@ -48,6 +51,17 @@ down() {
   rm -rf "$run"
 }
 
+# Takes down the runs whose owner is gone (see the header); a run with no owner, or an owner that is not a process number, stays.
+sweep() {
+  local dir owner
+  for dir in "$base"/run.*; do
+    [ -f "$dir/owner" ] || continue
+    read -r owner <"$dir/owner" || true
+    [[ $owner =~ ^[0-9]+$ ]] || continue
+    kill -0 "$owner" 2>/dev/null || down "$dir"
+  done
+}
+
 # What `up` has made, for the cleanup when it stops half way.
 run= box=
 undo() {
@@ -66,6 +80,7 @@ up() {
   # Ports are picked and the containers started with the lock held, so that the next run picks others.
   exec 9>"$base/lock"
   flock 9
+  sweep
   local ports directory management dns challenge http tls
   # Six ports, free on TCP and UDP, held until all are chosen.
   # The last two are the validation ports another live run has noted for itself, which are skipped.
@@ -99,6 +114,7 @@ PY
   )
   read -r directory management dns challenge http tls <<<"$ports"
   echo "$http $tls" >"$run/ports"
+  [ -z "${WAFIO_PEBBLE_OWNER:-}" ] || echo "$WAFIO_PEBBLE_OWNER" >"$run/owner"
 
   cat >"$run/pebble-config.json" <<JSON
 {
