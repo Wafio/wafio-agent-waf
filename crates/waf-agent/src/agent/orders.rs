@@ -104,8 +104,8 @@ impl Agent {
     }
 
     /// The order to start next, if one is due, when the authority at `directory` is the one the
-    /// agent orders from. A started order is reported `pending`, and so is whatever the look
-    /// changed: a crash loop counted as a failure, a wait that ended. Blocking: it may write.
+    /// agent orders from. A started order is reported `pending`, and whatever the look changed (a
+    /// crash counted as a failure, a wait dropped or cut) is offered too. Blocking: it may write.
     pub(crate) fn next_order(&self, now: i64, directory: &str) -> Option<NextOrder> {
         let mut guard = self.lock();
         let st = &mut *guard;
@@ -119,7 +119,11 @@ impl Agent {
         let (next, changed) = keys.next_order(now, directory);
         if let Some(out) = &self.statuses {
             if changed {
-                out.changed(keys.statuses(None));
+                // The look touches the orders only: an uploaded app's status waiting out its gap
+                // would be replaced by the one of the bundle in force, and never sent.
+                let mut all = keys.statuses(None);
+                all.retain(|s| s.source == status::SOURCE_ACME);
+                out.changed(all);
             } else if let NextOrder::Order(job) = &next {
                 out.changed(keys.statuses(Some(&job.app_id)));
             }

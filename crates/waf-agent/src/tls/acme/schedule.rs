@@ -95,9 +95,10 @@ fn other_directory(record: Option<&AppRecord>, directory: &str) -> bool {
 /// order is due when the app has no certificate of its own, when a host is not covered by it, when
 /// the bundle asks for one with an id that no order has answered, when the certificate has a third
 /// of its lifetime left, and when another directory than `directory` issued it (it is served until
-/// the new one replaces it). A certificate that was due when it was kept is no endless reason to
-/// order: taking it in noted a failure, whose wait holds the next order back. An order that failed under the current id is tried again, whatever the
-/// app is served meanwhile: the certificate it asked for is not there yet (but not once a whole
+/// the new one replaces it). A certificate that was due when it was kept, or within a minute of
+/// it, is no endless reason to order: taking it in noted a failure, whose wait holds the next
+/// order back. An order that failed under the current id is tried again, whatever the app is
+/// served meanwhile: the certificate it asked for is not there yet (but not once a whole
 /// certificate is there and the failed order was for a host the app has dropped). A due order
 /// waits for the next attempt that the failed order set, and for the authority's wait. A new id
 /// lifts the first and never the second.

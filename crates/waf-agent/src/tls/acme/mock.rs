@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rcgen::{
@@ -179,11 +180,30 @@ impl MockCa {
 /// A key and a self-signed certificate for `hosts`, valid from the day `from` to the day `to`
 /// (year, month, day, midnight UTC): the text of a key file, and the key the listeners serve.
 pub fn dated_pair(hosts: &[&str], from: Day, to: Day) -> (Vec<u8>, Arc<CertifiedKey>) {
+    pair_valid(hosts, |params| {
+        params.not_before = date_time_ymd(from.0, from.1, from.2);
+        params.not_after = date_time_ymd(to.0, to.1, to.2);
+    })
+}
+
+/// `dated_pair` for a certificate valid from the time `from` (seconds since the epoch) for
+/// `lasts` seconds.
+pub fn short_pair(hosts: &[&str], from: u64, lasts: u64) -> (Vec<u8>, Arc<CertifiedKey>) {
+    pair_valid(hosts, |params| {
+        let epoch = date_time_ymd(1970, 1, 1);
+        params.not_before = epoch + Duration::from_secs(from);
+        params.not_after = epoch + Duration::from_secs(from + lasts);
+    })
+}
+
+fn pair_valid(
+    hosts: &[&str],
+    dates: impl FnOnce(&mut CertificateParams),
+) -> (Vec<u8>, Arc<CertifiedKey>) {
     let pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let names: Vec<String> = hosts.iter().map(|h| (*h).to_owned()).collect();
     let mut params = CertificateParams::new(names).unwrap();
-    params.not_before = date_time_ymd(from.0, from.1, from.2);
-    params.not_after = date_time_ymd(to.0, to.1, to.2);
+    dates(&mut params);
     let certificate = params.self_signed(&pair).unwrap();
     let mut file = Vec::new();
     push_pem_block("PRIVATE KEY", &pair.serialize_der(), &mut file);

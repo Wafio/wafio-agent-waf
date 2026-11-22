@@ -37,9 +37,13 @@ use state_file::{AppRecord, STATE_FILE, StateFile, is_key_file};
 pub(crate) const INTERRUPTED: &str = "the agent stopped while the order ran, again and again";
 
 /// Why an order that gave a certificate counts as a failure: the certificate is due for renewal
-/// the moment it is kept.
+/// the moment it is kept, or within `DUE_SOON` of it.
 pub(crate) const DUE_AT_ISSUE: &str =
     "the authority issued a certificate that is due for renewal at once";
+
+/// How soon after it is kept a certificate may be due for renewal and still count as due at once,
+/// in seconds. It stays under the 80 seconds a certificate of two minutes lives before its renewal.
+const DUE_SOON: i64 = 60;
 
 /// The certificate an app is served with, and where it came from.
 #[derive(Clone)]
@@ -589,14 +593,14 @@ impl Keys {
             return self.order_failed(job, "the certificate cannot be served", 0, now);
         }
         // Nothing else puts a floor between two issuances: a clock that runs far ahead, or an
-        // authority that issues short-lived or expired certificates, would order again at once
-        // until the authority's rate limit answered.
+        // authority that issues expired certificates or ones that last a minute or so, would
+        // order again at once until the authority's rate limit answered.
         let due_at_issue = issued
             .key
             .cert
             .first()
             .and_then(|leaf| acme::names::validity(leaf.as_ref()))
-            .is_some_and(|(from, to)| schedule::renew_at(from, to) <= now);
+            .is_some_and(|(from, to)| schedule::renew_at(from, to) <= now.saturating_add(DUE_SOON));
         let served = Served {
             file: file.clone(),
             leaf_sha256: leaf_sha256(&issued.key),
@@ -2027,6 +2031,54 @@ pub(crate) mod tests {
                 && text.contains("wafio_waf_acme_orders_total{result=\"failed\"} 0\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_certificate_due_within_a_minute_of_being_kept_counts_as_failed_and_a_later_one_does_not() {
+        let s = Scratch::new();
+        let mut k = keys(&s);
+        let book = book_of(&[APP]);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        // Valid from a second before it is kept, for `lasts` seconds.
+        let kept_at = |now: i64, lasts: u64| {
+            let from = u64::try_from(now - 1).unwrap();
+            let (pem, key) = acme::mock::short_pair(&["shop.example.com"], from, lasts);
+            Issued {
+                key,
+                file: Zeroizing::new(pem),
+            }
+        };
+
+        // Ten seconds: its renewal is 6 seconds after it is kept.
+        let job = order(&mut k, T0);
+        k.finish_order(&job, Ok(kept_at(T0, 10)), &book, DIR, T0);
+        let record = record_on_disk(&s);
+        assert_eq!(
+            (
+                record.failures,
+                record.next_attempt_unix - T0,
+                record.error.as_str()
+            ),
+            (1, 600, DUE_AT_ISSUE)
+        );
+        assert_eq!(k.statuses(Some(APP))[0].state, "failed");
+
+        // Two minutes: its renewal is 79 seconds after it is kept, and a private authority that
+        // issues such certificates is renewed from by the schedule, not held back.
+        let now = T0 + 600;
+        let job = order(&mut k, now);
+        k.finish_order(&job, Ok(kept_at(now, 120)), &book, DIR, now);
+        let record = record_on_disk(&s);
+        assert_eq!(
+            (
+                record.failures,
+                record.next_attempt_unix,
+                record.error.as_str()
+            ),
+            (0, 0, "")
+        );
+        assert_eq!(k.statuses(Some(APP))[0].state, "active");
+        assert_eq!(waits_until(&mut k, now + 1), Some(now + 79));
     }
 
     #[test]

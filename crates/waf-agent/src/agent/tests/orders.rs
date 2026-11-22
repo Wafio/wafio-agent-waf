@@ -1742,6 +1742,42 @@ async fn one_unfinished_attempt_at_start_orders_again_at_once() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_look_that_changes_an_order_offers_the_ordered_apps_and_leaves_the_uploaded_ones_alone() {
+    // The look counts a second unfinished attempt as a failure. An uploaded app of the bundle may
+    // have a status waiting out its gap, and an offer of the bundle in force would replace it.
+    let state = format!(
+        r#"{{"apps":{{"{SHOP}":{{"request_id":"r1","attempt_started":{},"attempt_request_id":"r1","interrupted":1}}}}}}"#,
+        BASE - 5
+    );
+    let mut r = rig_over(seeded(&state), None);
+    let acme = acme_object("0.0.0.0:443", None, &[HOST], "r1");
+    let uploaded = tls_object("blog.example.com", CERT, &"ab".repeat(32));
+    r.apply_json(
+        &bundle_of(&[
+            app_json(SHOP, 18080, Some(&acme)),
+            app_json(BLOG, 18081, Some(&uploaded)),
+        ]),
+        1,
+    );
+    r.offers.drain();
+    assert!(matches!(
+        r.agent.next_order(BASE, DIRECTORY),
+        Some(crate::tls::NextOrder::Wait(Some(_)))
+    ));
+    let offered: Vec<(String, String, String)> = r
+        .offers
+        .drain()
+        .into_iter()
+        .flat_map(|offer| offer.statuses)
+        .map(|s| (s.app_id, s.source, s.state))
+        .collect();
+    assert_eq!(
+        offered,
+        [(SHOP.to_owned(), "acme".to_owned(), "failed".to_owned())]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_second_unfinished_attempt_in_a_row_is_a_failure_with_the_backoff_and_no_order() {
     let state = format!(
         r#"{{"apps":{{"{SHOP}":{{"request_id":"r1","attempt_started":{},"attempt_request_id":"r1","interrupted":1}}}}}}"#,

@@ -552,21 +552,22 @@ exactly as before.
   not lift that wait: the status under the new id is `failed` with its time. At each look the agent drops a wait that has passed and cuts
   one that reaches further than it ever sets (the authority's to 7 days, its own to a day), so a clock that was set ahead and back parks
   no app. A renewal that fails keeps serving the certificate the app has, expired or not, and reports `failed` with that chain. A
-  certificate that is due for renewal the moment the authority gives it (a host clock far ahead, or an authority that issues expired or
-  very short-lived certificates) is kept and served, and counts as a failed order with the same ladder and the error `the authority
-  issued a certificate that is due for renewal at once`, so an app cannot order again and again until the authority's rate limit stops it. `state.json` keeps the id the last order answered, the directory that issued the certificate, the challenge that worked,
+  certificate that is due for renewal the moment the authority gives it, or within a minute of that (a host clock far ahead, or an
+  authority that issues expired certificates or ones that last a minute or so), is kept and served, and the ladder and the status treat it
+  as a failed order with the error `the authority issued a certificate that is due for renewal at once` (the metrics count it as
+  `issued`), so an app cannot order again and again until the authority's rate limit stops it. One that is due later than a minute after it is kept is ordered when it is due. `state.json` keeps the id the last order answered, the directory that issued the certificate, the challenge that worked,
   the failures and the hosts of the failed order, the time of the next try, the wait of the authority and the text of the last error, so a
   restart does not order sooner. An order notes its start there, synced, before it asks the authority anything: a start that finds an
   order unfinished (the process was killed) orders again at once, and the second one in a row counts as a failure with the backoff, so a
   process that is started over and over cannot spend the authority's limits. An order that a reload cuts short, and one that the
-  process before ended, is no crash, and does not clear the crashes counted before it. A file of an earlier build, without these fields, is read as it is. What `state.json` keeps for an
+  process before ended, is no crash, and a hand-over keeps the crashes counted before it; an order that ends clears them. A file of an earlier build, without these fields, is read as it is. What `state.json` keeps for an
   app is bounded (at most 100 hosts of a failed order, an error text of 1 KiB), and the agent never writes a file larger than it reads
   (1 MiB): if the whole is too large the hosts of the failed orders go, then the error texts are cut short, and the file is left as it is
   when even that is not enough.
-- An ordered certificate reports `pending` (an order is running, or is due for a certificate that is missing, lacks a host or answers a
-  request id no order has answered; `chain_pem` is the certificate in use meanwhile, if any), `active` (the ordered certificate is
+- An ordered certificate reports `pending` (an order is running, or is due because the app has no certificate of its own, one that lacks a
+  host, or a request id no order has answered; `chain_pem` is the certificate in use meanwhile, if any), `active` (the ordered certificate is
   served and covers every host; a renewal, or a reissue by another directory, that is due but waits behind the order of another app stays
-  `active` until its own order starts) or `failed` (the last order failed: `error` is a
+  `active` until its own order starts) or `failed` (the last order failed, or gave a certificate that is due for renewal at once: `error` is a
   fixed phrase with the problem type and detail the authority gave or the kind of the I/O error, and `next_attempt_unix` the time of the
   next try; also the state of a new request id while the wait the authority set for an earlier order stands, with that time).
   `request_id` is the id of the bundle entry the state answers: an order that ends under an id that is no longer the entry's
@@ -574,8 +575,8 @@ exactly as before.
 - The metrics listener (`WAFIO_METRICS_ADDR`) has three series for the certificates: `wafio_waf_acme_orders_total{result}` counts the
   orders that ended, `issued` (a certificate was kept and is served) or `failed` (the authority, the key directory, or an agent that was
   stopped twice in a row while the order ran); `wafio_waf_certificate_installs_total{result}` counts the installs of uploaded
-  certificates the key directory answered, `ok` or the code it refused with (an agent with no key directory, and an install that
-  panics, are answered by the control link and not counted); `wafio_waf_tls_certificate_expiry_seconds{app_id}` is
+  certificates the key directory answered, `ok` or the code it refused with (an install refused because the agent has no key directory, `not_in_bundle`, and one that
+  panics, which the control link acks, are not counted); `wafio_waf_tls_certificate_expiry_seconds{app_id}` is
   the number of seconds until the certificate each app is served ends, negative once it has. An app served no certificate, or only the
   placeholder, has no series of the last kind, and it goes when the app leaves the bundle or stops serving that certificate. The only
   label values are those results and the id of an app.
