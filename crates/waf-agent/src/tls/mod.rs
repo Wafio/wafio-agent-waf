@@ -334,8 +334,12 @@ impl Keys {
             let mut record = self.state.apps.get(id).cloned().unwrap_or_default();
             record.served = app.served.as_ref().map(|s| s.file.clone());
             if app.settings.source != Source::Acme {
+                // The wait of the authority stays with its reason: a change of source is no way
+                // round it.
                 record = AppRecord {
                     served: record.served,
+                    ca_wait_unix: record.ca_wait_unix,
+                    error: record.error,
                     ..AppRecord::default()
                 };
             }
@@ -672,6 +676,14 @@ impl Keys {
         all
     }
 
+    /// The statuses of the apps that are ordered a certificate. What looks at the orders offers
+    /// these only: an offer of an uploaded app's status would replace one that waits out its gap.
+    pub fn ordered_statuses(&self) -> Vec<CertificateStatus> {
+        let mut all = self.statuses(None);
+        all.retain(|s| s.source == status::SOURCE_ACME);
+        all
+    }
+
     /// Reads a file of the key directory that is none of an app's: the account.
     pub fn read_file(&self, name: &str, limit: usize) -> Result<Vec<u8>, ReadError> {
         self.dir.read(name, limit)
@@ -697,9 +709,16 @@ impl Keys {
             return false;
         }
         tracing::info!("[tls] this process writes in the key directory now");
+        let (theirs, intact) = StateFile::load(&self.dir);
+        if !self.bundle_seen {
+            // Nothing this process did can be newer than the file, and the first bundle writes the
+            // state it starts from: it starts from theirs, or it would write the older one back.
+            self.written = intact.then(|| theirs.clone());
+            self.state = theirs;
+            return true;
+        }
         // The process that let go may have got a newer bundle than the one this process applied
         // and written its certificates since: those are files this process does not know about.
-        let (theirs, _) = StateFile::load(&self.dir);
         let known: HashSet<&str> = self
             .written
             .iter()
@@ -715,41 +734,53 @@ impl Keys {
         true
     }
 
-    /// Takes in the orders the process that let go ended after this one applied its bundle, for
-    /// the apps this one orders for: the certificate it kept, and the failure it noted with the
-    /// time of the next attempt. Without them this process would order again at once, a second
-    /// issuance for the same names, and write its own state over theirs.
+    /// Takes in what the process that let go did after this one applied its bundle. For the apps
+    /// this one orders for: the orders it ended, the certificate it kept and the failure it noted
+    /// with the time of the next attempt. Without them this process would order again at once, a
+    /// second issuance for the same names, and write its own state over theirs. For every app: the
+    /// certificate file it wrote, which is served at once.
     fn adopt(&mut self, theirs: &StateFile, book: &CertBook) {
-        let ordered: Vec<String> = self
+        let apps: Vec<(String, bool)> = self
             .applied
             .iter()
-            .filter(|(_, a)| a.settings.source == Source::Acme)
-            .map(|(id, _)| id.clone())
+            .map(|(id, a)| (id.clone(), a.settings.source == Source::Acme))
             .collect();
-        for id in ordered {
+        for (id, ordered) in apps {
             let before = self.written.as_ref().and_then(|w| w.apps.get(&id));
-            if let Some(record) = theirs.apps.get(&id).filter(|r| Some(*r) != before) {
+            if ordered && let Some(record) = theirs.apps.get(&id).filter(|r| Some(*r) != before) {
                 self.state
                     .apps
                     .entry(id.clone())
                     .or_default()
                     .take_orders_from(record);
             }
-            self.serve_ordered(&id, book);
+            self.serve_from_file(&id, book);
         }
     }
 
-    /// Serves the app from its own certificate file when that holds another certificate than the
-    /// one it is served with: a process that let go of the directory wrote it.
-    fn serve_ordered(&mut self, app_id: &str, book: &CertBook) {
-        let Some(file) = self
-            .applied
-            .get(app_id)
-            .and_then(|a| a.settings.wanted_file(app_id))
-        else {
+    /// The leaf of the certificate each app of the bundle in force is served, if it is served one.
+    pub fn served_leaves(&self) -> HashMap<String, Option<String>> {
+        self.applied
+            .iter()
+            .map(|(id, a)| (id.clone(), a.served.as_ref().map(|s| s.leaf_sha256.clone())))
+            .collect()
+    }
+
+    /// Serves the app from the file its settings name when that holds another certificate than the
+    /// one it is served with (and the one the bundle names, for an uploaded certificate): a process
+    /// that let go of the directory wrote it.
+    fn serve_from_file(&mut self, app_id: &str, book: &CertBook) {
+        let Some((file, leaf)) = self.applied.get(app_id).and_then(|a| {
+            let leaf = a
+                .settings
+                .certificate
+                .as_ref()
+                .map(|c| c.leaf_sha256.clone());
+            Some((a.settings.wanted_file(app_id)?, leaf))
+        }) else {
             return;
         };
-        let served = match self.load(&file, None) {
+        let served = match self.load(&file, leaf.as_deref()) {
             Ok(served) => served,
             Err(Fault::Read(ReadError::Missing)) => return,
             Err(e) => return tracing::info!("[tls] app {app_id}: {file}: {e}"),
@@ -762,7 +793,7 @@ impl Keys {
             return;
         }
         tracing::info!(
-            "[acme] app {app_id}: serves {file}, which the process that handed over ordered"
+            "[tls] app {app_id}: serves {file}, which the process that handed over wrote"
         );
         // Not `serve`: it would clean the directory before the files of that process are known to
         // be kept.
@@ -1704,6 +1735,39 @@ pub(crate) mod tests {
             ),
             (1, T0 + 7800, 0)
         );
+    }
+
+    #[test]
+    fn a_change_of_source_does_not_lift_the_wait_of_the_authority() {
+        let s = Scratch::new();
+        let mut k = keys(&s);
+        apply(&mut k, &[(APP, acme("r1"))]);
+        let job = order(&mut k, T0);
+        fails(&mut k, &job, T0, rate_limited(Some("7200")));
+
+        // The app is uploaded for a while and then ordered again, under a new id.
+        apply(&mut k, &[(APP, uploaded(X, &"ab".repeat(32)))]);
+        apply(&mut k, &[(APP, acme("r2"))]);
+        assert_eq!(waits_until(&mut k, T0 + 601), Some(T0 + 7200));
+        let [status] = &k.statuses(Some(APP))[..] else {
+            panic!("one status");
+        };
+        assert_eq!(
+            (
+                status.state.as_str(),
+                status.request_id.as_str(),
+                status.next_attempt_unix
+            ),
+            ("failed", "r2", T0 + 7200)
+        );
+        assert!(
+            status.error.contains("too many certificates"),
+            "{}",
+            status.error
+        );
+        assert_eq!(record_on_disk(&s).ca_wait_unix, T0 + 7200);
+        // Once it has passed, the order goes ahead.
+        assert_eq!(order(&mut k, T0 + 7200).request_id, "r2");
     }
 
     #[test]

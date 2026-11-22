@@ -119,11 +119,7 @@ impl Agent {
         let (next, changed) = keys.next_order(now, directory);
         if let Some(out) = &self.statuses {
             if changed {
-                // The look touches the orders only: an uploaded app's status waiting out its gap
-                // would be replaced by the one of the bundle in force, and never sent.
-                let mut all = keys.statuses(None);
-                all.retain(|s| s.source == status::SOURCE_ACME);
-                out.changed(all);
+                out.changed(keys.ordered_statuses());
             } else if let NextOrder::Order(job) = &next {
                 out.changed(keys.statuses(Some(&job.app_id)));
             }

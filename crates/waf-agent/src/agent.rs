@@ -189,6 +189,7 @@ impl Agent {
     }
 
     /// Whether the agent has a key directory and this process is the one that writes in it.
+    #[cfg(test)]
     pub fn holds_keys(&self) -> bool {
         self.lock().tls.as_ref().is_some_and(Keys::holds_lock)
     }
@@ -208,13 +209,22 @@ impl Agent {
         let held = match st.tls.as_mut() {
             Some(keys) if !closed => {
                 let had = keys.holds_lock();
+                let before = keys.served_leaves();
                 let held = keys.take_over(&self.routes.certificates());
                 if held
                     && !had
                     && let Some(out) = &self.statuses
                 {
-                    // What the process that let go ordered may change what an app reports.
-                    out.changed(keys.statuses(None));
+                    // What the process that let go ordered may change what an ordered app reports,
+                    // and a certificate it installed what an uploaded app is served. Any other
+                    // uploaded status stays out: an offer would replace one that waits out its gap.
+                    let after = keys.served_leaves();
+                    let mut all = keys.ordered_statuses();
+                    all.extend(keys.statuses(None).into_iter().filter(|s| {
+                        s.source != status::SOURCE_ACME
+                            && before.get(&s.app_id) != after.get(&s.app_id)
+                    }));
+                    out.changed(all);
                 }
                 held
             }
@@ -236,14 +246,6 @@ impl Agent {
         if let Some(keys) = self.lock().tls.as_mut() {
             keys.release();
         }
-    }
-
-    /// The apply lock. While it is held no bundle is applied, no certificate is switched and
-    /// nothing is written in the key directory by any other part of the process, so what its
-    /// holder read from the bundle in force is still true when it commits a change that depends on
-    /// it.
-    pub fn apply_lock(&self) -> ApplyLock<'_> {
-        ApplyLock { st: self.lock() }
     }
 
     /// The apps of the bundle in force that have a `tls` object, by app id: their checked
@@ -347,7 +349,16 @@ impl Agent {
                 );
                 status::refused(&b.apps, keys.applied(), status::REFUSED_SETTINGS, 0)
             }),
-            None => Ok(HashMap::new()),
+            None => {
+                // Said at every bundle: such an app is served in plain HTTP at its bundle address.
+                let ignored = b.apps.iter().filter(|app| app.tls.is_some()).count();
+                if ignored > 0 {
+                    tracing::warn!(
+                        "[waf-bundle] the key directory is not usable: the TLS settings of {ignored} app(s) are ignored, and they are served in plain HTTP at their bundle address"
+                    );
+                }
+                Ok(HashMap::new())
+            }
         };
         let tls = match prepared {
             Ok(tls) => tls,
@@ -524,22 +535,14 @@ impl Agent {
         let st = &mut *guard;
         let Some(keys) = &st.tls else { return };
         match st.refusal.take() {
-            Some(failed) => out.after_refusal(failed, keys.statuses(None)),
+            Some(mut failed) => {
+                // An ordered app gets no `failed` from the refusal, but a live bundle is answered
+                // for it too: with the state of its order now.
+                failed.extend(keys.ordered_statuses());
+                out.after_refusal(failed, keys.statuses(None));
+            }
             None => out.after_bundle(keys.statuses(None), true),
         }
-    }
-}
-
-/// The apply lock of an agent (`Agent::apply_lock`).
-pub struct ApplyLock<'a> {
-    st: std::sync::MutexGuard<'a, State>,
-}
-
-impl ApplyLock<'_> {
-    /// The checked `tls` settings of `app_id` in the bundle in force; `None` for an app that is not
-    /// served over HTTPS by the agent, or that is not in the bundle.
-    pub fn settings(&self, app_id: &str) -> Option<&Settings> {
-        Some(&self.st.tls.as_ref()?.applied().get(app_id)?.settings)
     }
 }
 
@@ -552,31 +555,29 @@ fn has_placeholder_for(book: &CertBook, app_id: &str, hosts: &[String]) -> bool 
 
 /// The proxy's view of an app's `tls` object: where it listens and which certificate it brings.
 fn tls_site(app_id: &str, applied: &Applied, book: &CertBook) -> TlsSite {
-    let certificate = match (&applied.served, applied.settings.wanted_file(app_id)) {
-        (Some(served), _) => BookChange::Set(book_entry(served)),
+    let ordered = applied.settings.source == Source::Acme;
+    let certificate = match &applied.served {
+        Some(served) => BookChange::Set(book_entry(served)),
         // The placeholder the book holds for these hosts stays: a new one would show a browser that
         // clicked through the warning another certificate each time a bundle comes in.
-        (None, Some(_)) if has_placeholder_for(book, app_id, &applied.settings.hosts) => {
+        None if ordered && has_placeholder_for(book, app_id, &applied.settings.hosts) => {
             BookChange::Keep
         }
         // An app that is ordered a certificate has nothing to serve before the first one: a
         // placeholder, so that a handshake succeeds and the app is answered `503` until then.
-        (None, Some(_)) if applied.settings.source == Source::Acme => {
-            match placeholder::certificate(&applied.settings.hosts) {
-                Ok(key) => BookChange::Set(BookEntry {
-                    key,
-                    placeholder: true,
-                }),
-                Err(e) => {
-                    tracing::info!("[acme] app {app_id}: no placeholder certificate: {e}");
-                    BookChange::Keep
-                }
+        None if ordered => match placeholder::certificate(&applied.settings.hosts) {
+            Ok(key) => BookChange::Set(BookEntry {
+                key,
+                placeholder: true,
+            }),
+            Err(e) => {
+                tracing::info!("[acme] app {app_id}: no placeholder certificate: {e}");
+                BookChange::Keep
             }
-        }
-        // The bundle names a file that cannot be served yet: what the book holds stays.
-        (None, Some(_)) => BookChange::Keep,
-        // The bundle names none: whatever the book holds is not served on.
-        (None, None) => BookChange::Clear,
+        },
+        // Any other app with nothing to serve (no certificate named, or an uploaded one that has not
+        // arrived) holds nothing, a placeholder left from an earlier source included.
+        None => BookChange::Clear,
     };
     TlsSite {
         listen: applied.settings.listen.clone(),

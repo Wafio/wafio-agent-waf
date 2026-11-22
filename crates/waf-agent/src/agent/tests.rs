@@ -159,8 +159,8 @@ fn only_an_app_with_a_tls_object_is_served_over_https() {
     assert_eq!(site.listen, "0.0.0.0:443");
     assert_eq!(site.hosts, ["shop.example.com"]);
     assert!(
-        matches!(site.certificate, BookChange::Keep),
-        "its file is not in the directory, so the book keeps what it holds"
+        matches!(site.certificate, BookChange::Clear),
+        "its file is not in the directory, so the app holds nothing"
     );
     assert!(sites[1].is_none());
     let apps = a.tls_apps();
@@ -310,55 +310,20 @@ fn an_entry_that_fails_a_check_refuses_the_whole_bundle_and_the_previous_one_ser
 fn without_a_key_directory_the_tls_object_is_not_read() {
     let (a, proxy, _) = agent();
     let broken = app_json(SHOP, 18080, Some(r#"{"hosts":["*"],"listen":"x"}"#));
-    apply(&a, &bundle_of(&[broken]), 1).unwrap();
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    tracing::subscriber::with_default(Collect(lines.clone()), || {
+        apply(&a, &bundle_of(&[broken]), 1).unwrap();
+    });
+    let lines = lines.lock().unwrap().join("\n");
+    assert!(
+        lines.contains("1 app(s) are ignored") && lines.contains("plain HTTP"),
+        "{lines}"
+    );
     assert!(
         proxy.tls.lock().unwrap()[0][0].is_none(),
         "served as its bundle says"
     );
     assert!(a.tls_apps().is_empty());
-}
-
-#[test]
-fn the_apply_lock_keeps_a_bundle_out_between_a_check_and_its_commit() {
-    let (a, _proxy, _dir) = agent_with_keys();
-    let tls = tls_object("shop.example.com", CERT, &"ab".repeat(32));
-    apply(&a, &bundle_of(&[app_json(SHOP, 18080, Some(&tls))]), 1).unwrap();
-
-    let lock = a.apply_lock();
-    // The check of an install: the app and its settings in the bundle in force.
-    let checked = lock
-        .settings(SHOP)
-        .cloned()
-        .expect("the bundle names the app");
-    assert!(lock.settings(BLOG).is_none());
-
-    // A bundle that takes the app out waits for the lock.
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let applier = {
-        let a = a.clone();
-        std::thread::spawn(move || {
-            let r = apply(&a, &bundle_of(&[app_json(BLOG, 18081, None)]), 2);
-            done_tx.send(()).unwrap();
-            r
-        })
-    };
-    assert!(
-        done_rx
-            .recv_timeout(std::time::Duration::from_millis(300))
-            .is_err(),
-        "the bundle applied while a check was waiting for its commit"
-    );
-    // The commit: what the check saw is still what the bundle in force says.
-    let committed = lock.settings(SHOP).cloned();
-    assert_eq!(committed, Some(checked));
-    drop(lock);
-
-    applier.join().unwrap().unwrap();
-    assert!(
-        a.apply_lock().settings(SHOP).is_none(),
-        "the app left with the bundle"
-    );
-    assert_eq!(a.generation().0, 2);
 }
 
 #[test]
@@ -949,6 +914,41 @@ fn a_bundle_refused_for_its_tls_settings_gives_each_gateway_app_in_it_failed_wit
     assert_eq!(
         summary(&offer.in_force),
         [(SHOP.into(), "uploaded".into(), "active".into())]
+    );
+}
+
+#[test]
+fn a_refused_bundle_is_answered_for_the_ordered_apps_in_force_with_the_state_of_their_order() {
+    let (a, _proxy, _dir, mut offers) = agent_with_statuses();
+    let acme = r#"{"listen":"0.0.0.0:444","hosts":["acme.example.com"],"source":"acme","acme_request_id":"r1"}"#;
+    let ordered = app_json(ACME_APP, 18081, Some(acme));
+    apply(&a, &bundle_of(std::slice::from_ref(&ordered)), 1).unwrap();
+    a.report_bundle();
+    offers.drain();
+
+    let bad = r#"{"listen":"0.0.0.0:443","hosts":["*.example.com"],"source":"uploaded","certificate_id":"7e1f3a90-2c1d-4b8e-9a55-1d3c4f6a8b02","leaf_sha256":"abababababababababababababababababababababababababababababababab"}"#;
+    let refused = apply(
+        &a,
+        &bundle_of(&[ordered, app_json(BLOG, 18082, Some(bad))]),
+        2,
+    );
+    assert!(refused.is_err());
+    a.report_bundle();
+    let offer = only(&mut offers);
+    assert!(offer.forced && !offer.whole);
+    let mut told = states(&offer);
+    told.sort();
+    assert_eq!(
+        told,
+        [
+            (ACME_APP.into(), "acme".into(), "pending".into()),
+            (BLOG.into(), "uploaded".into(), "failed".into()),
+        ],
+        "the ordered app of the bundle in force hears its state, like after any live bundle"
+    );
+    assert_eq!(
+        summary(&offer.in_force),
+        [(ACME_APP.into(), "acme".into(), "pending".into())]
     );
 }
 

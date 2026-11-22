@@ -75,7 +75,7 @@ impl Accounts {
                     Ok(account) => Some(account),
                     // A file that cannot be used here would fail every order for good.
                     Err(e) if e.problem.as_deref() == Some(CREDENTIALS_UNUSABLE) => {
-                        tracing::info!("[acme] {}; making a new account", e.text);
+                        tracing::info!("[acme] the kept account cannot be used; making a new one");
                         None
                     }
                     Err(e) => return Err(e),

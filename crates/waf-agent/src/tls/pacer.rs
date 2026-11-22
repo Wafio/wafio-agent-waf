@@ -34,7 +34,7 @@ pub struct Offer {
     /// The statuses are all there are: an app that is not among them has left the bundle, and
     /// nothing more is said of it.
     pub whole: bool,
-    /// What the bundle in force says of the apps, for the offer of a refused bundle. An app of
+    /// What the bundle in force says of all its apps, for the offer of a refused bundle. An app of
     /// `statuses` that is `missing` there asks again once its `failed` has gone out: the bundle in
     /// force still names a certificate it does not hold.
     pub in_force: Vec<CertificateStatus>,
@@ -60,7 +60,7 @@ impl Statuses {
     }
 
     /// A live bundle was refused; `failed` says so for the apps it names, and `in_force` is what
-    /// the bundle that is still in force says of its apps. No app is forgotten.
+    /// the bundle that is still in force says of all its apps. An app of neither is forgotten.
     pub fn after_refusal(&self, failed: Vec<CertificateStatus>, in_force: Vec<CertificateStatus>) {
         self.offer(failed, true, false, in_force);
     }
@@ -147,8 +147,16 @@ pub struct Pacer {
 
 impl Pacer {
     pub fn offer(&mut self, now: Instant, offer: Offer) {
-        if offer.whole {
-            let named: HashSet<&str> = offer.statuses.iter().map(|s| s.app_id.as_str()).collect();
+        // A live bundle says which apps matter: a whole offer names them all; a refusal names the
+        // apps of the refused bundle and `in_force` lists the others. A slot of any other app goes,
+        // so the apps that a stream of refused bundles names do not pile up.
+        if offer.whole || offer.forced {
+            let named: HashSet<&str> = offer
+                .statuses
+                .iter()
+                .chain(&offer.in_force)
+                .map(|s| s.app_id.as_str())
+                .collect();
             self.slots.retain(|app, _| named.contains(app.as_str()));
         }
         for status in offer.statuses {
@@ -411,14 +419,57 @@ mod tests {
             [at_state(0, State::Missing), at_state(10, State::Active)]
         );
 
-        // A refusal names the apps it knows and forgets none: the others go on as they were.
-        rig.statuses
-            .after_bundle(vec![status("other", State::Missing)], true);
+        // A refusal lists the apps in force too: the ones it does not name go on as they were.
+        rig.statuses.after_bundle(
+            vec![
+                status("other", State::Missing),
+                status("stays", State::Active),
+            ],
+            true,
+        );
         rig.at(301).await;
-        rig.statuses
-            .after_refusal(vec![status("stays", State::Failed)], Vec::new());
+        rig.statuses.after_refusal(
+            vec![status("stays", State::Failed)],
+            vec![
+                status("other", State::Missing),
+                status("stays", State::Active),
+            ],
+        );
         rig.at(400).await;
         assert_eq!(rig.sent("other").len(), 2, "repeated at 360");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_apps_of_refused_bundles_are_kept_only_until_the_next_one() {
+        let mut pacer = Pacer::default();
+        let now = Instant::now();
+        let kept = status("kept", State::Active);
+        pacer.offer(
+            now,
+            Offer {
+                statuses: vec![kept.clone()],
+                forced: true,
+                whole: true,
+                in_force: Vec::new(),
+            },
+        );
+        // Each refused bundle names apps of its own that are not in force.
+        for named in [["a1", "a2"], ["b1", "b2"]] {
+            pacer.offer(
+                now,
+                Offer {
+                    statuses: named.map(|app| status(app, State::Failed)).to_vec(),
+                    forced: true,
+                    whole: false,
+                    in_force: vec![kept.clone()],
+                },
+            );
+        }
+        assert_eq!(
+            pacer.slots.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["b1", "b2", "kept"],
+            "the bundle in force and the last refused one"
+        );
     }
 
     #[tokio::test(start_paused = true)]

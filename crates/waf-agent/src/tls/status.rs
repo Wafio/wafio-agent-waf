@@ -12,7 +12,7 @@ use wafio_control::CertificateStatus;
 use wafio_proxy::cert_store::chain_pem;
 
 use super::acme::schedule::{Own, failed, held_by_authority, own, retry_at};
-use super::entry::{Certificate, Settings, Source};
+use super::entry::{Certificate, Settings, Source, is_uuid};
 use super::state_file::AppRecord;
 use super::{Applied, Served};
 use crate::bundle::BundleApp;
@@ -152,7 +152,8 @@ pub fn current(applied: &HashMap<String, Applied>, only: Option<&str>) -> Vec<Ce
 /// settings may be what failed. The certificate each is served meanwhile stays described, from
 /// the bundle in force. `retry_at` is when the bundle is tried again, or 0 when nothing is
 /// planned. An ordered certificate has none until it reports through its order: a `failed` here
-/// would stay on its app after the bundle was taken.
+/// would stay on its app after the bundle was taken. An app id that is no UUID names no app of the
+/// control plane, so it gets none either.
 pub fn refused(
     apps: &[BundleApp],
     applied: &HashMap<String, Applied>,
@@ -163,7 +164,7 @@ pub fn refused(
     let mut all: Vec<CertificateStatus> = apps
         .iter()
         .filter_map(|app| {
-            let entry = app.tls.as_ref()?;
+            let entry = app.tls.as_ref().filter(|_| is_uuid(&app.app_id))?;
             let served = applied.get(&app.app_id).and_then(|a| a.served.as_ref());
             let status = match entry.source.as_str() {
                 SOURCE_UPLOADED if !entry.certificate_id.is_empty() => CertificateStatus {
@@ -549,13 +550,15 @@ mod tests {
             ),
         );
         let entries = [
-            (APP, uploaded),
+            (APP, uploaded.clone()),
             (
                 "1a2b3c4d-0000-4000-8000-000000000002",
                 tls("acme", r#","acme_request_id":"r1""#),
             ),
             ("1a2b3c4d-0000-4000-8000-000000000003", tls("", "")),
             ("1a2b3c4d-0000-4000-8000-000000000004", tls("uploaded", "")),
+            // An id that names no app of the control plane gets nothing, whatever its entry says.
+            ("not-an-app-id", uploaded),
         ];
         let list: Vec<String> = entries
             .iter()

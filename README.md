@@ -121,6 +121,9 @@ The feature `test-cache-delay` makes the agent wait `WAFIO_TEST_CACHE_WRITE_DELA
 cache, so that the last tests of `tests/control_plane.rs` can signal an agent while a write is pending; those tests are built
 only with it, and no release build enables it.
 
+The feature `test-owner` lets the agent load an engine library that the user it runs as owns, for tests that cannot be root; no
+release build enables it.
+
 Pebble is the ACME test server of Let's Encrypt. The tests of `tests/tls_bundle.rs` named `pebble_*` have the real binary order
 certificates from it, with a fake control plane. They cover TLS-ALPN-01 and HTTP-01 (on the redirect listener, and on the HTTPS listener
 behind something that sends port 80 to HTTPS), the renewal of a two minute certificate while a connection is open, a failed order and its
@@ -450,9 +453,14 @@ reports what is in it and can ask the agent to refresh it. An install of version
 stripped from the value), logs one warning naming the new setting, and uses the new setting when both are set.
 
 State lives in `--state-dir` (`/var/lib/wafio-waf-agent` under systemd): the last applied bundle, so a restart while
-the control plane is down still serves the protected applications, and the challenge secret.
+the control plane is down still serves the protected applications, and the challenge secret. Certificates, the ACME account and the
+certificate state live in `/var/lib/wafio-waf-agent/tls/`, a fixed path that `--state-dir` does not change (see "HTTPS from the
+agent"). `--tls-sites-file` no longer exists; the variable `WAFIO_TLS_SITES_FILE` is ignored with one warning.
 
-The agent acks a bundle once it is applied and writes the file after that, on a thread of its own (temp file, fsync, rename).
+`WAFIO_METRICS_ADDR` (no flag) opens the OpenMetrics listener. It must be a loopback IP literal and port, and the agent stops at start
+for any other address; a reload's successor reads the same variable.
+
+The agent acks a bundle without waiting for the cache write, which a thread of its own does (temp file, fsync, rename).
 A slow disk therefore does not hold up the commands that come after the bundle. A bundle that arrives while a write runs
 replaces one that is still waiting, so the file never goes back to an older bundle. A successor and the next start read the
 file, so the agent finishes the pending writes before it starts a successor and before it ends. That wait covers the bundles
@@ -490,8 +498,11 @@ exactly as before.
 
 - The agent checks the object as the control plane does, and no stricter. `app_id` (and `certificate_id`) must be a lower-case UUID, as
   they name files. `listen` and `redirect_listen` are an IP address with a port from 1 to 65535 (an IPv6 address in square brackets),
-  and differ; `listen` is `0.0.0.0:443` when it is left out. `hosts` are 1 to 100 plain DNS names, trimmed, lower-cased and each
-  kept once: no port, no wildcard, no IP address, no trailing dot, no underscore. An object that fails a check refuses the whole
+  and differ and do not share a port on overlapping addresses (`0.0.0.0` takes every IPv4 address, `::` every address); `listen` is
+  `0.0.0.0:443` when it is left out. `hosts` are 1 to 100 plain DNS names, trimmed, lower-cased and each kept once: letters, digits,
+  hyphens and dots only, at least one dot, at most 253 bytes, labels of 1 to 63 bytes with no hyphen at either end, and a last label that
+  is not all digits (so no port, no wildcard, no IP address, no trailing dot, no underscore). An entry with the source `acme` may carry
+  `acme_request_id` of up to 128 printable ASCII characters, and a longer one refuses the bundle. An object that fails a check refuses the whole
   bundle (`invalid TLS site settings`, with the app and the field in the log), as an invalid route does: the previous bundle stays and
   the control plane sends it again. A `source` that is empty or not known, or an uploaded one with no certificate named yet, is no
   refusal: nothing is served for that app, and a certificate it was served before is dropped with its file. A bundle that cannot
@@ -500,12 +511,17 @@ exactly as before.
 - The certificates are files of the key directory, `/var/lib/wafio-waf-agent/tls/` (the unit's `StateDirectory` is its parent; it does
   not follow `--state-dir`). The agent makes it 0700 if it is missing and uses it only when it is a directory, not a link, owned by
   the user the agent runs as; group and other access is cleared and logged. Otherwise the start logs a warning that names the
-  directory and the cause, and the `tls` objects are ignored. A file holds one private key and the chain, leaf first
+  directory and the cause, the `tls` objects are ignored, and each bundle logs that again: an app with a `tls` object is then served in
+  plain HTTP at the address its bundle names, as by an agent that does not know the object. The control plane does not turn gateway
+  mode on for such an agent. A file holds one private key and the chain, leaf first
   (`<certificate id>.pem` for an uploaded certificate, `acme-<app id>.pem` for an ordered one), and is 0600. A file is read when a
   bundle is applied (the start, a reload, a new bundle), never through a link and up to 128 KiB. An app is served the file its
-  bundle names, if it is there and holds the certificate the bundle names by its leaf; until then, the file it was served before,
+  bundle names, if it is there and holds the certificate the bundle names by its leaf (an uploaded one; an ordered certificate is
+  served from its file when its key and chain match, and names no leaf); until then, the file it was served before,
   which `state.json` in the same directory remembers across a restart (it holds no key material, and drops the apps that are not in
-  the bundle). That holds for a bundle that names a file; one that names none (see above) serves nothing. A certificate file of
+  the bundle), or nothing: an uploaded app that was served no file has no handshake and its redirect listener answers `503` until the
+  install lands, and a placeholder it had as an ordered app goes. That holds for a bundle that names a file; one that names none (see
+  above) serves nothing. A certificate file of
   the agent (`<certificate id>.pem`, `acme-<app id>.pem`) that no app of the bundle names and none is served from is removed after
   each applied bundle: once the new certificate is served, the old file goes. Any other file in the directory stays. The agent
   sets `PR_SET_DUMPABLE` to 0, so a crash leaves no core dump with the keys in it and no other process of the same user can
@@ -549,13 +565,13 @@ exactly as before.
   0, as a retry of the same bundle fails the same check. The refusal changes nothing in force, so an app whose bundle in force still names
   a certificate the agent does not hold asks for it again (`missing`) once its `failed` has gone, and then every minute. An app that
   is ordered a certificate gets no `failed` from a refused bundle: it reports through its order, so the status of such an app does not
-  say that its bundle cannot bind. A bundle
+  say that its bundle cannot bind; it hears the state of its order now, as after any live bundle, if the bundle in force has it. A bundle
   refused for any other reason (a plain app on the address of an HTTPS listener, say) says nothing of the certificates: each app
   reports the state it is in. An error text has its control characters
   removed, is cut to 1 KiB on a character boundary, and becomes `error text withheld` when it holds `-----BEGIN` or `PRIVATE KEY`.
 - An app whose source is `acme` has its certificate ordered by the agent from the ACME directory it is configured with, for all its
   `hosts` in one order. Nothing is ordered until the bundle asks for it. The agent has one account for each directory: an ECDSA P-256 key
-  with no contact address, the terms of service agreed to (the request button of the dashboard is the acceptance), in `acme-account.json` of
+  with no contact address, the terms of service agreed to (a request to order a certificate is the acceptance), in `acme-account.json` of
   the key directory, 0600, and made again when the directory is not the one the file names. It is in no log line, no status and not
   in `state.json`. One worker orders, in the process that holds the key directory lock, one order at a time, the app that has been
   due the longest first; the process that a reload replaces starts no new order once the successor is being started (the authority's check
@@ -584,7 +600,8 @@ exactly as before.
   to the hosts does not shorten the wait. When the authority answers `rateLimited` the app waits the later of an hour and the `Retry-After`
   of the answer (seconds, or a date in the form `Sun, 06 Nov 1994 08:49:37 GMT`; one that is missing, malformed, in the past or in one
   of the two obsolete date forms asks for nothing) and at most 7 days, so an authority cannot park an app for good. A new request id does
-  not lift that wait: the status under the new id is `failed` with its time. At each look the agent drops a wait that has passed and cuts
+  not lift that wait, and neither does a change of source: the status under the new id is `failed` with its time. An app that leaves
+  the bundle loses its record, the wait included. At each look the agent drops a wait that has passed and cuts
   one that reaches further than it ever sets (the authority's to 7 days, its own to a day), so a clock that was set ahead and back parks
   no app. A renewal that fails keeps serving the certificate the app has, expired or not, and reports `failed` with that chain. A
   certificate that is due for renewal the moment the authority gives it, or within a minute of that (a host clock far ahead, or an
@@ -620,7 +637,8 @@ exactly as before.
   through a CDN that sends port 80 to HTTPS can then get its answer. The app itself is not reached: such a connection gets `503` and the
   answers to a validation, and the redirect listener answers `503` too, not `308`. A client that clicked through the warning has a TLS
   session that a resumption can bring back without a new certificate, and a resumed placeholder session can reach the app. A bundle
-  never gives such an app a plain listener, so a login or a cookie never goes over plain HTTP before the certificate is there.
+  never gives such an app a plain listener, so a login or a cookie never goes over plain HTTP before the certificate is there. (The one
+  exception is an agent with no usable key directory, which ignores the `tls` object altogether: see the key directory above.)
 - Ports 80 and 443 have to be open to everyone for an order: the authority validates from several networks, and a host firewall or an XDP
   allowlist that lets only some through makes the order fail. Behind a CDN the mode that connects to the origin over HTTPS ("Full")
   works with HTTP-01 and never with TLS-ALPN-01, which a CDN does not pass; the mode that connects over plain HTTP loops.
@@ -635,8 +653,9 @@ exactly as before.
   connection finishes; an old connection that is idle between requests closes at once.
 - An app with a `tls` object opens no plain listener of its own: the address its bundle names is not served and not checked (another
   app may use it), and the app answers on its HTTPS listener only. An address of the object that another app of the bundle uses
-  fails the apply with `duplicate listener in WAF bundle`.
-- TLS 1.2 and 1.3. The SNI name picks the app and the certificate the agent holds for it, and the `Host` header picks the app.
+  fails the apply with `duplicate listener in WAF bundle`. A host that two apps both
+  send to one `redirect_listen` refuses the bundle with `invalid TLS site settings`.
+- TLS 1.2 and 1.3. The SNI name picks the app and the certificate the agent holds for it, and the `Host` header must name the same host.
   ALPN is `acme-tls/1`, then `http/1.1`: a client that offers `acme-tls/1` is a certificate validation, and gets a handshake only
   for a name with a validation pending, which ends with the handshake; every other client negotiates `http/1.1` or none. A client
   that sends no name, or a name no `hosts` list has, gets no handshake. A `Host` that differs from the SNI name gets `421`
@@ -803,7 +822,7 @@ crates/
                              bounded LRU, malware hashes, byte-level text helpers (UTF-8, URL, HTML, patterns, transforms)
   proto                      generated gRPC client and server
 proto/                       vendored protocol file and its SOURCE
-scripts/                     ci-local.sh  build-dist.sh  gen-test-certs.sh  gen-notices.py  sync-proto.sh  check-ai.sh  advisories.py  pebble.sh  acme-gate.sh  test-acme-gate.sh
+scripts/                     ci-local.sh  build-dist.sh  gen-test-certs.sh  gen-notices.py  sync-proto.sh  check-ai.sh  advisories.py  advisories.allow  test_advisories.py  test_gen_notices.py  pebble.sh  acme-gate.sh  test-acme-gate.sh
 scripts/notices/             notices.json and the licence texts that gen-notices.py puts into NOTICES.txt
 tools/core-gen               Go generators for the bytetext Unicode and HTML entity tables
 ```
