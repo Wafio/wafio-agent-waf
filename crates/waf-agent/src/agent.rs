@@ -9,14 +9,16 @@ use wafio_agent_pages::goodbot::VerifiedBotChecker;
 use wafio_application::RateLimitStore;
 use wafio_application::blocklist::BlockStore;
 use wafio_control::{
-    AckCode, BundleError, BundleSink, CertificateInstall, CertificateSink, WAF_BUNDLE_RETRY_MAX,
+    AckCode, BundleError, BundleSink, CachePurge, CertificateInstall, CertificateSink,
+    EdgeCompressionCounters, EdgeFeatureState, EdgeSink, EdgeStatus, PurgeCode,
+    WAF_BUNDLE_RETRY_MAX,
 };
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
 use wafio_proxy::cert_store::{BookChange, BookEntry, CertBook};
-use wafio_proxy::{AppAnalysisSetup, AppSpec, TlsSite};
+use wafio_proxy::{AppAnalysisSetup, AppSpec, CompressionCounters, CompressionSpec, TlsSite};
 
-use crate::bundle::{Bundle, BundleApp, UnblockEntry, decode_bundle};
+use crate::bundle::{Bundle, BundleApp, CompressionEntry, UnblockEntry, decode_bundle};
 use crate::executor::{BaseExecutor, Stores, executor_for_rules};
 use crate::ready::Ready;
 use crate::tls::acme::placeholder;
@@ -31,6 +33,9 @@ use crate::tls::{Applied, Keys, book_entry};
 /// What `Proxy::apply` says of a bundle whose `tls` settings it refuses.
 const TLS_SETTINGS_REFUSED: &str = "invalid TLS site settings";
 
+/// The smallest answer compressed when the bundle names no size.
+const DEFAULT_COMPRESSION_MIN_BYTES: usize = 1024;
+
 /// The proxy side (`wafio_proxy::Proxy::apply`): builds every route, binds every new
 /// address, then switches; any error changes nothing. A trait so tests can fake it.
 pub trait RouteSink: Send + Sync + 'static {
@@ -41,6 +46,11 @@ pub trait RouteSink: Send + Sync + 'static {
 
     /// The address and the error kind of the bind that failed the last `apply`.
     fn bind_failure(&self) -> Option<(String, std::io::ErrorKind)>;
+
+    /// What the compression of `app_id` counted over the last hour, if it counted anything.
+    fn compression_counters(&self, _app_id: &str) -> Option<CompressionCounters> {
+        None
+    }
 }
 
 impl RouteSink for wafio_proxy::Proxy {
@@ -54,6 +64,10 @@ impl RouteSink for wafio_proxy::Proxy {
 
     fn bind_failure(&self) -> Option<(String, std::io::ErrorKind)> {
         wafio_proxy::Proxy::bind_failure(self)
+    }
+
+    fn compression_counters(&self, app_id: &str) -> Option<CompressionCounters> {
+        wafio_proxy::Proxy::compression_counters(self, app_id)
     }
 }
 
@@ -75,6 +89,16 @@ struct State {
     /// What the control plane hears of a bundle that was refused for a reason that concerns the
     /// HTTPS settings of its apps; taken by `bundle_finished`, and cleared by the next apply.
     refusal: Option<status::Refusal>,
+    /// Which edge parts each app of the bundle in force has on.
+    edge: HashMap<String, AppEdge>,
+}
+
+/// The edge parts an app has on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AppEdge {
+    /// A main host name or a path prefix.
+    redirects: bool,
+    compression: bool,
 }
 
 /// The agent state minus the request path (the proxy crate's).
@@ -369,6 +393,7 @@ impl Agent {
         let book = self.routes.certificates();
         let mut executors: HashMap<String, (Arc<AppAnalysisSetup>, Stores)> = HashMap::new();
         let mut specs: Vec<AppSpec> = Vec::new();
+        let mut edge: HashMap<String, AppEdge> = HashMap::new();
         let mut addresses: HashSet<String> = HashSet::new();
         let mut unbindable = false;
         let mut with_scripts = 0u64;
@@ -408,10 +433,20 @@ impl Agent {
                     .map(|applied| tls_site(&app.app_id, applied, &book)),
             );
             // The route is built here, so a bad route fails before later apps are built.
-            if let Err(e) = wafio_proxy::config::build_route(&spec) {
-                tracing::info!("[waf-bundle] {e}");
-                return Err(apply_error("invalid app route in WAF bundle"));
-            }
+            let route = match wafio_proxy::config::build_route(&spec) {
+                Ok(route) => route,
+                Err(e) => {
+                    tracing::info!("[waf-bundle] {e}");
+                    return Err(apply_error("invalid app route in WAF bundle"));
+                }
+            };
+            edge.insert(
+                app.app_id.clone(),
+                AppEdge {
+                    redirects: route.redirects(),
+                    compression: spec.compression.is_some(),
+                },
+            );
             // An app with an HTTPS site opens no listener at its bundle address, so that address
             // is neither checked for a duplicate nor for a port that cannot be bound.
             if app.listen_port > 0 && spec.tls.is_none() {
@@ -442,6 +477,7 @@ impl Agent {
         st.per_app = executors;
         st.generation = b.generation;
         st.agent_id = b.agent_id.clone();
+        st.edge = edge;
         if let Some(keys) = st.tls.as_mut() {
             keys.commit(tls);
         }
@@ -551,6 +587,96 @@ impl Agent {
     }
 }
 
+impl Agent {
+    /// One status for each app of the bundle in force that has an edge part on, in app id order,
+    /// with the compression counters as of now.
+    pub fn edge_statuses(&self) -> Vec<EdgeStatus> {
+        let (generation, edge) = {
+            let st = self.lock();
+            (st.generation, st.edge.clone())
+        };
+        let now = status::unix_now();
+        let applied = |feature: &str| EdgeFeatureState {
+            feature: feature.into(),
+            state: "applied".into(),
+            ..Default::default()
+        };
+        let mut apps: Vec<_> = edge
+            .into_iter()
+            .filter(|(_, e)| e.redirects || e.compression)
+            .collect();
+        apps.sort_by(|a, b| a.0.cmp(&b.0));
+        apps.into_iter()
+            .map(|(app_id, e)| {
+                let mut features = Vec::new();
+                if e.redirects {
+                    features.push(applied("redirects"));
+                }
+                let mut compression = None;
+                if e.compression {
+                    features.push(applied("compression"));
+                    let c = self
+                        .routes
+                        .compression_counters(&app_id)
+                        .unwrap_or_default();
+                    compression = Some(EdgeCompressionCounters {
+                        responses: c.responses,
+                        skipped_streamed: c.skipped_streamed,
+                        bytes_saved: c.bytes_saved,
+                    });
+                }
+                EdgeStatus {
+                    app_id,
+                    generation,
+                    features,
+                    cache: None,
+                    compression,
+                    unix_time: now,
+                }
+            })
+            .collect()
+    }
+
+    /// Answers a cache purge. This build has no response cache, so a purge for an app of the
+    /// bundle is for an app with no cache.
+    pub fn purge_cache(&self, purge: &CachePurge) -> Result<(), PurgeCode> {
+        let address_ok = purge.url.starts_with('/')
+            || purge
+                .url
+                .strip_prefix("http://")
+                .is_some_and(|rest| !rest.is_empty())
+            || purge
+                .url
+                .strip_prefix("https://")
+                .is_some_and(|rest| !rest.is_empty());
+        let scope_ok = match purge.scope.as_str() {
+            "app" => purge.url.is_empty(),
+            "url" | "prefix" => address_ok,
+            _ => false,
+        };
+        if !scope_ok {
+            return Err(PurgeCode::Invalid);
+        }
+        if !self.lock().edge.contains_key(&purge.app_id) {
+            return Err(PurgeCode::NotInBundle);
+        }
+        Err(PurgeCode::CacheOff)
+    }
+}
+
+/// The `EdgeSink` the control link calls (on a blocking thread).
+pub struct Edge(pub Arc<Agent>);
+
+impl EdgeSink for Edge {
+    fn statuses(&self) -> Vec<EdgeStatus> {
+        self.0.edge_statuses()
+    }
+
+    fn purge(&self, purge: &CachePurge) -> Result<(), PurgeCode> {
+        self.0.purge_cache(purge)
+    }
+}
+
 /// Whether the book serves `app_id` the placeholder, and it names exactly `hosts`.
 fn has_placeholder_for(book: &CertBook, app_id: &str, hosts: &[String]) -> bool {
     book.get(app_id).is_some_and(|entry| {
@@ -589,6 +715,7 @@ fn tls_site(app_id: &str, applied: &Applied, book: &CertBook) -> TlsSite {
         hosts: applied.settings.hosts.clone(),
         certificate,
         redirect_listen: applied.settings.redirect_listen.clone(),
+        canonical_host: applied.settings.canonical_host.clone(),
     }
 }
 
@@ -610,7 +737,19 @@ fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>, tls: Option<TlsSit
         maintenance: app.maintenance.clone(),
         analysis: executor,
         tls,
+        compression: compression_spec(app.compression.as_ref()),
     }
+}
+
+/// The compression of an app: `None` unless the bundle turns it on. A size that is negative is
+/// kept as one no route accepts, so the bundle is refused.
+fn compression_spec(entry: Option<&CompressionEntry>) -> Option<CompressionSpec> {
+    let entry = entry.filter(|c| c.enabled)?;
+    Some(CompressionSpec {
+        min_bytes: entry.min_bytes.map_or(DEFAULT_COMPRESSION_MIN_BYTES, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX)
+        }),
+    })
 }
 
 /// The per-app custom rules: each raw rule that decodes cleanly is kept.

@@ -11,8 +11,9 @@ use wafio_application::{PARTIAL_COVERAGE_REQUESTS, RECOVERED_ANALYZE_PANICS};
 use wafio_control::{ControlLink, HeartbeatCounters};
 use wafio_engine_api::engine;
 use wafio_proxy::metrics::{
-    ANALYZE_LATENCY_HISTOGRAM, MAINTENANCE_RESPONSES, PANIC_COUNT, coverage_flag_samples,
-    latency_percentiles,
+    ANALYZE_LATENCY_HISTOGRAM, COMPRESSED_BROTLI, COMPRESSED_GZIP, COMPRESSION_BYTES_IN,
+    COMPRESSION_BYTES_OUT, COMPRESSION_SKIP_REASONS, COMPRESSION_SKIPPED, MAINTENANCE_RESPONSES,
+    PANIC_COUNT, coverage_flag_samples, latency_percentiles,
 };
 
 use crate::tls::metrics::TlsMetrics;
@@ -102,6 +103,45 @@ pub fn register_agent_metrics(reg: &Registry, link: Arc<ControlLink>, tls: &Arc<
         "wafio_waf_maintenance_responses",
         "Requests answered with the maintenance page of an app in maintenance mode.",
         || u(MAINTENANCE_RESPONSES.load(Ordering::Relaxed)),
+    );
+    // One label value of a sample: `name="value"`.
+    let sample = |name: &str, value: &str, n: u64| Sample {
+        labels: vec![Label {
+            name: name.into(),
+            value: value.into(),
+        }],
+        value: u(n),
+    };
+    reg.labeled_counter(
+        "wafio_waf_compression_responses",
+        "Answers sent compressed, by encoding.",
+        move || {
+            vec![
+                sample("encoding", "gzip", COMPRESSED_GZIP.load(Ordering::Relaxed)),
+                sample("encoding", "br", COMPRESSED_BROTLI.load(Ordering::Relaxed)),
+            ]
+        },
+    );
+    reg.labeled_counter(
+        "wafio_waf_compression_bytes",
+        "Bytes of the compressed answers before compression (in) and as sent (out).",
+        move || {
+            vec![
+                sample("dir", "in", COMPRESSION_BYTES_IN.load(Ordering::Relaxed)),
+                sample("dir", "out", COMPRESSION_BYTES_OUT.load(Ordering::Relaxed)),
+            ]
+        },
+    );
+    reg.labeled_counter(
+        "wafio_waf_compression_skipped",
+        "Answers that could have been compressed and were not: streamed (no length up front), too_large, busy (no free compression slot) or grew (the compressed form was not smaller).",
+        move || {
+            COMPRESSION_SKIP_REASONS
+                .iter()
+                .zip(&COMPRESSION_SKIPPED)
+                .map(|(reason, n)| sample("reason", reason, n.load(Ordering::Relaxed)))
+                .collect()
+        },
     );
     reg.labeled_counter(
         "wafio_waf_jail_refused",
@@ -267,6 +307,9 @@ mod tests {
             "wafio_waf_partial_coverage_flags",
             "wafio_waf_maintenance_responses_total",
             "wafio_waf_ratelimit_evictions_total",
+            r#"wafio_waf_compression_responses_total{encoding="br"}"#,
+            r#"wafio_waf_compression_bytes_total{dir="in"}"#,
+            r#"wafio_waf_compression_skipped_total{reason="streamed"}"#,
             r#"wafio_waf_challenge_pinned_evictions_total{store="spent_tokens"}"#,
             r#"wafio_waf_challenge_pinned_evictions_total{store="revoked_cookies"}"#,
             "wafio_waf_challenge_verify_limited_total",

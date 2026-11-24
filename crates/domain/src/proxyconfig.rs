@@ -46,6 +46,9 @@ pub struct ProxyConfig {
     /// Answer 400 for a path with a '%' not followed by two hex digits;
     /// absent or null means true.
     pub reject_invalid_path_encoding: bool,
+    /// The path the application lives under (`/shop`): the upstream sees a request to `/shop/cart`
+    /// as `/cart`. Empty = none. `strip_path_prefix_fault` says what a valid one is.
+    pub strip_path_prefix: String,
 }
 
 /// Per-app deadlines in milliseconds: 0 unset (default), -1 unlimited, > 0 ms.
@@ -97,6 +100,8 @@ const DEFAULT_PROXY_BUFFER_BYTES: i64 = 16384;
 const DEF_PROXY_MAX_CONNS: i64 = 512;
 const DEF_PROXY_CONN_WAIT_MS: i64 = 5000;
 const DEF_PROXY_IDLE_CONN_MS: i64 = 10000;
+/// The longest `strip_path_prefix`, in bytes.
+pub const MAX_STRIP_PATH_PREFIX: usize = 256;
 const MAX_PROXY_HEADERS: usize = 32;
 const MAX_PROXY_HEADER_BYTE: usize = 8192;
 
@@ -280,6 +285,8 @@ pub fn parse_proxy_config(raw: &[u8]) -> Result<ProxyConfig, ProxyError> {
                 &mut pc.reject_invalid_path_encoding,
                 "reject_invalid_path_encoding",
             );
+        } else if key_matches(k, "strip_path_prefix") {
+            d.string(v, &mut pc.strip_path_prefix, "strip_path_prefix");
         }
     }
     if let Some(e) = d.error {
@@ -332,6 +339,38 @@ fn fill_proxy_defaults(pc: &mut ProxyConfig) {
     }
     pc.request_headers.add.get_or_insert_with(BTreeMap::new);
     pc.response_headers.add.get_or_insert_with(BTreeMap::new);
+}
+
+/// Why `prefix` is not a valid `strip_path_prefix`, or `None` (an empty one is valid: no prefix).
+/// The control plane checks the same, so what it sends passes.
+pub fn strip_path_prefix_fault(prefix: &str) -> Option<&'static str> {
+    if prefix.is_empty() {
+        return None;
+    }
+    if prefix.len() > MAX_STRIP_PATH_PREFIX {
+        return Some("is longer than 256 bytes");
+    }
+    if !prefix.starts_with('/') {
+        return Some("must start with /");
+    }
+    if !prefix
+        .bytes()
+        .all(|c| c.is_ascii_graphic() && !matches!(c, b'?' | b'#' | b'%' | b'\\'))
+    {
+        return Some("holds a space or one of ? # % \\ or a non-printable character");
+    }
+    if prefix.ends_with('/') {
+        return Some("must not end with /");
+    }
+    // Every segment after the leading slash.
+    for segment in prefix[1..].split('/') {
+        match segment {
+            "" => return Some("has an empty segment"),
+            "." | ".." => return Some("has a . or .. segment"),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn has_crlf(s: &str) -> bool {
@@ -456,6 +495,9 @@ impl ProxyConfig {
                     "{label}: header rules too large (max {MAX_PROXY_HEADER_BYTE} bytes)"
                 )));
             }
+        }
+        if let Some(why) = strip_path_prefix_fault(&self.strip_path_prefix) {
+            return Err(ProxyError(format!("strip_path_prefix {why}")));
         }
         check_trusted_proxies(&self.trusted_proxies)
     }

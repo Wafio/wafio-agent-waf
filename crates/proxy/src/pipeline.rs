@@ -31,12 +31,14 @@ use wafio_bytetext::strings::trim_whitespace;
 use wafio_domain::ip_address::IpAddress;
 use wafio_domain::{AnalysisResult, IncomingRequest};
 
+use crate::compress;
 use crate::config::{AppAnalysisSetup, Route, Target};
 use crate::decision::{
     AnalysisRequest, DecisionEvent, REQUEST_BODY_CAPTURE_LIMIT, Verdict, canonical_content_type,
     emit_decision_event, emit_upstream_error_event, first_header_value, now_unix,
 };
 use crate::proxy::Shared;
+use crate::redirect::upstream_target;
 use crate::request::InboundRequest;
 use crate::response::OutboundResponse;
 use crate::upstream::Forwarded;
@@ -662,7 +664,18 @@ pub(crate) async fn handle(
         };
     }
 
+    // Another host name of the app is sent to its main host, after the verdict and the WebSocket
+    // takeover: a block is never redirected, and an upgrade request goes upstream untouched.
+    if v.action != "block"
+        && !req.has_upgrade()
+        && let Some(r) = route.main_host.as_ref().and_then(|m| m.answer(&req))
+    {
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, r.status);
+        return answer(r);
+    }
+
     // Allow (or monitor-mode block) → upstream, encrypt rules applied to what it receives.
+    let target = upstream_target(route, &req);
     let (mut fbody, mut fct) = (det.body, det.raw_ct.clone());
     if !field_rules.is_empty() && !fbody.is_empty() {
         let (enc, enc_ct) = fp::transform_request_body(
@@ -706,7 +719,7 @@ pub(crate) async fn handle(
             crate::fastcgi::forward_fcgi(
                 pool,
                 &req.method,
-                &req.forward_request_target,
+                &target,
                 &req.host,
                 &remote,
                 &hm,
@@ -720,6 +733,7 @@ pub(crate) async fn handle(
             route,
             t,
             &req,
+            &target,
             &peer,
             &remote,
             &fbody,
@@ -750,11 +764,18 @@ pub(crate) async fn handle(
         },
     };
     match result {
-        Ok(Forwarded::Whole(resp)) => {
+        Ok(Forwarded::Whole(mut resp)) => {
+            if let Some(spec) = &route.compression {
+                let stats = shared.edge.app(&route.app_id);
+                compress::apply(&stats, spec, &req, &mut resp).await;
+            }
             emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, resp.status);
             answer(resp)
         }
         Ok(Forwarded::Stream(s)) => {
+            if route.compression.is_some() {
+                compress::note_streamed(&shared.edge.app(&route.app_id), &req, &s.head);
+            }
             emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, s.head.status);
             Ok(Done::Stream(s))
         }
@@ -803,7 +824,9 @@ mod tests {
                 hosts: vec!["shop.test".into()],
                 certificate: BookChange::Keep,
                 redirect_listen: None,
+                canonical_host: None,
             }),
+            compression: None,
         })
         .unwrap()
     }

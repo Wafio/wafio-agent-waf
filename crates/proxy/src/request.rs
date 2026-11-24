@@ -374,6 +374,13 @@ impl InboundRequest {
             .map_or(&[][..], |(_, v)| v.as_slice())
     }
 
+    /// Whether the request has an `Upgrade` line: a WebSocket handshake, or `h2c`.
+    pub fn has_upgrade(&self) -> bool {
+        self.lines
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(b"upgrade"))
+    }
+
     pub fn is_get_method(&self) -> bool {
         self.method == b"GET"
     }

@@ -19,10 +19,10 @@ use wafio_agent_pages::iprep::{
 };
 use wafio_control::{
     AckCode, AgentStats, CacheWrite, CertificateInstall, CertificateSink, ControlConfig,
-    ControlLink, HeartbeatCounters, Hooks,
+    ControlLink, HeartbeatCounters, Hooks, NoEdge,
 };
 
-use crate::agent::{Agent, Certificates, Sink};
+use crate::agent::{Agent, Certificates, Edge, Sink};
 use crate::executor::{Stores, startup_executor};
 use crate::flags::{AgentArgs, OsEnv};
 use crate::ready::{Ready, ReadyActions};
@@ -46,6 +46,10 @@ const FEATURE_MAINTENANCE_MODE: &str = "maintenance_mode";
 /// The `Hello.features` entry of an agent that serves apps over HTTPS from its key directory: it
 /// takes `CertificateInstall` and sends `CertificateStatus`.
 pub const FEATURE_TLS_CERTIFICATES: &str = "tls_certificates";
+/// The `Hello.features` entries of an agent that applies the main host name and the path prefix of
+/// an app, and compresses its answers, and says so in `EdgeStatus`.
+const FEATURE_EDGE_REDIRECTS: &str = "edge_redirects";
+const FEATURE_EDGE_COMPRESSION: &str = "edge_compression";
 
 struct Stats;
 
@@ -110,6 +114,7 @@ pub fn test_hooks() -> Hooks {
     Hooks {
         bundles: Arc::new(AcceptAll),
         certificates: Arc::new(NoCertificates),
+        edge: Arc::new(NoEdge),
         stats: Arc::new(Stats),
         security_data: Arc::new(crate::security_data::AgentSecurityData),
         redact: crate::redact::mask_decision_event,
@@ -331,6 +336,8 @@ pub async fn run_waf_agent(
     cfg.features = vec![
         crate::script_rules::FEATURE_SCRIPT_RULES.into(),
         FEATURE_MAINTENANCE_MODE.into(),
+        FEATURE_EDGE_REDIRECTS.into(),
+        FEATURE_EDGE_COMPRESSION.into(),
     ];
     // Only an agent that could use its key directory at start takes certificates: without one the
     // `tls` objects of its bundles are ignored, and the control plane must not send a key.
@@ -470,6 +477,7 @@ pub async fn run_waf_agent(
         Hooks {
             bundles: Arc::new(Sink(agent.clone())),
             certificates: Arc::new(Certificates(agent.clone())),
+            edge: Arc::new(Edge(agent.clone())),
             stats: Arc::new(Stats),
             security_data: Arc::new(crate::security_data::AgentSecurityData),
             redact: crate::redact::mask_decision_event,

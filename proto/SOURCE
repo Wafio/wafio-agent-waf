@@ -1,5 +1,5 @@
 # Vendored copy; scripts/sync-proto.sh <tag> rewrites this file.
 repo: Wafio/wafio-cp-backend
 path: shared/proto/agent/v1/agent_control.proto
-tag: shared/v0.3.0
-sha256: 6af7c0308d05aa768acda68e8f42911df1954716d518c6ea78e09cb34515477f
+tag: shared/v0.4.0
+sha256: 0d42f14d62f2acff92e5e11a3e4095b013a742d5aad2dafb941da02e325cbf63

@@ -187,7 +187,9 @@ The black-box suites that start an agent binary and drive it over HTTP and gRPC 
 ## Hello features
 
 The agent reports in `Hello.features`: `script_rules` (it runs script rules in its own process), `maintenance_mode` (it
-serves the maintenance page, see below), `tls_certificates` (it takes `CertificateInstall` and sends `CertificateStatus`, see
+serves the maintenance page, see below), `edge_redirects` and `edge_compression` (it applies the main host name and the path
+prefix of an app and compresses its answers, and reports them in `EdgeStatus`, see "Main host name and path prefix" and
+"Compression"), `tls_certificates` (it takes `CertificateInstall` and sends `CertificateStatus`, see
 "HTTPS from the agent") and, only when no engine is installed, `no_semantic_engine`. The official agent never sends the last
 one. `tls_certificates` goes in every Hello of an agent that could use its key directory at start; without one the start logs a
 warning that names the directory and the cause, the feature is left out, and the `tls` objects of the bundles are ignored. The
@@ -673,6 +675,78 @@ exactly as before.
 - Every TLS connection counts against the listener's connection limit, and the handshake has 10 seconds. A failed handshake closes
   without an answer.
 
+## Main host name and path prefix
+
+Two settings of an app change where a request ends up, and both are checked before anything reaches the application.
+
+**Main host name.** The `tls` object of an app may carry `canonical_host`, one of its `hosts`. A request that arrives under another
+host name of the app gets `308 Permanent Redirect` to `https://<canonical_host>` with the same path and query, and the redirect
+listener of the app (`redirect_listen`) sends every visitor of every host name straight there in one hop. `308` keeps the method, so
+a `POST` is repeated as a `POST`. A value that is not one of `hosts` (compared in lower case, trimmed) refuses the bundle like any
+other `tls` check; an empty one means no redirect.
+
+- The host of `Location` comes from the bundle only, never from the request, so the redirect cannot be turned into an open
+  redirect. The target is the path and query the agent forwards, with every byte that is not visible ASCII (a space, CR, LF, a control
+  or high byte) written as `%XX`, so nothing in a request can end the header line. The port is the one of the HTTPS listener,
+  left out for 443.
+- The redirect comes after the verdict and after the WebSocket handshake takeover: a request that is blocked is never redirected, a
+  WebSocket handshake is handled by its own takeover, and a request that asks for an upgrade (`Upgrade:`) is sent to the application
+  as it is. The decision event of a redirect carries the verdict action and the status `308`, like the event of a request that was
+  forwarded.
+- Browsers keep a `308`. A main host that is changed later may keep sending returning visitors to the old name for a while.
+- It works for an app the agent serves over HTTPS. For an app behind a proxy the server in front of the agent does it.
+
+**Path prefix.** `proxy_config.strip_path_prefix` is the path the application lives under, such as `/shop`. A path that equals the
+prefix, or continues after it with `/`, reaches the application without it (`/shop/cart` is `/cart`, `/shop` and `/shop/` are `/`;
+the query is kept as sent, `/shopping` is not changed). A prefix is `/` and one or more segments, with no empty segment, no `.` or `..`
+segment and no trailing `/`, in printable ASCII without a space, `?`, `#`, `%` or `\`, at most 256 bytes. An invalid one refuses the
+bundle (`invalid app route in WAF bundle`), and an empty one means none.
+
+- The prefix is taken off the path after the agent has decoded it and resolved its dot segments, so `/shop/../admin` is `/admin` and
+  is not changed. Only what goes to the application sees the short path: the HTTP request, and `REQUEST_URI`, `SCRIPT_NAME` and
+  `SCRIPT_FILENAME` of a FastCGI application. Inspection, path rules, decision events and the cache key keep the public path.
+- A request that asks for an upgrade, a WebSocket handshake included, keeps the public path.
+- `Location` headers and links that the application writes are not rewritten. They must include the prefix.
+
+## Compression
+
+An app with `compression` in its bundle entry, `{"enabled": true, "min_bytes": 1024}`, gets its answers compressed with gzip or
+brotli, whichever the visitor's `Accept-Encoding` takes. `min_bytes` is 1024 when it is left out and may be 0 to 1048576; a value
+outside that refuses the bundle. An absent or empty object turns compression off, and so does `enabled: false`. Compression applies
+to the answers the agent reads whole from an HTTP or FastCGI application.
+
+- The encoding: brotli (quality 4) when its weight is the highest and above 0, a tie going to brotli; else gzip (level 5) when its
+  weight is above 0; else none. `*` gives its weight to a coding the list does not name. The agent reads the first 1 KiB of the
+  header and its first 16 tokens, and a weight that does not parse counts as 0. The compressed form is kept only when it is smaller.
+- What is compressed: `text/*` except `text/event-stream`, JSON, JavaScript, XML, WebAssembly, any `+json` or `+xml` type,
+  `image/svg+xml` and the fonts `font/ttf`, `font/otf` and `application/vnd.ms-fontobject`, when the answer has a body of at least
+  `min_bytes` and at most 8 MiB. Not compressed: a streamed answer (no length up front, only counted), the agent's own pages, answers
+  to `HEAD`, `1xx`, `204`, `206`, `304`, an answer with `Content-Range`, `Cache-Control: no-transform` or a `Content-Encoding` other
+  than `identity`, and any other type (images, video, archives, PDF).
+- A compressed answer has its `Content-Length` computed again, a strong `ETag` made weak (`W/`), `Accept-Ranges` dropped and
+  `Content-Encoding` set. Every answer of a listed type at or over `min_bytes`, compressed or not, gets `Vary: Accept-Encoding`
+  merged into its `Vary` (not into `*`), for a cache or CDN in front of the agent.
+- An answer over 64 KiB is compressed on a blocking thread, one for each core at a time. With none free it is sent as it is.
+- **BREACH.** Compressing a page that holds a secret next to text the visitor can reflect lets an attacker guess the secret from the
+  size of the answer. So for a signed-in request, `text/html` and JSON are not compressed; other types, such as styles and scripts,
+  are. A request is signed in when it carries `Authorization`, the userinfo of an absolute-form target, or a cookie whose name
+  holds `sess` (`PHPSESSID`, `JSESSIONID`, `laravel_session`), starts with `wordpress_logged_in`, `wordpress_sec`, `.AspNetCore.` or
+  `remember`, or is `connect.sid`. The test is by name, so an application that keeps its session under another cookie name is
+  not covered.
+- Metrics: `wafio_waf_compression_responses{encoding}`, `wafio_waf_compression_bytes{dir}` (before and after) and
+  `wafio_waf_compression_skipped{reason}` (`streamed`, `too_large`, `busy`, `grew`).
+
+## Edge status and cache purge
+
+An agent that applies the parts above sends `EdgeStatus` for each app of the bundle in force that has one on (a main host name, a
+path prefix or compression): once after a bundle is applied, when a stream comes up, and every minute while one is up. It names the
+parts that run (`redirects`, `compression`, each `applied`) and, for compression, what the app did in the last hour: answers sent
+compressed, answers that came in pieces and were not, and the bytes saved. The counters are kept in one-minute buckets and the
+agent sends the sum of the buckets still inside the hour, not a total since start. An app with no part on gets no status.
+
+This build has no response cache, so it does not send the Hello feature `edge_cache`. It still answers a `CachePurge`: `invalid` for a
+scope or address it does not accept, `not_in_bundle` for an app the bundle does not name, else `cache_off`.
+
 ## Switching inspection off
 
 `semantic_policies.inspection_off` switches inspection off for the project, and a path exception's `inspection_off` does it
@@ -780,12 +854,6 @@ The only C code in the binary is the TLS provider (`ring`) and the allocator (`m
 `tonic-prost-build`, so no `protoc` is needed. A protocol change starts in wafio-cp-backend; then run
 `scripts/sync-proto.sh <tag>` here. `scripts/sync-proto.sh --check` is part of the gate.
 
-`CertificateInstall` carries a private key, and prost ignores the proto's `debug_redact`. So `build.rs` leaves out the
-derived `Debug` of that message and `crates/proto/src/lib.rs` writes one that prints the ids, the leaf digest and the
-two byte lengths, which makes the `Debug` of `ServerMessage` safe too. The same file gives the message a `Drop` that
-zeroes `key_pem`, so a key does not stay in freed memory however the message ends: installed, refused, drained from a
-closing stream or dropped by a panic. This is best effort: tonic keeps its own decode buffer.
-
 ## Release
 
 The release bundle is made by wafio-release `scripts/release.sh <version> --waf-agent <binary>`, which takes the
@@ -810,7 +878,7 @@ Cargo.toml  Cargo.lock       workspace of 18 crates
 crates/
   waf-agent                  the library and the binary wafio-waf-agent-open: flags, run loop, bundle apply, key directory, uploaded and ordered certificates, reload
   control                    gRPC link to the control plane, bundle cache, telemetry
-  proxy                      per-application reverse proxy and WebSocket handling, HTTPS listeners and certificates
+  proxy                      per-application reverse proxy and WebSocket handling, HTTPS listeners and certificates, main host redirect, path prefix, compression
   application                request analysis pipeline, in-memory block and rate-limit stores
   engine-api                 the engine boundary: scan configuration, finding names, coverage marks, the Engine trait
   engine-abi                 the C interface to an engine in a shared library: structs, symbols, header, encodings

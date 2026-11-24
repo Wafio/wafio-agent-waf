@@ -31,6 +31,16 @@ pub struct BundleApp {
     pub maintenance: Vec<u8>,
     /// The app is served over HTTPS by the agent itself: present only in gateway mode.
     pub tls: Option<TlsEntry>,
+    /// Compression of the answers; absent or null is off.
+    pub compression: Option<CompressionEntry>,
+}
+
+/// The `compression` object of an app as sent. `{}` is off: only `enabled: true` turns it on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompressionEntry {
+    pub enabled: bool,
+    /// `None` = not sent: the default applies.
+    pub min_bytes: Option<i64>,
 }
 
 /// The `tls` object of an app as sent, before any check (`crate::tls::entry`). It never carries key
@@ -47,6 +57,8 @@ pub struct TlsEntry {
     pub leaf_sha256: String,
     /// A new id asks the agent to order a certificate now.
     pub acme_request_id: String,
+    /// The main host name; `""` = none.
+    pub canonical_host: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -168,7 +180,7 @@ fn raw_slice(
     })
 }
 
-const APP_FIELDS: [&str; 17] = [
+const APP_FIELDS: [&str; 18] = [
     "app_id",
     "listen_host",
     "listen_port",
@@ -186,9 +198,10 @@ const APP_FIELDS: [&str; 17] = [
     "maintenance",
     "fcgi_keep_conn",
     "tls",
+    "compression",
 ];
 
-const TLS_FIELDS: [&str; 7] = [
+const TLS_FIELDS: [&str; 8] = [
     "listen",
     "hosts",
     "redirect_listen",
@@ -196,6 +209,7 @@ const TLS_FIELDS: [&str; 7] = [
     "certificate_id",
     "leaf_sha256",
     "acme_request_id",
+    "canonical_host",
 ];
 
 fn decode_tls(d: &mut DecodeTrace, v: &Value, t: &mut TlsEntry) -> Result<(), JsonDecodeError> {
@@ -213,7 +227,35 @@ fn decode_tls(d: &mut DecodeTrace, v: &Value, t: &mut TlsEntry) -> Result<(), Js
                 3 => json_decode::string(d, v, &mut t.source),
                 4 => json_decode::string(d, v, &mut t.certificate_id),
                 5 => json_decode::string(d, v, &mut t.leaf_sha256),
-                _ => json_decode::string(d, v, &mut t.acme_request_id),
+                6 => json_decode::string(d, v, &mut t.acme_request_id),
+                _ => json_decode::string(d, v, &mut t.canonical_host),
+            }
+            Ok(())
+        },
+    )
+}
+
+fn decode_compression(
+    d: &mut DecodeTrace,
+    v: &Value,
+    c: &mut CompressionEntry,
+) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.CompressionEntry",
+        "CompressionEntry",
+        &["enabled", "min_bytes"],
+        |d, i, v| {
+            match i {
+                0 => json_decode::boolean(d, v, &mut c.enabled),
+                _ => {
+                    let mut n = 0;
+                    json_decode::int(d, v, &mut n);
+                    if !json_decode::is_null(v) {
+                        c.min_bytes = Some(n);
+                    }
+                }
             }
             Ok(())
         },
@@ -250,7 +292,8 @@ fn decode_app(
                 13 => raw_slice(d, sp, v, &mut a.custom_tuning_rules)?,
                 14 => a.maintenance = sp.raw(v),
                 15 => json_decode::boolean(d, v, &mut a.fcgi_keep_conn),
-                _ => json_decode::optional(d, v, &mut a.tls, decode_tls)?,
+                16 => json_decode::optional(d, v, &mut a.tls, decode_tls)?,
+                _ => json_decode::optional(d, v, &mut a.compression, decode_compression)?,
             }
             Ok(())
         },
@@ -384,7 +427,7 @@ mod tests {
         let b = decode_bundle(
             br#"{"apps":[{"app_id":"x","tls":{"listen":"0.0.0.0:443","Hosts":["a.example.com","b.example.com"],
                "redirect_listen":"0.0.0.0:80","source":"uploaded","certificate_id":"c1","leaf_sha256":"ab",
-               "acme_request_id":"r1","future":{"k":[1]}}},{"app_id":"y"},{"app_id":"z","tls":null}]}"#,
+               "acme_request_id":"r1","Canonical_Host":"a.example.com","future":{"k":[1]}}},{"app_id":"y"},{"app_id":"z","tls":null}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -397,6 +440,7 @@ mod tests {
                 certificate_id: "c1".into(),
                 leaf_sha256: "ab".into(),
                 acme_request_id: "r1".into(),
+                canonical_host: "a.example.com".into(),
             })
         );
         assert_eq!(b.apps[1].tls, None, "absent");
@@ -415,6 +459,42 @@ mod tests {
         assert_eq!(
             decode_bundle(br#"{"apps":[{"tls":"yes"}]}"#).unwrap_err(),
             "apps.tls: expected an object, got a string"
+        );
+    }
+
+    #[test]
+    fn the_compression_object_is_read_and_only_enabled_true_turns_it_on() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"a","compression":{"enabled":true,"min_bytes":2048}},
+               {"app_id":"b","compression":{"enabled":true}},
+               {"app_id":"c","compression":{}},
+               {"app_id":"d","compression":null},
+               {"app_id":"e"},
+               {"app_id":"f","compression":{"Enabled":true,"MIN_BYTES":0,"future":1}},
+               {"app_id":"g","compression":{"enabled":true,"min_bytes":null}}]}"#,
+        )
+        .unwrap();
+        let on = |enabled, min_bytes| Some(CompressionEntry { enabled, min_bytes });
+        let got: Vec<_> = b.apps.iter().map(|a| a.compression.clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                on(true, Some(2048)),
+                on(true, None),
+                on(false, None),
+                None,
+                None,
+                on(true, Some(0)),
+                on(true, None),
+            ]
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"compression":{"min_bytes":"10"}}]}"#).unwrap_err(),
+            "apps.compression.min_bytes: expected an integer, got a string"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"compression":true}]}"#).unwrap_err(),
+            "apps.compression: expected an object, got a boolean"
         );
     }
 

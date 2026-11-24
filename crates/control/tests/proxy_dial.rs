@@ -172,6 +172,7 @@ fn link(addr: &str) -> Arc<ControlLink> {
         Hooks {
             bundles: Arc::new(NoSink),
             certificates: Arc::new(NoCertificates),
+            edge: Arc::new(NoEdge),
             stats: Arc::new(NoStats),
             security_data: Arc::new(NoSec),
             redact: |_| {},

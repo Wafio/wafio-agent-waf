@@ -21,11 +21,13 @@ use wafio_agent_pages::challenge::ChallengeSettings;
 use wafio_application::AnalyzeConfig;
 use wafio_domain::text_helpers::quote;
 use wafio_domain::{
-    ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config, timeout_or_default_ms,
+    ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config, strip_path_prefix_fault,
+    timeout_or_default_ms,
 };
 
 use crate::cert_store::BookChange;
 use crate::maintenance::MaintenanceRoute;
+use crate::redirect::MainHost;
 
 /// What one app's requests are analysed with. Immutable once applied; a bundle replaces it as
 /// a whole.
@@ -69,7 +71,19 @@ pub struct AppSpec {
     /// The agent serves the app over HTTPS itself (its bundle entry has a `tls` object) and opens
     /// no listener at the bundle's address for it; `None` = only the bundle listener, as before.
     pub tls: Option<TlsSite>,
+    /// Compression of the answers the upstream sends whole; `None` = off.
+    pub compression: Option<CompressionSpec>,
 }
+
+/// The compression settings of one app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressionSpec {
+    /// Answers shorter than this go as they are. At most [`MAX_MIN_COMPRESS_BYTES`].
+    pub min_bytes: usize,
+}
+
+/// The largest `CompressionSpec::min_bytes`: 1 MiB.
+pub const MAX_MIN_COMPRESS_BYTES: usize = 1 << 20;
 
 /// One app's HTTPS settings, from the bundle entry of the app.
 #[derive(Clone)]
@@ -86,6 +100,9 @@ pub struct TlsSite {
     /// `host:port` of a plain listener that redirects these hosts to HTTPS once the app has a real
     /// certificate and answers HTTP-01 validations; `None` = no such listener.
     pub redirect_listen: Option<String>,
+    /// The main host name: one of `hosts`, lower case. A request under another of the hosts is
+    /// redirected to it, on both listeners. `None` = no redirect.
+    pub canonical_host: Option<String>,
 }
 
 /// Prints no certificate: the entry holds a private key.
@@ -95,6 +112,7 @@ impl fmt::Debug for TlsSite {
             .field("listen", &self.listen)
             .field("hosts", &self.hosts)
             .field("redirect_listen", &self.redirect_listen)
+            .field("canonical_host", &self.canonical_host)
             .finish_non_exhaustive()
     }
 }
@@ -146,6 +164,9 @@ pub struct Route {
     /// The agent is the edge for this app (it terminates TLS): fingerprint headers count only
     /// from a trusted proxy.
     pub(crate) edge: bool,
+    /// Where the other host names of the app are sent; `None` = nowhere.
+    pub(crate) main_host: Option<MainHost>,
+    pub(crate) compression: Option<CompressionSpec>,
     pub(crate) target: Target,
     /// `timeouts.upstream_ms` resolved (default 30 s); ignored when `upstream_unlimited`.
     pub(crate) upstream_timeout: Duration,
@@ -162,6 +183,12 @@ pub struct Route {
 impl Route {
     pub fn app_id(&self) -> &str {
         &self.app_id
+    }
+
+    /// Whether the route sends the app's other host names to a main host or takes a path prefix
+    /// off what the upstream sees.
+    pub fn redirects(&self) -> bool {
+        self.main_host.is_some() || !self.proxy_config.strip_path_prefix.is_empty()
     }
 
     /// The HTTP upstream's address (resolved per dial, one-minute DNS cache).
@@ -266,6 +293,32 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
             e.0
         )
     })?;
+    if let Some(why) = strip_path_prefix_fault(&pxy.strip_path_prefix) {
+        return Err(format!(
+            "app {}: strip_path_prefix {why}",
+            quote(app.app_id.as_bytes())
+        ));
+    }
+    if app
+        .compression
+        .is_some_and(|c| c.min_bytes > MAX_MIN_COMPRESS_BYTES)
+    {
+        return Err(format!(
+            "app {}: compression min_bytes must be at most {MAX_MIN_COMPRESS_BYTES}",
+            quote(app.app_id.as_bytes())
+        ));
+    }
+    let main_host = match &app.tls {
+        Some(site) => {
+            let port = site
+                .listen
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse().ok());
+            // `Proxy::apply` refuses a listen address without a port; the route is built before it.
+            port.and_then(|port| MainHost::new(site, port))
+        }
+        None => None,
+    };
     let ws = parse_ws_app_policy(&app.rules_json)
         .map_err(|e| format!("app {}: {e}", quote(app.app_id.as_bytes())))?;
     let upstream_to =
@@ -326,6 +379,8 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
         maintenance: parse_maintenance(&app.maintenance).map(MaintenanceRoute::new),
         analysis: app.analysis.clone(),
         edge: app.tls.is_some(),
+        main_host,
+        compression: app.compression,
         target,
         upstream_timeout: upstream_to,
         upstream_unlimited,

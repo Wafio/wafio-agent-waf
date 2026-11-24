@@ -22,6 +22,7 @@ use crate::client_hello;
 use crate::config::{Route, TlsSite};
 use crate::head_parser::UriParts;
 use crate::proxy::Shared;
+use crate::redirect::https_location;
 use crate::request::TlsClient;
 use crate::response::OutboundResponse;
 use crate::route::{HeadLimits, RouteApp, Site, serve_connection};
@@ -329,7 +330,7 @@ impl Site for TlsConn {
 }
 
 /// `host` without its port and trailing dot.
-fn host_name(host: &[u8]) -> &[u8] {
+pub(crate) fn host_name(host: &[u8]) -> &[u8] {
     let host = match host.iter().rposition(|&c| c == b':') {
         Some(colon) if !host.ends_with(b"]") => &host[..colon],
         _ => host,
@@ -389,6 +390,8 @@ pub struct RedirectTarget {
     pub port: u16,
     /// The app the host belongs to: its certificate decides whether the redirect is sent.
     pub app_id: String,
+    /// The app's main host name: the redirect goes to it, whatever host the request named.
+    pub canonical_host: Option<String>,
 }
 
 /// The host names a plain listener sends to HTTPS, with the target of each.
@@ -415,7 +418,8 @@ impl RedirectTable {
     /// The answer to a request: an HTTP-01 validation of a name that is being validated, `404` for
     /// a host that is not in the table, `503` while the host's app has no real certificate (plain
     /// HTTP would carry its logins, and a `308` is cached by the browser that follows it into a
-    /// refused handshake), else `308` to the same host and target over HTTPS.
+    /// refused handshake), else `308` over HTTPS to the app's main host if it has one, the same host
+    /// if not, with the same target.
     pub(crate) fn answer(&self, method: &[u8], parts: &UriParts) -> OutboundResponse {
         if let Some(response) = challenge_response(&self.book, method, parts) {
             return response;
@@ -434,17 +438,8 @@ impl RedirectTable {
         {
             return not_ready();
         }
-        let mut location = format!("https://{name}").into_bytes();
-        if target.port != 443 {
-            location.extend_from_slice(format!(":{}", target.port).as_bytes());
-        }
-        // `OPTIONS *` and an absolute-form target without a path have no origin-form target.
-        if !parts.uri.starts_with(b"/") {
-            location.push(b'/');
-        }
-        if parts.uri.starts_with(b"/") || parts.uri.starts_with(b"?") {
-            location.extend_from_slice(&parts.uri);
-        }
+        let host = target.canonical_host.as_deref().unwrap_or(name);
+        let location = https_location(host, target.port, &parts.uri);
         let mut response = OutboundResponse::new(308);
         response.set(b"Location", &location);
         response
@@ -500,6 +495,7 @@ mod tests {
         let target = |port, app: &str| RedirectTarget {
             port,
             app_id: app.to_owned(),
+            canonical_host: None,
         };
         let table = RedirectTable::new(
             HashMap::from([
@@ -542,6 +538,7 @@ mod tests {
                 RedirectTarget {
                     port: 443,
                     app_id: "shop".to_owned(),
+                    canonical_host: None,
                 },
             )]),
             book.clone(),

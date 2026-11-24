@@ -6,6 +6,7 @@ use crate::bundle_cache::{
 };
 use crate::bundle_puller::{BundleError, BundleProbe, BundleSink, is_management_only};
 use crate::certificates::{AckCode, CertificateSink, run_install};
+use crate::edge::{EdgeSink, PurgeCode};
 use crate::grpc_reconnect::{
     GRPC_CLIENT_KEEPALIVE_TIME, GRPC_CLIENT_KEEPALIVE_TIMEOUT, ReconnectBackoff, jitter,
 };
@@ -26,12 +27,14 @@ use wafio_proto::v1::agent_control_client::AgentControlClient;
 use wafio_proto::v1::agent_message::Kind as Out;
 use wafio_proto::v1::server_message::Kind as In;
 use wafio_proto::v1::{
-    AgentMessage, BundleUpdate, CertificateInstall, CertificateStatus, CommandAck,
+    AgentMessage, BundleUpdate, CachePurge, CertificateInstall, CertificateStatus, CommandAck,
     FetchSecurityData, Heartbeat, Hello,
 };
 
 /// Heartbeat period; `Welcome.heartbeat_seconds` is ignored.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the edge statuses go out again, with fresh counters.
+const EDGE_STATUS_INTERVAL: Duration = Duration::from_secs(60);
 /// Bound on the initial handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Connect timeout.
@@ -180,6 +183,7 @@ pub trait AgentStats: Send + Sync + 'static {
 pub struct Hooks {
     pub bundles: Arc<dyn BundleSink>,
     pub certificates: Arc<dyn CertificateSink>,
+    pub edge: Arc<dyn EdgeSink>,
     pub stats: Arc<dyn AgentStats>,
     pub security_data: Arc<dyn SecurityData>,
     pub redact: Redactor,
@@ -315,6 +319,8 @@ pub struct ControlLink {
     statuses: Mutex<BTreeMap<String, CertificateStatus>>,
     /// Wakes the status task; one pending wake-up is enough, as it drains `statuses`.
     status_wake: mpsc::Sender<()>,
+    /// Wakes the task that sends the edge statuses; one pending wake-up is enough.
+    edge_wake: mpsc::Sender<()>,
     /// Orders the applies and retries of bundles, the cached one at start included, so a retry
     /// never lands after a newer bundle.
     bundle_retry: Arc<BundleRetry>,
@@ -332,6 +338,7 @@ impl ControlLink {
     /// [`ControlLink::new`] with `write` as the way a bundle reaches the cache directory.
     pub fn with_cache_write(cfg: ControlConfig, hooks: Hooks, write: CacheWrite) -> Arc<Self> {
         let (status_wake, status_wake_rx) = mpsc::channel(1);
+        let (edge_wake, edge_wake_rx) = mpsc::channel(1);
         let link = Arc::new(ControlLink {
             control_config: Mutex::new(cfg),
             hooks,
@@ -342,6 +349,7 @@ impl ControlLink {
             malware_lock: tokio::sync::Mutex::const_new(()),
             statuses: Mutex::new(BTreeMap::new()),
             status_wake,
+            edge_wake,
             bundle_retry: Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX)),
             cache_writer: CacheWriter::new(write),
         });
@@ -353,6 +361,7 @@ impl ControlLink {
             Arc::downgrade(&link),
             status_wake_rx,
         ));
+        tokio::spawn(send_edge_statuses(Arc::downgrade(&link), edge_wake_rx));
         link
     }
 
@@ -397,6 +406,14 @@ impl ControlLink {
             .insert(status.app_id.clone(), status);
         // A full channel means a wake-up is already waiting.
         let _ = self.status_wake.try_send(());
+    }
+
+    /// Asks for the edge statuses to go out now: the settings of an app or what the agent counts
+    /// changed. Without a stream nothing goes out; the next connect sends them. Callable from any
+    /// thread.
+    pub fn report_edge(&self) {
+        // A full channel means a wake-up is already waiting.
+        let _ = self.edge_wake.try_send(());
     }
 
     /// One dial + Hello + Welcome within 12 s, so bad credentials fail the start instead of
@@ -479,6 +496,9 @@ impl ControlLink {
             "[agent-grpc] connected to {} as {:?}",
             cfg.server_address, cfg.agent_name
         );
+        // The control plane may keep what it was told on the last stream, but the counters are
+        // fresh and the bundle in force may have changed while no stream was up.
+        self.report_edge();
 
         // Everything this stream starts ends with it, except a bundle retry.
         let mut tasks = JoinSet::new();
@@ -542,6 +562,7 @@ impl ControlLink {
                     ));
                 }
                 Some(In::CertificateInstall(ci)) => self.handle_install(ci, &send).await,
+                Some(In::CachePurge(cp)) => self.handle_purge(cp, &send).await,
                 None => {}
             }
         }
@@ -567,6 +588,19 @@ impl ControlLink {
             ),
         }
         let _ = send.send(install_ack(command_id, res)).await;
+    }
+
+    /// Runs the purge and acks it before the next message is read, as an install is.
+    async fn handle_purge(&self, purge: CachePurge, send: &StreamSender) {
+        // The ids only: the address stays out of the log.
+        let (command_id, app_id) = (purge.command_id.clone(), purge.app_id.clone());
+        let sink = self.hooks.edge.clone();
+        let res = tokio::task::spawn_blocking(move || sink.purge(&purge))
+            .await
+            .unwrap_or(Err(PurgeCode::Busy));
+        let code = res.err().map_or("", PurgeCode::as_str);
+        info!("[agent-grpc] cache purge command_id={command_id:?} app_id={app_id:?}: {code:?}");
+        let _ = send.send(ack(command_id, res.is_ok(), code.into())).await;
     }
 
     /// Host info on connect, then every 30 s.
@@ -678,6 +712,7 @@ impl ControlLink {
             *self.last_gen.lock().unwrap() = generation;
             self.set_bundle_status(BUNDLE_SOURCE_LIVE, generation);
             self.queue_applied_bundle(&bu.bundle_json, generation);
+            self.report_edge();
         }
         (Retry::No, Ok(()))
     }
@@ -841,6 +876,7 @@ fn kind_name(k: &Option<In>) -> &'static str {
         Some(In::Ping(_)) => "*agentv1.ServerMessage_Ping",
         Some(In::FetchSecurityData(_)) => "*agentv1.ServerMessage_FetchSecurityData",
         Some(In::CertificateInstall(_)) => "*agentv1.ServerMessage_CertificateInstall",
+        Some(In::CachePurge(_)) => "*agentv1.ServerMessage_CachePurge",
     }
 }
 
@@ -1047,6 +1083,41 @@ async fn send_certificate_statuses(link: Weak<ControlLink>, mut wake: mpsc::Rece
             };
             if let Err(e) = send.send(msg).await {
                 info!("[agent-grpc] dropping certificate status of app {app_id:?}: {e}");
+            }
+        }
+    }
+}
+
+/// Sends the edge statuses when woken and every minute while a stream is up. The agent builds
+/// them with counters as of the moment, so each send is fresh. With no stream up the wake-up is
+/// dropped: the next connect wakes the task again.
+async fn send_edge_statuses(link: Weak<ControlLink>, mut wake: mpsc::Receiver<()>) {
+    let mut tick = tokio::time::interval(EDGE_STATUS_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick is due at once; a connect wakes the task, so skip it.
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            woken = wake.recv() => if woken.is_none() { return },
+        }
+        let Some(l) = link.upgrade() else { return };
+        let Some(send) = l.active.lock().unwrap().clone() else {
+            continue;
+        };
+        let sink = l.hooks.edge.clone();
+        drop(l);
+        let statuses = tokio::task::spawn_blocking(move || sink.statuses())
+            .await
+            .unwrap_or_default();
+        for status in statuses {
+            let app_id = status.app_id.clone();
+            let msg = AgentMessage {
+                kind: Some(Out::EdgeStatus(status)),
+            };
+            if let Err(e) = send.send(msg).await {
+                info!("[agent-grpc] dropping edge status of app {app_id:?}: {e}");
+                break;
             }
         }
     }
@@ -1877,6 +1948,7 @@ mod tests {
             Hooks {
                 bundles,
                 certificates,
+                edge: Arc::new(crate::edge::NoEdge),
                 stats: Arc::new(ZeroStats),
                 security_data: Arc::new(NoSec),
                 redact: |_| {},

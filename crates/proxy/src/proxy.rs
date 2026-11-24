@@ -15,6 +15,7 @@ use wafio_agent_pages::iprep::ReputationChecker;
 use crate::cert_store::CertBook;
 use crate::config::{AppSpec, Route, TlsSite, build_route};
 use crate::decision::DecisionSink;
+use crate::edge_stats::{CompressionCounters, EdgeStats};
 use crate::https::{RedirectTarget, TLS_HANDSHAKE_TIMEOUT};
 use crate::listeners::{ROUTE_DRAIN_GRACE, RouteManager, RouteSpec, Serves};
 use crate::route::CONNECTION_LIMIT;
@@ -65,10 +66,13 @@ pub(crate) struct Shared {
     pub transport: TransportConnector,
     /// The certificates of every TLS listener, by app.
     pub book: Arc<CertBook>,
+    /// What the edge parts of each app count.
+    pub edge: EdgeStats,
 }
 
 pub struct Proxy {
     manager: RouteManager,
+    shared: Arc<Shared>,
 }
 
 fn format_host_port(host: &str, port: u16) -> String {
@@ -89,8 +93,10 @@ impl Proxy {
             connector: Connector::new(None),
             transport: TransportConnector::new(None),
             book: Arc::default(),
+            edge: EdgeStats::default(),
         });
         Proxy {
+            shared: shared.clone(),
             manager: RouteManager::new(
                 shared,
                 opts.drain_timeout,
@@ -139,6 +145,7 @@ impl Proxy {
                     let target = RedirectTarget {
                         port,
                         app_id: app.app_id.clone(),
+                        canonical_host: site.canonical_host.clone(),
                     };
                     for host in &site.hosts {
                         let other = hosts.insert(host.to_ascii_lowercase(), target.clone());
@@ -185,7 +192,17 @@ impl Proxy {
         }));
         self.manager.apply(specs)?;
         wafio_agent_io::ip_jail_guard::install_trusted_proxy_configs(proxy_cfgs);
+        self.shared
+            .edge
+            .retain(&apps.iter().map(|a| a.app_id.as_str()).collect());
         Ok(())
+    }
+
+    /// What the compression of `app_id` did over the last hour; `None` for an app that never
+    /// compressed or counted anything since this process started.
+    pub fn compression_counters(&self, app_id: &str) -> Option<CompressionCounters> {
+        let now = u64::try_from(crate::decision::now_unix()).unwrap_or(0);
+        Some(self.shared.edge.get(app_id)?.compression_counters(now))
     }
 
     /// The certificates the TLS listeners serve, by app id, and the validation answers they give.

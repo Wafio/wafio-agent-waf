@@ -217,6 +217,7 @@ mod tests {
             listen: listen.into(),
             redirect_listen: redirect.map(str::to_owned),
             hosts: vec!["shop.example.com".into()],
+            canonical_host: None,
             source: Source::Acme,
             certificate: None,
             request_id: request_id.into(),

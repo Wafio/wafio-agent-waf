@@ -32,6 +32,26 @@ pub fn count_agent_panic() {
 /// Requests answered with the maintenance page.
 pub static MAINTENANCE_RESPONSES: AtomicU64 = AtomicU64::new(0);
 
+/// Answers sent compressed, by encoding.
+pub static COMPRESSED_GZIP: AtomicU64 = AtomicU64::new(0);
+pub static COMPRESSED_BROTLI: AtomicU64 = AtomicU64::new(0);
+/// Bytes of the compressed answers before compression and as sent.
+pub static COMPRESSION_BYTES_IN: AtomicU64 = AtomicU64::new(0);
+pub static COMPRESSION_BYTES_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// Why an answer that could have been compressed was not: it came in pieces, it was over the
+/// largest size, no compression slot was free, or the compressed form was not smaller.
+pub const COMPRESSION_SKIP_REASONS: [&str; 4] = ["streamed", "too_large", "busy", "grew"];
+pub(crate) const SKIP_STREAMED: usize = 0;
+pub(crate) const SKIP_TOO_LARGE: usize = 1;
+pub(crate) const SKIP_BUSY: usize = 2;
+pub(crate) const SKIP_GREW: usize = 3;
+pub static COMPRESSION_SKIPPED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn count_compression_skipped(reason: usize) {
+    COMPRESSION_SKIPPED[reason].fetch_add(1, Ordering::Relaxed);
+}
+
 /// Most distinct coverage flags kept as labels; the rest count as "other".
 const COVERAGE_LABEL_CAP: usize = 32;
 

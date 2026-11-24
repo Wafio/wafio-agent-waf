@@ -313,6 +313,7 @@ mod tests {
             maintenance: maintenance.as_bytes().to_vec(),
             analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
             tls: None,
+            compression: None,
         })
         .unwrap()
     }

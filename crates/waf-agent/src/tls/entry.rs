@@ -48,6 +48,8 @@ pub struct Settings {
     pub redirect_listen: Option<String>,
     /// Lower case, each once, in the order sent.
     pub hosts: Vec<String>,
+    /// The main host name: one of `hosts`. A request under another of them is redirected to it.
+    pub canonical_host: Option<String>,
     pub source: Source,
     /// Uploaded source with a current certificate only.
     pub certificate: Option<Certificate>,
@@ -99,6 +101,7 @@ pub fn check(app_id: &str, entry: &TlsEntry) -> Result<Settings, Refusal> {
         return refuse("app_id", "must be a lower-case UUID");
     }
     let hosts = check_hosts(&entry.hosts)?;
+    let canonical_host = check_canonical_host(&entry.canonical_host, &hosts)?;
     let listen = match entry.listen.trim() {
         "" => DEFAULT_LISTEN,
         listen => listen,
@@ -129,6 +132,7 @@ pub fn check(app_id: &str, entry: &TlsEntry) -> Result<Settings, Refusal> {
         listen: show(listen),
         redirect_listen: redirect.map(show),
         hosts,
+        canonical_host,
         source,
         certificate: None,
         request_id: String::new(),
@@ -186,12 +190,7 @@ fn check_hosts(sent: &[String]) -> Result<Vec<String>, Refusal> {
     let mut hosts = Vec::new();
     let mut seen = HashSet::new();
     for h in sent {
-        // One lower-case letter per letter, as Go's per-rune mapping (U+0130 becomes a plain i).
-        let h: String = h
-            .trim()
-            .chars()
-            .map(|c| c.to_lowercase().next().unwrap_or(c))
-            .collect();
+        let h = lower_case(h.trim());
         if !seen.insert(h.clone()) {
             continue;
         }
@@ -207,6 +206,29 @@ fn check_hosts(sent: &[String]) -> Result<Vec<String>, Refusal> {
         return refuse("hosts", "at least one host is required");
     }
     Ok(hosts)
+}
+
+/// The main host name, trimmed and lower case as the names are: empty is none, anything else is
+/// one of `hosts`.
+fn check_canonical_host(sent: &str, hosts: &[String]) -> Result<Option<String>, Refusal> {
+    let host = lower_case(sent.trim());
+    if host.is_empty() {
+        return Ok(None);
+    }
+    if !hosts.contains(&host) {
+        return refuse(
+            "canonical_host",
+            format!("{:?} is not one of the hosts", shorten(&host)),
+        );
+    }
+    Ok(Some(host))
+}
+
+/// One lower-case letter per letter, as Go's per-rune mapping (U+0130 becomes a plain i).
+fn lower_case(s: &str) -> String {
+    s.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
 }
 
 /// The start of a value that goes into a log line.
@@ -373,6 +395,41 @@ pub(crate) mod tests {
                 None,
             ),
             ("no listener named", with(|e| e.listen.clear()), None),
+            (
+                "a main host that is one of the hosts",
+                with(|e| e.canonical_host = "shop.example.com".into()),
+                None,
+            ),
+            (
+                "a main host in upper case with spaces",
+                with(|e| e.canonical_host = " SHOP.Example.COM ".into()),
+                None,
+            ),
+            (
+                "no main host",
+                with(|e| e.canonical_host = "  ".into()),
+                None,
+            ),
+            (
+                "a main host that is not one of the hosts",
+                with(|e| e.canonical_host = "www.example.com".into()),
+                Some("canonical_host"),
+            ),
+            (
+                "a main host with a wildcard",
+                with(|e| e.canonical_host = "*.example.com".into()),
+                Some("canonical_host"),
+            ),
+            (
+                "a main host with a port",
+                with(|e| e.canonical_host = "shop.example.com:443".into()),
+                Some("canonical_host"),
+            ),
+            (
+                "a main host that starts like a host",
+                with(|e| e.canonical_host = "shop.example.com.evil.test".into()),
+                Some("canonical_host"),
+            ),
             (
                 "names trimmed, lower-cased and kept once",
                 hosts(&[" Shop.Example.COM ", "www.example.com", "shop.example.com"]),
@@ -629,6 +686,17 @@ pub(crate) mod tests {
             Some(format!("{CERT}.pem").as_str())
         );
 
+        assert_eq!(s.canonical_host, None);
+        let main = check(
+            APP,
+            &with(|e| {
+                e.hosts = vec!["shop.example.com".into(), "www.example.com".into()];
+                e.canonical_host = " WWW.example.com ".into();
+            }),
+        )
+        .unwrap();
+        assert_eq!(main.canonical_host.as_deref(), Some("www.example.com"));
+
         let default = check(APP, &with(|e| e.listen.clear())).unwrap();
         assert_eq!(default.listen, "0.0.0.0:443");
         assert_eq!(default.redirect_listen, None);
@@ -850,6 +918,9 @@ pub(crate) mod tests {
             let r = r.parse::<std::net::SocketAddr>().expect(&context);
             assert!(r.port() != 0 && r != listen, "{context}");
         }
+        if let Some(main) = &s.canonical_host {
+            assert!(s.hosts.contains(main), "{context}");
+        }
         if let Some(c) = &s.certificate {
             assert!(is_uuid(&c.id) && c.leaf_sha256.len() == 64, "{context}");
             assert_eq!(s.source, Source::Uploaded, "{context}");
@@ -877,8 +948,9 @@ pub(crate) mod tests {
             "certificate_id",
             "leaf_sha256",
             "acme_request_id",
+            "canonical_host",
         ];
-        let seeds: Vec<[String; 8]> = vec![
+        let seeds: Vec<[String; 9]> = vec![
             [
                 APP,
                 "0.0.0.0:443",
@@ -887,6 +959,7 @@ pub(crate) mod tests {
                 "uploaded",
                 CERT,
                 leaf().as_str(),
+                "",
                 "",
             ]
             .map(String::from),
@@ -899,6 +972,7 @@ pub(crate) mod tests {
                 "",
                 "",
                 "6f1c0c64-4f7e-4a06-8cf3-0b7c2a6d1e90",
+                "a.example.com",
             ]
             .map(String::from),
             [
@@ -910,13 +984,14 @@ pub(crate) mod tests {
                 "",
                 "",
                 "",
+                "xn--mnchen-3ya.de",
             ]
             .map(String::from),
         ];
-        let document = |v: &[String; 8]| {
+        let document = |v: &[String; 9]| {
             serde_json::json!({"apps": [{"app_id": v[0], "listen_host": "127.0.0.1", "listen_port": 8080, "tls": {
                 "listen": v[1], "hosts": [v[2], v[2].to_uppercase()], "redirect_listen": v[3], "source": v[4],
-                "certificate_id": v[5], "leaf_sha256": v[6], "acme_request_id": v[7]}}]})
+                "certificate_id": v[5], "leaf_sha256": v[6], "acme_request_id": v[7], "canonical_host": v[8]}}]})
             .to_string()
             .into_bytes()
         };
@@ -935,7 +1010,7 @@ pub(crate) mod tests {
                 let mut raw = Vec::new();
                 if round > 0 && rng.below(2) == 0 {
                     for _ in 0..1 + rng.below(3) {
-                        let v = &mut values[rng.below(8)];
+                        let v = &mut values[rng.below(9)];
                         let mut bytes = v.clone().into_bytes();
                         mutate_bytes(&mut bytes, &mut rng);
                         *v = String::from_utf8_lossy(&bytes).into_owned();
