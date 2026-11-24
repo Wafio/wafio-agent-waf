@@ -589,8 +589,10 @@ impl Agent {
 
 impl Agent {
     /// One status for each app of the bundle in force that has an edge part on, in app id order,
-    /// with the compression counters as of now.
-    pub fn edge_statuses(&self) -> Vec<EdgeStatus> {
+    /// with the compression counters as of now. With `every_app` an app with no part on gets one
+    /// too, with no features and no counters: that is how the control plane learns that the app
+    /// runs the generation of a save that switched its last part off.
+    pub fn edge_statuses(&self, every_app: bool) -> Vec<EdgeStatus> {
         let (generation, edge) = {
             let st = self.lock();
             (st.generation, st.edge.clone())
@@ -603,7 +605,7 @@ impl Agent {
         };
         let mut apps: Vec<_> = edge
             .into_iter()
-            .filter(|(_, e)| e.redirects || e.compression)
+            .filter(|(_, e)| every_app || e.redirects || e.compression)
             .collect();
         apps.sort_by(|a, b| a.0.cmp(&b.0));
         apps.into_iter()
@@ -668,8 +670,8 @@ impl Agent {
 pub struct Edge(pub Arc<Agent>);
 
 impl EdgeSink for Edge {
-    fn statuses(&self) -> Vec<EdgeStatus> {
-        self.0.edge_statuses()
+    fn statuses(&self, every_app: bool) -> Vec<EdgeStatus> {
+        self.0.edge_statuses(every_app)
     }
 
     fn purge(&self, purge: &CachePurge) -> Result<(), PurgeCode> {

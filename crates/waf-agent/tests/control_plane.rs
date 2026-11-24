@@ -303,7 +303,7 @@ async fn agent_talks_to_the_control_plane() {
 
     // A live bundle: acked, cached, READY, the listener proxies.
     let bundle = format!(
-        r#"{{"agent_id":"cf4","project_id":"p","generation":1,"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block","proxy_config":{{"strip_path_prefix":"/shop"}},"compression":{{"enabled":true,"min_bytes":2}},"rules_json":{{"path_exceptions":[{{"path":"/search","block":{{}}}}]}}}}]}}"#
+        r#"{{"agent_id":"cf4","project_id":"p","generation":1,"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block","proxy_config":{{"strip_path_prefix":"/shop"}},"compression":{{"enabled":true,"min_bytes":2}},"rules_json":{{"path_exceptions":[{{"path":"/shop/search","block":{{}}}}]}}}}]}}"#
     );
     let bu = BundleUpdate {
         command_id: "b1".into(),
@@ -358,7 +358,7 @@ async fn agent_talks_to_the_control_plane() {
     // The ack does not wait for the cache write.
     let cache = common::cached_bundle(&dir.join("state"), 3).await;
     assert!(cache.contains("\"generation\":3"), "{cache}");
-    let ok = tokio::task::spawn_blocking(move || get(listen, "/hello", ""))
+    let ok = tokio::task::spawn_blocking(move || get(listen, "/shop/hello", ""))
         .await
         .unwrap();
     assert!(ok.starts_with("HTTP/1.1 200") && ok.ends_with("ok"), "{ok}");
@@ -368,7 +368,7 @@ async fn agent_talks_to_the_control_plane() {
     let blocked = tokio::task::spawn_blocking(move || {
         get(
             listen,
-            "/search?q=anything",
+            "/shop/search?q=anything",
             "Authorization: Bearer secret-token\r\n",
         )
     })
@@ -532,7 +532,7 @@ async fn agent_talks_to_the_control_plane() {
         .await
         .unwrap();
     assert!(status.success(), "predecessor: {status:?}");
-    let ok = tokio::task::spawn_blocking(move || get(listen, "/again", ""))
+    let ok = tokio::task::spawn_blocking(move || get(listen, "/shop/again", ""))
         .await
         .unwrap();
     assert!(ok.starts_with("HTTP/1.1 200"), "successor serves: {ok}");

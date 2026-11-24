@@ -72,19 +72,37 @@ pub(crate) fn https_location(host: &str, port: u16, target: &[u8]) -> Vec<u8> {
     location
 }
 
+/// What follows `prefix` in `path`: `/` when nothing does, the rest when it starts with `/`, and
+/// `None` when the path is not under the prefix (`/shopping` is not under `/shop`).
+fn below_prefix<'a>(prefix: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
+    match path.strip_prefix(prefix)? {
+        [] => Some(b"/"),
+        rest if rest.starts_with(b"/") => Some(rest),
+        _ => None,
+    }
+}
+
+/// Whether the route has a path prefix and the request is for a path outside it. Such a request
+/// is answered `404` and never reaches the application: it would arrive under a path that no
+/// rule written for the public one covers (`/admin` for the page that is public at
+/// `/shop/admin`). The path is the one the pipeline inspects, decoded with its dot segments
+/// resolved, so `/shop/../admin` is outside `/shop`.
+pub(crate) fn outside_prefix(route: &Route, req: &InboundRequest) -> bool {
+    let prefix = route.proxy_config.strip_path_prefix.as_bytes();
+    !prefix.is_empty() && below_prefix(prefix, &req.forward_path).is_none()
+}
+
 /// The request target the upstream gets: the public one, with the route's path prefix taken off
 /// when the path equals it or goes on with `/` (`/` when nothing is left). The prefix is matched
-/// on the decoded path, dot segments already resolved, so `/shop/../admin` is `/admin` and keeps
-/// it. A request that asks for an upgrade is not changed.
+/// on the decoded path, dot segments already resolved. A request that asks for an upgrade is not
+/// changed. A path outside the prefix never gets here (`outside_prefix`); it is left as it is.
 pub(crate) fn upstream_target<'a>(route: &Route, req: &'a InboundRequest) -> Cow<'a, [u8]> {
     let prefix = route.proxy_config.strip_path_prefix.as_bytes();
     if prefix.is_empty() || req.has_upgrade() {
         return Cow::Borrowed(&req.forward_request_target);
     }
-    let rest = match req.forward_path.strip_prefix(prefix) {
-        Some([]) => &b"/"[..],
-        Some(rest) if rest.starts_with(b"/") => rest,
-        _ => return Cow::Borrowed(&req.forward_request_target),
+    let Some(rest) = below_prefix(prefix, &req.forward_path) else {
+        return Cow::Borrowed(&req.forward_request_target);
     };
     let mut target = Vec::with_capacity(req.forward_request_target.len());
     push_escaped_path(&mut target, rest);
@@ -302,6 +320,43 @@ mod tests {
         assert_eq!(target(cfg, &req), "/cart?x=%3Cb%3E");
         assert_eq!(req.forward_path, b"/shop/cart");
         assert_eq!(req.forward_request_target, b"/shop/cart?x=%3Cb%3E");
+    }
+
+    #[test]
+    fn a_path_outside_the_prefix_is_told_from_one_under_it() {
+        let shop = route(r#"{"strip_path_prefix":"/shop"}"#, None);
+        for (path, outside) in [
+            ("/shop", false),
+            ("/shop/", false),
+            ("/shop/admin", false),
+            ("/shop?a=1", false),
+            ("/shop/%2e%2e/shop/x", false),
+            ("/admin", true),
+            ("/", true),
+            ("/shopping", true),
+            ("/shop2/x", true),
+            ("/Shop/x", true),
+            ("/other/shop/x", true),
+            // Dot segments are resolved first, so this is `/admin`.
+            ("/shop/../admin", true),
+            ("/shop/%2e%2e/admin", true),
+            ("/a/../shop/x", false),
+        ] {
+            assert_eq!(
+                outside_prefix(&shop, &request("a.test", path)),
+                outside,
+                "{path}"
+            );
+        }
+        let deeper = route(r#"{"strip_path_prefix":"/a/b"}"#, None);
+        assert!(outside_prefix(&deeper, &request("a.test", "/a")));
+        assert!(outside_prefix(&deeper, &request("a.test", "/a/bc")));
+        assert!(!outside_prefix(&deeper, &request("a.test", "/a/b/c")));
+        // No prefix: no path is outside it.
+        for cfg in ["{}", r#"{"strip_path_prefix":""}"#] {
+            let r = route(cfg, None);
+            assert!(!outside_prefix(&r, &request("a.test", "/admin")), "{cfg}");
+        }
     }
 
     #[test]

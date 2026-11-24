@@ -218,6 +218,31 @@ async fn oversize_text_closes_1009() {
     assert_eq!(s(&h.last_event().match_detail), "ws_text_oversize");
 }
 
+/// A handshake for a path outside the app's path prefix is answered `404` like any request there,
+/// and never reaches the upstream; one under the prefix is relayed with the public path.
+#[tokio::test]
+async fn a_handshake_outside_the_path_prefix_never_reaches_the_upstream() {
+    let (up, echo) = echo_upstream().await;
+    let port = free_port();
+    let mut a = ws_app(port, up, "");
+    a.proxy_config = br#"{"strip_path_prefix":"/shop"}"#.to_vec();
+    let (h, proxy) = Harness::serve_with_fake_engine(vec![a]);
+    let err = ws_client(proxy, "/admin/ws", &[])
+        .await
+        .err()
+        .expect("handshake refused");
+    assert!(matches!(err, WsError::Handshake(_)), "{err:?}");
+    settle().await;
+    assert_eq!(echo.accepts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.last_event().status, 404);
+
+    let c = ws_client(proxy, "/shop/ws", &[]).await.unwrap();
+    c.send_data_message(1, b"hi").await.unwrap();
+    assert_eq!(c.next_data_message().await.unwrap(), (1, b"hi".to_vec()));
+    let head = echo.heads.lock().unwrap()[0].clone();
+    assert!(head.starts_with("GET /shop/ws HTTP/1.1"), "{head}");
+}
+
 #[tokio::test]
 async fn blocked_handshake_and_origin_check_never_reach_upstream() {
     let (up, echo) = echo_upstream().await;

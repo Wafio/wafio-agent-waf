@@ -38,7 +38,7 @@ use crate::decision::{
     emit_decision_event, emit_upstream_error_event, first_header_value, now_unix,
 };
 use crate::proxy::Shared;
-use crate::redirect::upstream_target;
+use crate::redirect::{outside_prefix, upstream_target};
 use crate::request::InboundRequest;
 use crate::response::OutboundResponse;
 use crate::upstream::Forwarded;
@@ -648,6 +648,14 @@ pub(crate) async fn handle(
     }
     if v.action == "block" && mode == "monitor" {
         v.action = "monitor".into();
+    }
+
+    // A path outside the app's path prefix is not the application's: `404`, for a WebSocket
+    // handshake too. Forwarded as it came it would reach the application under a path that no rule
+    // written for the public one covers (`/admin` for the page that is public at `/shop/admin`).
+    if outside_prefix(route, &req) {
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, 404);
+        return answer(OutboundResponse::error(404, "Not Found"));
     }
 
     if ws {

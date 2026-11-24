@@ -16,7 +16,7 @@ dst=proto/agent/v1/agent_control.proto
 cp_dir=${WAFIO_CP_BACKEND:-../wafio-cp-backend}
 fixture_src=test/frontend-fixtures
 fixture_dst=crates/proxy/tests/data
-fixtures=(trace-keep-names.json)
+fixtures=(trace-keep-names.json delivery-checks.json)
 
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 src_value() { sed -n "s/^$1: //p" proto/SOURCE; }
@@ -29,7 +29,7 @@ case "${1:-}" in
     for f in "${fixtures[@]}"; do
       [ "$(fixture_sha "$f")" = "$(sha "$fixture_dst/$f")" ] || { echo "sync-proto: $fixture_dst/$f differs from the sha256 in proto/SOURCE" >&2; exit 1; }
     done
-    if [ -d "$cp_dir/.git" ]; then
+    if [ -e "$cp_dir/.git" ]; then
       for f in "${fixtures[@]}"; do
         cmp "$cp_dir/$fixture_src/$f" "$fixture_dst/$f" || { echo "sync-proto: $fixture_dst/$f differs from $cp_dir/$fixture_src/$f" >&2; exit 1; }
       done

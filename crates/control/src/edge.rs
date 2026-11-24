@@ -34,8 +34,11 @@ impl PurgeCode {
 /// a stream comes up and every minute while one is up; it sends what comes back as it is.
 pub trait EdgeSink: Send + Sync + 'static {
     /// One status for each app of the bundle in force that has an edge part on, with the counters
-    /// as of now.
-    fn statuses(&self) -> Vec<EdgeStatus>;
+    /// as of now. With `every_app` (after a live bundle and when a stream comes up) an app with no
+    /// part on gets one too, with no features and no counters: the control plane waits for the
+    /// generation an app runs after a save that switched its last part off, and an agent that
+    /// started with that bundle never said so. The minute refresh leaves such apps out.
+    fn statuses(&self, every_app: bool) -> Vec<EdgeStatus>;
 
     /// Removes the stored answers `purge` names.
     fn purge(&self, purge: &CachePurge) -> Result<(), PurgeCode>;
@@ -45,7 +48,7 @@ pub trait EdgeSink: Send + Sync + 'static {
 pub struct NoEdge;
 
 impl EdgeSink for NoEdge {
-    fn statuses(&self) -> Vec<EdgeStatus> {
+    fn statuses(&self, _: bool) -> Vec<EdgeStatus> {
         Vec::new()
     }
 
@@ -85,7 +88,8 @@ mod tests {
 
     #[test]
     fn no_edge_says_nothing_and_refuses_every_purge() {
-        assert!(NoEdge.statuses().is_empty());
+        assert!(NoEdge.statuses(true).is_empty());
+        assert!(NoEdge.statuses(false).is_empty());
         assert_eq!(
             NoEdge.purge(&CachePurge::default()),
             Err(PurgeCode::CacheOff)

@@ -691,21 +691,26 @@ other `tls` check; an empty one means no redirect.
   left out for 443.
 - The redirect comes after the verdict and after the WebSocket handshake takeover: a request that is blocked is never redirected, a
   WebSocket handshake is handled by its own takeover, and a request that asks for an upgrade (`Upgrade:`) is sent to the application
-  as it is. The decision event of a redirect carries the verdict action and the status `308`, like the event of a request that was
+  as it is. A path outside the app's path prefix (below) is `404` under every host name and is not redirected. The decision event of a redirect carries the verdict action and the status `308`, like the event of a request that was
   forwarded.
 - Browsers keep a `308`. A main host that is changed later may keep sending returning visitors to the old name for a while.
 - It works for an app the agent serves over HTTPS. For an app behind a proxy the server in front of the agent does it.
 
 **Path prefix.** `proxy_config.strip_path_prefix` is the path the application lives under, such as `/shop`. A path that equals the
 prefix, or continues after it with `/`, reaches the application without it (`/shop/cart` is `/cart`, `/shop` and `/shop/` are `/`;
-the query is kept as sent, `/shopping` is not changed). A prefix is `/` and one or more segments, with no empty segment, no `.` or `..`
-segment and no trailing `/`, in printable ASCII without a space, `?`, `#`, `%` or `\`, at most 256 bytes. An invalid one refuses the
-bundle (`invalid app route in WAF bundle`), and an empty one means none.
+the query is kept as sent). Any other path is not the application's: the agent answers it `404`, a WebSocket handshake included,
+and the request never reaches the application (`/shopping` and `/admin` are `404` under `/shop`). A prefix is `/` and one or more
+segments, with no empty segment, no `.` or `..` segment and no trailing `/`, in printable ASCII without a space, `?`, `#`, `%` or
+`\`, at most 256 bytes. An invalid one refuses the bundle (`invalid app route in WAF bundle`), and an empty one means none.
 
-- The prefix is taken off the path after the agent has decoded it and resolved its dot segments, so `/shop/../admin` is `/admin` and
-  is not changed. Only what goes to the application sees the short path: the HTTP request, and `REQUEST_URI`, `SCRIPT_NAME` and
+- The prefix is matched on the path after the agent has decoded it and resolved its dot segments, so `/shop/../admin` is `/admin`
+  and is `404`. Only what goes to the application sees the short path: the HTTP request, and `REQUEST_URI`, `SCRIPT_NAME` and
   `SCRIPT_FILENAME` of a FastCGI application. Inspection, path rules, decision events and the cache key keep the public path.
-- A request that asks for an upgrade, a WebSocket handshake included, keeps the public path.
+- The `404` is the reason rules written for the public path (`/shop/admin`, `/shop/login`) cannot be walked around: a request for
+  `/admin` is not forwarded to the page that is public at `/shop/admin`. It comes after the verdict, so a request that a rule blocks
+  is still blocked and counted, and its decision event carries the status `404`. The challenge verify endpoint and the answers
+  of the plain HTTP listener (certificate validation, the redirect to HTTPS) do not depend on the prefix.
+- A request that asks for an upgrade, a WebSocket handshake included, keeps the public path when it goes to the application.
 - `Location` headers and links that the application writes are not rewritten. They must include the prefix.
 
 ## Compression
@@ -738,11 +743,15 @@ to the answers the agent reads whole from an HTTP or FastCGI application.
 
 ## Edge status and cache purge
 
-An agent that applies the parts above sends `EdgeStatus` for each app of the bundle in force that has one on (a main host name, a
-path prefix or compression): once after a bundle is applied, when a stream comes up, and every minute while one is up. It names the
-parts that run (`redirects`, `compression`, each `applied`) and, for compression, what the app did in the last hour: answers sent
-compressed, answers that came in pieces and were not, and the bytes saved. The counters are kept in one-minute buckets and the
-agent sends the sum of the buckets still inside the hour, not a total since start. An app with no part on gets no status.
+An agent that applies the parts above sends `EdgeStatus` for the apps of the bundle in force. After a bundle is applied and when a
+stream comes up it sends one for every app, so the control plane learns the generation each app runs: an app that has a part on (a
+main host name, a path prefix or compression) names the parts that run (`redirects`, `compression`, each `applied`) and, for
+compression, what the app did in the last hour (answers sent compressed, answers that came in pieces and were not, and the bytes
+saved); an app with no part on gets a status with no features and no counters. That is also how a save that switches the last part
+of an app off is answered: the status at the new generation, with nothing running. Every minute while a stream is up the agent sends
+the apps that have a part on again, with fresh counters; it does not repeat the others. The counters are kept in one-minute buckets
+and the agent sends the sum of the buckets still inside the hour, not a total since start. An app that leaves the bundle gets no
+status.
 
 This build has no response cache, so it does not send the Hello feature `edge_cache`. It still answers a `CachePurge`: `invalid` for a
 scope or address it does not accept, `not_in_bundle` for an app the bundle does not name, else `cache_off`.
@@ -855,7 +864,9 @@ The only C code in the binary is the TLS provider (`ring`) and the allocator (`m
 `scripts/sync-proto.sh <tag>` here. `scripts/sync-proto.sh --check` is part of the gate.
 
 `crates/proxy/tests/data/` holds copies of the files of wafio-cp-backend `test/frontend-fixtures` that the tests read, and
-`proto/SOURCE` records the sha256 of each. `--check` compares the sha256 values always, and the files with those of the checkout
+`proto/SOURCE` records the sha256 of each. `delivery-checks.json` is the table of the checks of the main host name, the path prefix
+and the compression size: `crates/waf-agent/src/agent/tests/edge.rs` runs every case of it, because the agent is never stricter
+than the control plane (a case that passes there must pass here, or a bundle it sends would be refused whole). `--check` compares the sha256 values always, and the files with those of the checkout
 when one sits next to this repository (`WAFIO_CP_BACKEND` names another place); the gate host has no checkout, so run it once in a
 shell next to the checkouts too. `scripts/sync-proto.sh <tag>` copies them again. `scripts/test-sync-proto.sh` tests the script.
 

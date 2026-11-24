@@ -34,11 +34,7 @@ async fn the_upstream_sees_the_path_without_the_prefix_and_the_decision_keeps_th
         ("/shop/cart", "/cart"),
         ("/shop/cart?a=1&b=%20", "/cart?a=1&b=%20"),
         ("/shop/a%20b/%e2%82%ac", "/a%20b/%E2%82%AC"),
-        ("/shopping", "/shopping"),
-        ("/shop2/x", "/shop2/x"),
-        ("/other/shop", "/other/shop"),
-        ("/", "/"),
-        ("/shop/../admin", "/admin"),
+        ("/a/../shop/x", "/x"),
     ] {
         let r = c.send(&get(sent)).await.unwrap();
         assert_eq!(r.status, 200, "{sent}");
@@ -54,6 +50,46 @@ async fn the_upstream_sees_the_path_without_the_prefix_and_the_decision_keeps_th
     let r = c.send(h2c.as_bytes()).await.unwrap();
     assert_eq!(r.status, 200);
     assert_eq!(up.last().line, "GET /shop/x HTTP/1.1");
+}
+
+/// A path outside the prefix is not the application's. Forwarded, it would reach a page that is
+/// public at `/shop/admin` as `/admin`, past every rule written for the public path.
+#[tokio::test]
+async fn a_path_outside_the_prefix_is_answered_404_and_never_reaches_the_upstream() {
+    let up = http_upstream().await;
+    let port = free_port();
+    let (h, addr) = Harness::serve(vec![prefixed(port, &up, "/shop")]);
+    let mut c = Client::connect(addr).await.unwrap();
+    assert_eq!(c.send(&get("/shop/admin")).await.unwrap().status, 200);
+    let reached = up.count();
+    for sent in [
+        "/admin",
+        "/",
+        "/shopping",
+        "/shop2/x",
+        "/other/shop",
+        "/Shop/admin",
+        "/shop/../admin",
+        "/shop/%2e%2e/admin",
+        "/admin?next=/shop/admin",
+    ] {
+        let r = c.send(&get(sent)).await.unwrap();
+        assert_eq!(r.status, 404, "{sent}");
+        assert_eq!(up.count(), reached, "{sent} reached the upstream");
+        let event = h.last_event();
+        assert_eq!(
+            (s(&event.uri), event.status),
+            (sent, 404),
+            "the event keeps the public target"
+        );
+    }
+    // The same for a request that asks for an upgrade.
+    let h2c = "GET /admin HTTP/1.1\r\nHost: app.test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n";
+    assert_eq!(c.send(h2c.as_bytes()).await.unwrap().status, 404);
+    assert_eq!(up.count(), reached);
+    // And the path under it still goes through.
+    assert_eq!(c.send(&get("/shop/admin")).await.unwrap().status, 200);
+    assert_eq!(up.last().line, "GET /admin HTTP/1.1");
 }
 
 #[tokio::test]
@@ -77,7 +113,6 @@ async fn fastcgi_gets_the_short_path_in_its_variables() {
     )]);
     let mut c = Client::connect(addr).await.unwrap();
     assert_eq!(c.send(&get("/shop/app.php?x=1")).await.unwrap().status, 201);
-    assert_eq!(c.send(&get("/shopping/app.php")).await.unwrap().status, 201);
     assert_eq!(c.send(&get("/shop")).await.unwrap().status, 201);
     let params = fake.params.lock().unwrap().clone();
     let pick = |i: usize| {
@@ -93,12 +128,11 @@ async fn fastcgi_gets_the_short_path_in_its_variables() {
         pick(0),
         ("/app.php?x=1", "/app.php", "/var/www/app.php", "x=1")
     );
-    assert_eq!(
-        pick(1).0,
-        "/shopping/app.php",
-        "a name that only starts with the prefix is not under it"
-    );
-    assert_eq!(pick(2).0, "/");
+    assert_eq!(pick(1).0, "/");
+    // A name that only starts with the prefix is not under it: answered 404 without a FastCGI call.
+    assert_eq!(c.send(&get("/shopping/app.php")).await.unwrap().status, 404);
+    assert_eq!(c.send(&get("/app.php")).await.unwrap().status, 404);
+    assert_eq!(fake.params.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

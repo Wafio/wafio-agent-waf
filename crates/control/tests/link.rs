@@ -254,6 +254,8 @@ struct Sink {
     panic_on: Mutex<Option<String>>,
     /// What `statuses` hands the link each time it asks.
     edge_statuses: Mutex<Vec<EdgeStatus>>,
+    /// The `every_app` argument of each `statuses` call.
+    edge_asks: Mutex<Vec<bool>>,
     /// Every purge the sink got.
     purges: Mutex<Vec<CachePurge>>,
     /// Purges this sink refuses, by command id.
@@ -309,7 +311,8 @@ impl CertificateSink for Sink {
 }
 
 impl EdgeSink for Sink {
-    fn statuses(&self) -> Vec<EdgeStatus> {
+    fn statuses(&self, every_app: bool) -> Vec<EdgeStatus> {
+        self.edge_asks.lock().unwrap().push(every_app);
         self.edge_statuses.lock().unwrap().clone()
     }
 
@@ -1265,6 +1268,11 @@ async fn edge_statuses_go_out_on_connect_after_a_bundle_and_on_request() {
 
     link.report_edge();
     assert_eq!(next_edge_status(&mut c).await, edge_status(a, 5));
+    let asks = sink.edge_asks.lock().unwrap().clone();
+    assert!(
+        asks.len() >= 3 && asks.iter().all(|&every_app| every_app),
+        "a new stream, a live bundle and a request all ask for every app: {asks:?}"
+    );
     task.abort();
     clean_up(&link, state).await;
 }

@@ -1089,25 +1089,31 @@ async fn send_certificate_statuses(link: Weak<ControlLink>, mut wake: mpsc::Rece
 }
 
 /// Sends the edge statuses when woken and every minute while a stream is up. The agent builds
-/// them with counters as of the moment, so each send is fresh. With no stream up the wake-up is
-/// dropped: the next connect wakes the task again.
+/// them with counters as of the moment, so each send is fresh. A wake-up (a live bundle, a new
+/// stream) asks for every app, the minute tick only for the apps that have an edge part on. With
+/// no stream up the wake-up is dropped: the next connect wakes the task again.
 async fn send_edge_statuses(link: Weak<ControlLink>, mut wake: mpsc::Receiver<()>) {
     let mut tick = tokio::time::interval(EDGE_STATUS_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The first tick is due at once; a connect wakes the task, so skip it.
     tick.tick().await;
     loop {
-        tokio::select! {
-            _ = tick.tick() => {}
-            woken = wake.recv() => if woken.is_none() { return },
-        }
+        let every_app = tokio::select! {
+            _ = tick.tick() => false,
+            woken = wake.recv() => {
+                if woken.is_none() {
+                    return;
+                }
+                true
+            }
+        };
         let Some(l) = link.upgrade() else { return };
         let Some(send) = l.active.lock().unwrap().clone() else {
             continue;
         };
         let sink = l.hooks.edge.clone();
         drop(l);
-        let statuses = tokio::task::spawn_blocking(move || sink.statuses())
+        let statuses = tokio::task::spawn_blocking(move || sink.statuses(every_app))
             .await
             .unwrap_or_default();
         for status in statuses {
@@ -1928,6 +1934,14 @@ mod tests {
         bundles: Arc<dyn BundleSink>,
         certificates: Arc<dyn CertificateSink>,
     ) -> Arc<ControlLink> {
+        bare_link_with_edge(bundles, certificates, Arc::new(crate::edge::NoEdge))
+    }
+
+    fn bare_link_with_edge(
+        bundles: Arc<dyn BundleSink>,
+        certificates: Arc<dyn CertificateSink>,
+        edge: Arc<dyn EdgeSink>,
+    ) -> Arc<ControlLink> {
         ControlLink::new(
             ControlConfig {
                 server_address: "127.0.0.1:1".into(),
@@ -1948,13 +1962,50 @@ mod tests {
             Hooks {
                 bundles,
                 certificates,
-                edge: Arc::new(crate::edge::NoEdge),
+                edge,
                 stats: Arc::new(ZeroStats),
                 security_data: Arc::new(NoSec),
                 redact: |_| {},
                 on_dial: |_| {},
             },
         )
+    }
+
+    /// An edge sink that writes down what it was asked for.
+    #[derive(Default)]
+    struct AskedEdge(Mutex<Vec<bool>>);
+
+    impl EdgeSink for AskedEdge {
+        fn statuses(&self, every_app: bool) -> Vec<wafio_proto::v1::EdgeStatus> {
+            self.0.lock().unwrap().push(every_app);
+            Vec::new()
+        }
+
+        fn purge(&self, _: &CachePurge) -> Result<(), PurgeCode> {
+            Err(PurgeCode::CacheOff)
+        }
+    }
+
+    // A wake-up (a live bundle, a new stream) asks the sink for every app of the bundle; the minute
+    // tick only for the apps that have an edge part on.
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_up_asks_for_every_app_and_the_minute_tick_for_the_apps_with_a_part_on() {
+        let sink = Arc::new(AskedEdge::default());
+        let l = bare_link_with_edge(Arc::new(FailSink), Arc::new(NoCerts), sink.clone());
+        let (tx, _rx) = mpsc::channel(8);
+        let (s, _alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s);
+        l.report_edge();
+        until("the sink to be asked after the wake-up", || {
+            sink.0.lock().unwrap().len() == 1
+        })
+        .await;
+        tokio::time::sleep(EDGE_STATUS_INTERVAL + Duration::from_secs(1)).await;
+        until("the sink to be asked on the tick", || {
+            sink.0.lock().unwrap().len() == 2
+        })
+        .await;
+        assert_eq!(*sink.0.lock().unwrap(), [true, false]);
     }
 
     fn status(app: &str, state: &str) -> CertificateStatus {
