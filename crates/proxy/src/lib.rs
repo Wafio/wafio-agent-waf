@@ -17,6 +17,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod body_reader;
+mod cache;
 pub mod cert_store;
 pub mod client_hello;
 mod compress;
@@ -45,6 +46,10 @@ pub mod upgrade;
 pub mod upstream;
 pub mod websocket;
 
+pub use cache::{
+    CacheHost, CacheLimits, CacheRefusal, CacheRefusalCode, CacheRule, CacheSpec, HostFacts,
+    valid_app_id,
+};
 pub use config::{AppAnalysisSetup, AppSpec, CompressionSpec, MAX_MIN_COMPRESS_BYTES, TlsSite};
 pub use decision::{DecisionEvent, DecisionSink};
 pub use edge_stats::CompressionCounters;

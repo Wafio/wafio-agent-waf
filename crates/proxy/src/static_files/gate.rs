@@ -21,6 +21,7 @@ pub(crate) const LOOKUP_WAIT: Duration = Duration::from_millis(100);
 /// The fewest slots a gate has; more workers get two slots each.
 const MIN_SLOTS: usize = 8;
 
+#[derive(Clone)]
 pub(crate) struct DiskGate {
     slots: Arc<Semaphore>,
     deadline: Duration,
@@ -55,12 +56,24 @@ impl DiskGate {
         wait: Duration,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
+        self.run_counting(wait, crate::metrics::count_static_unavailable, work)
+            .await
+    }
+
+    /// [`DiskGate::run`] that calls `unavailable` instead of counting a static folder's miss, for
+    /// work that is not a folder's.
+    pub async fn run_counting<T: Send + 'static>(
+        &self,
+        wait: Duration,
+        unavailable: fn(),
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
         let slot = tokio::time::timeout(wait, self.slots.clone().acquire_owned())
             .await
             .ok()
             .and_then(Result::ok);
         let Some(slot) = slot else {
-            crate::metrics::count_static_unavailable();
+            unavailable();
             return None;
         };
         let job = tokio::task::spawn_blocking(move || {
@@ -74,7 +87,7 @@ impl DiskGate {
                 None
             }
             Err(_) => {
-                crate::metrics::count_static_unavailable();
+                unavailable();
                 None
             }
         }

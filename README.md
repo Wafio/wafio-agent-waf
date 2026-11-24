@@ -109,13 +109,16 @@ scripts/ci-local.sh
 
 In order: agent-material check (`scripts/check-ai.sh`), secret scan (`gitleaks`), proto copy check
 (`scripts/test-sync-proto.sh`, then `scripts/sync-proto.sh --check`), notices (`scripts/gen-notices.py`), advisories, the test certificates,
-`cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay -- -D warnings`,
-`cargo test --locked --workspace --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay` and the certificate orders against Pebble (below). In a copy of the tree without `.git` the gate skips the agent-material check
+`cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay,wafio-waf-agent/test-response-cache -- -D warnings`,
+`cargo test --locked --workspace --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay,wafio-waf-agent/test-response-cache` and the certificate orders against Pebble (below). In a copy of the tree without `.git` the gate skips the agent-material check
 and scans the files for secrets instead of the history; run `scripts/check-ai.sh` in the checkout then.
 
 The feature `test-tls` of `wafio-waf-agent` lets `WAFIO_TEST_TLS_DIR` name the key directory, so that the tests of the binary can use a
 directory that the user they run as owns (the fixed path needs the user of the unit); `tests/tls_bundle.rs` and `tests/control_plane.rs`
 are built only with it. No release build enables it.
+
+The feature `test-response-cache` lets `WAFIO_TEST_CACHE_DIR` name the response cache directory, for the same reason (the fixed
+`/var/cache/wafio-waf` belongs to the user of the unit); `tests/control_plane.rs` is built only with it. No release build enables it.
 
 The feature `test-cache-delay` makes the agent wait `WAFIO_TEST_CACHE_WRITE_DELAY_MS` milliseconds before it writes the bundle
 cache, so that the last tests of `tests/control_plane.rs` can signal an agent while a write is pending; those tests are built
@@ -189,7 +192,7 @@ The black-box suites that start an agent binary and drive it over HTTP and gRPC 
 The agent reports in `Hello.features`: `script_rules` (it runs script rules in its own process), `maintenance_mode` (it
 serves the maintenance page, see below), `edge_redirects`, `edge_compression` and `edge_static_files` (it applies the main host
 name and the path prefix of an app, compresses its answers and serves files from a folder, and reports them in `EdgeStatus`, see
-"Main host name and path prefix", "Compression" and "Static files"), `tls_certificates` (it takes `CertificateInstall` and sends `CertificateStatus`, see
+"Main host name and path prefix", "Compression" and "Static files"; `edge_cache` is not sent yet, see "Response cache"), `tls_certificates` (it takes `CertificateInstall` and sends `CertificateStatus`, see
 "HTTPS from the agent") and, only when no engine is installed, `no_semantic_engine`. The official agent never sends the last
 one. `tls_certificates` goes in every Hello of an agent that could use its key directory at start; without one the start logs a
 warning that names the directory and the cause, the feature is left out, and the `tls` objects of the bundles are ignored. The
@@ -734,10 +737,10 @@ to the answers the agent reads whole from an HTTP or FastCGI application.
 - An answer over 64 KiB is compressed on a blocking thread, one for each core at a time. With none free it is sent as it is.
 - **BREACH.** Compressing a page that holds a secret next to text the visitor can reflect lets an attacker guess the secret from the
   size of the answer. So for a signed-in request, `text/html` and JSON are not compressed; other types, such as styles and scripts,
-  are. A request is signed in when it carries `Authorization`, the userinfo of an absolute-form target, or a cookie whose name
-  holds `sess` (`PHPSESSID`, `JSESSIONID`, `laravel_session`), starts with `wordpress_logged_in`, `wordpress_sec`, `.AspNetCore.` or
-  `remember`, or is `connect.sid`. The test is by name, so an application that keeps its session under another cookie name is
-  not covered.
+  are. A request is signed in when it carries `Authorization`, the userinfo of an absolute-form target, or a cookie that is a session
+  cookie (the list is under "Response cache", the same one decides what the cache keeps) or one the app names itself in
+  `session_cookies` of its bundle entry, which is sent whether or not the cache is on. The test is by name, so an application that
+  keeps its session under another cookie name is not covered unless the name is given.
 - Metrics: `wafio_waf_compression_responses{encoding}`, `wafio_waf_compression_bytes{dir}` (before and after) and
   `wafio_waf_compression_skipped{reason}` (`streamed`, `too_large`, `busy`, `grew`).
 
@@ -810,6 +813,116 @@ rest of the bundle applies without it.
   counted when the folder answers it, not when the request goes on to the application), `wafio_waf_static_bytes` and
   `wafio_waf_static_unavailable` (looks and reads that got no slot or no answer from the disk).
 
+## Response cache
+
+An app with `cache` in its bundle entry keeps the answers of its application and sends them again without asking it. The control
+plane sends the object only while it is on, with every number filled in; a number that is left out takes the default here too.
+
+```json
+"cache": {"enabled": true, "default_ttl_s": 3600, "stale_if_error_s": 600, "disk_bytes": 1073741824, "memory_bytes": 33554432,
+          "max_object_bytes": 8388608, "session_cookies": ["MyAuth"],
+          "rules": [{"prefix": "/blog/", "action": "cache", "ttl_s": 600, "signed_in": false}, {"prefix": "/admin/", "action": "bypass"}]}
+```
+
+`default_ttl_s` (0 to 365 days) is how long a file of a type that carries no secrets is kept when the application says nothing: `image/*`,
+`font/*`, `video/*`, `audio/*`, `text/css`, `text/javascript`, `application/javascript` and `application/wasm`; 0 turns it off.
+`stale_if_error_s` (0 to a day) is carried but not used yet. `disk_bytes` is 16 MiB to 1 TiB, `memory_bytes` 0 to 4 GiB,
+`max_object_bytes` 1 KiB to 64 MiB and no more than `disk_bytes`. `session_cookies` has up to 20 names of up to 64 characters
+without spaces, commas, semicolons or `=`. `rules` has up to 50 rules; a prefix starts with `/`, has at most 256 bytes and no space, `?`
+or `#`, and the longest prefix that matches the path decides. A `cache` rule keeps for `ttl_s` (1 second to 365 days) an answer that
+does not give its own lifetime, and with `signed_in` also for a signed-in visitor; a `bypass` rule sends the path to the application
+unread and unstored. The top-level `session_cookies` of the app entry holds more names of session cookies; it joins the list of
+`cache` and is read for compression too, with the cache off. A setting out of its range is refused with the code `invalid` and the name of
+the setting; the app keeps the settings it ran with.
+
+**Where.** Copies are kept in `/var/cache/wafio-waf` (the unit's `CacheDirectory`, mode 0700), in `<app id>/<2 hex>/<64 hex>`, with
+the files being written in `<app id>/tmp/`. The directory must be a canonical absolute path outside `/var/lib/wafio-waf-agent` (the host
+agent sheds the opens of a path like that only when it is canonical and keeps every open in the state folder), a directory (not a
+link) owned by the user of the agent; group and other access is cleared. Otherwise the cache stays off, the start logs a warning that
+names the directory and the cause, and `EdgeStatus` says `cache_dir_unusable` for every app. An app id that is not 1 to 64 letters,
+digits, `-` and `_` has no cache (`invalid`, `app_id`). The feature `test-response-cache` reads the directory from
+`WAFIO_TEST_CACHE_DIR`.
+
+**One writer.** The process that holds `flock` of `cache.lock` in that directory stores, evicts and deletes; a reload's successor
+that does not hold it serves what it reads and changes nothing, and takes the lock when the old process lets go. Every process builds
+an index of the files from their headers when it starts, in the background; nothing is stored until it is built. The process that takes the
+lock reads the directory again first (files the old process stored after the successor began count), then cleans: `tmp/`, names that are
+not the agent's, the directories of apps that do not have the cache on in the newest bundle, copies past their life and the window they
+allow after it, and what is over the quota. Switching the cache off, or taking the app out of the bundle, deletes its directory.
+
+**Host.** When settings change, the sum of `disk_bytes` over the apps must be at most the free space plus what the cache holds minus 5 %
+of the file system (`disk_too_small`, detail `<bytes allowed> <bytes asked>`), and the sum of `memory_bytes` at most a quarter of the
+memory of the host or its cgroup (`memory_too_small`, detail the memory in bytes). The check runs when an app asks for more disk or
+memory than it runs with (a new app asks for more than it has). If the sums do not fit, every app that asks for more is refused and
+the others go on: settings are never reduced to fit, and an app that ran with other settings keeps them (`running_previous`). An app
+that asks for the same or less, or only changes a rule, a lifetime or a cookie name, is always applied, so an operator can shrink a quota
+on a full disk. An apply whose cache holds an index that is not built within three seconds does not check the disk.
+
+**What is looked up.** Only a request the verdict allows reads or fills the cache, after the main host redirect and before the folder of
+static files and the application. A request with a `log` or `monitor` verdict, an `Upgrade`, a method other than `GET` and `HEAD`, a body, a
+length above 0 or `Transfer-Encoding` on a `GET`, `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (also with `_` for `-`, which
+a CGI parameter makes the same header), a path under a
+`bypass` rule, a path with `;` under any rule (`..;` is `..` to some servers), or a path that the app's `response_decrypt_aes` or
+`response_field_rules` rewrite goes to the application as it is, unread and unstored. Every answer of that path carries `X-Cache`: `HIT` (from
+a copy), `MISS` (asked the application, whether or not the answer was kept), `BYPASS`; a file of the static folder is `BYPASS`. An
+answer from the block page, the main host redirect, the path-prefix 404 and a challenge has none.
+
+**Key.** The scheme (HTTPS when the agent ended TLS, else the `X-Forwarded-Proto` of a proxy the app trusts, else HTTP), the host in lower case
+without the scheme's own port, the request target the application gets, byte for byte (`?a=1&b=2` and `?b=2&a=1` are two keys), and the encoding
+bucket (`br`, `gzip` or identity, from `Accept-Encoding` by the weights of "Compression"). The copy's own `Vary` names, up to four of at most 256
+bytes, add the values of those request headers (`Accept-Encoding` is the bucket); an answer that varies by `*`, `Cookie` or `Authorization`,
+or by more than that, is not kept. The SHA-256 of the whole key names the file and the file holds the key, which is compared when it is read.
+
+**Headers a front-end writes.** With the cache on, what a peer says in `X-Forwarded-*` other than the three the agent writes itself
+(`-For`, `-Host`, `-Proto`), `X-Original-*`, `X-Host`, `X-Rewrite-URL`, `Forwarded`, `Front-End-Https` and `X-Url-Scheme` is not sent to the
+application (HTTP and FastCGI), unless the peer is a proxy the route trusts (`trust_forwarded` and `trusted_proxies`): then they are sent
+and are part of the key, and a request with more than 256 bytes of them is not cached. A line of the client's for `X-Forwarded-Host` or
+`X-Forwarded-Proto`, in any spelling (`_` for `-` too), does not stay beside the agent's, and the scheme the application is told is the
+connection's. The host is always the agent's word: a FastCGI application is sent `X-Forwarded-Host` with the host of the request and never
+the client's or a proxy's, because the key does not hold what a proxy says there.
+
+**Signed in.** A request is signed in when it carries `Authorization`, the userinfo of an absolute-form target, or a cookie whose name,
+in any case, holds `sess` (`PHPSESSID`, `laravel_session`, `ASP.NET_SessionId`), starts with `wordpress_logged_in_`, `wp-postpass_`,
+`remember_web_`, `remember-me` or `.AspNetCore.`, is `JSESSIONID` or `connect.sid`, or is one of the names the app gave. Compression uses
+the same test. A signed-in request is answered from a copy when there is one, and makes none unless a rule with `signed_in` covers its path.
+
+**What is kept.** An answer to a `GET` with no `Range`, with a status of 200, 203, 300, 301, 308, 404 or 410 and a lifetime: `s-maxage`, else
+`max-age`, else `Expires` minus `Date`, else the `ttl_s` of the rule, else `default_ttl_s` for a file type, at most 365 days (a 404 or 410 needs
+one of the first four, never the default). The request's own `Cache-Control` is ignored; the `Age` the application gave counts against the
+lifetime. Never kept: `Set-Cookie`, `private`, `no-store` and `no-cache` (with or without a field list), a `Cache-Control` that does not
+parse, more than 64 directives or a line over 4 KiB, a `Vary` as above, a body over `max_object_bytes`, a head over 64 KiB, an answer in
+an encoding other than the request's bucket (an application that compresses by itself with a coding the bucket does not name, such as
+zstd, is passed on and not kept), an answer sent in pieces without a length, an answer to a request with a cookie unless it says `public`
+or `s-maxage`, is of a file type or a rule covers the path, and an answer to a signed-in request without a rule for them. The stored head is
+what the application said without the headers of the connection (`Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`,
+`Upgrade`), `Date`, `Age` and `X-Cache`, with compression's changes: compression runs before the copy is made, so each bucket has its own copy.
+The response header rules (`resp_headers`) run on every answer as it is sent, copies included, so a change to them reaches stored
+copies at once. The copy is written behind the answer: the visitor does not wait for the disk.
+
+**A copy that is fresh** is sent with `Age` (the age the application gave plus the time here). `HEAD` is answered from the copy of a `GET`.
+`If-None-Match` (weak comparison, `*`), else `If-Modified-Since` against the copy's `Last-Modified`, gives `304` with the headers a `304`
+carries; one `Range` of a copy that is an identity `200` gives `206` (an unsatisfiable one `416`; several ranges, another unit or a form that
+does not parse give the whole copy), and `If-Range` keeps the range only for the copy's strong tag or exact `Last-Modified`. A request
+with a `Range` is looked up and never makes a copy. A copy that is not fresh is a miss: stale answers, revalidation and a lock for
+one fill at a time are not built yet. A 2xx or 3xx answer to `POST`, `PUT`, `PATCH` or `DELETE` ends the copies of the same URL, in every
+encoding and variant, before the answer goes on.
+
+**Disk and memory.** A file holds a 64-byte header (magic, version, lengths, CRC-32, times), the key, the head and the body. It is
+created with mode 0600 and `O_NOFOLLOW` in `tmp/` and renamed, without `fsync`; a file that a crash tore fails its length or its CRC. It is
+read whole with `O_NOFOLLOW`, within 256 MiB of reads and writes in flight (a request that finds none goes to the application); a size, a CRC or a
+key that differs deletes the file and is a miss, and so is a link or anything that is not a plain file. All disk work runs on blocking
+threads, within the slots the static folders share. The index holds at most 200,000 entries for each app. Both tiers evict by a
+segmented LRU: new copies enter probation, a second hit moves a copy to the protected segment (four fifths of the quota), so a crawl only
+cycles probation. The disk holds `disk_bytes` and at most one more object while a store is being made. The memory tier holds copies of up
+to 256 KiB from their second hit, up to `memory_bytes` (0 keeps every copy on disk only).
+
+Not built yet: the lock for one fill of a key at a time and the marks for answers that cannot be kept, `stale-while-revalidate`, `stale-if-error`,
+revalidation, purge, the counters of `EdgeStatus` and the Prometheus series of the cache, what happens when the file system fills while the
+agent runs, files of the static folder in the memory tier, and the Hello feature `edge_cache`. A write that a process without the lock answers
+(a reload's successor) drops the copies from its index and is remembered with its second, up to 4096 URLs; the process that takes the lock deletes
+the files of copies stored in that second or before when it reads the directory again. Past 4096 URLs it deletes every copy stored up to the last
+write.
+
 ## Edge status and cache purge
 
 An agent that applies the parts above sends `EdgeStatus` for the apps of the bundle in force. After a bundle is applied and when a
@@ -823,8 +936,11 @@ the apps that have a part on again, with fresh counters; it does not repeat the 
 and the agent sends the sum of the buckets still inside the hour, not a total since start. An app that leaves the bundle gets no
 status.
 
-This build has no response cache, so it does not send the Hello feature `edge_cache`. It still answers a `CachePurge`: `invalid` for a
-scope or address it does not accept, `not_in_bundle` for an app the bundle does not name, else `cache_off`.
+The response cache reports as a part too: `cache` is `applied`, or `refused` with a code and a detail (see "Response cache"), and when
+the cache directory cannot be used every app gets `cache` `refused` `cache_dir_unusable`, whether its cache is on or off. The cache
+counters are not sent yet, and neither is the Hello feature `edge_cache`: this build keeps copies, but the control plane does not
+offer the cache for an agent that does not say it has one. A `CachePurge` is not carried out yet: it is answered `invalid` for a
+scope or address the agent does not accept, `not_in_bundle` for an app the bundle does not name, else `cache_off`.
 
 ## Switching inspection off
 
@@ -970,7 +1086,7 @@ Cargo.toml  Cargo.lock       workspace of 18 crates
 crates/
   waf-agent                  the library and the binary wafio-waf-agent-open: flags, run loop, bundle apply, key directory, uploaded and ordered certificates, reload
   control                    gRPC link to the control plane, bundle cache, telemetry
-  proxy                      per-application reverse proxy and WebSocket handling, HTTPS listeners and certificates, main host redirect, path prefix, compression, static files
+  proxy                      per-application reverse proxy and WebSocket handling, HTTPS listeners and certificates, main host redirect, path prefix, compression, static files, response cache
   application                request analysis pipeline, in-memory block and rate-limit stores
   engine-api                 the engine boundary: scan configuration, finding names, coverage marks, the Engine trait
   engine-abi                 the C interface to an engine in a shared library: structs, symbols, header, encodings

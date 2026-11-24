@@ -441,7 +441,13 @@ pub async fn run_waf_agent(
     } else {
         inherited.remove(&metrics_addr)
     };
+    // The response cache directory is checked and opened once, here: the proxy keeps the copies in
+    // it and the agent reports it. An unusable one is logged and leaves the cache off.
+    let cache = crate::cache::open();
     let mut opts = wafio_proxy::ProxyOptions::new(Arc::new(emit_decision));
+    if let crate::cache::CacheSetup::Ready(host) = &cache {
+        opts.cache = Some(host.clone());
+    }
     opts.ip_rep = Some(iprep.clone());
     opts.good_bots = Some(good_bots.clone());
     opts.captcha = Some(Arc::new(Captcha {
@@ -457,7 +463,8 @@ pub async fn run_waf_agent(
         good_bots.clone(),
         ready.clone(),
     )
-    .with_statuses(statuses);
+    .with_statuses(statuses)
+    .with_cache(cache);
     let ordering = keys.is_some();
     if let Some(dir) = keys {
         agent = agent.with_key_dir(dir);
@@ -609,6 +616,27 @@ pub async fn run_waf_agent(
         });
     }
 
+    // The same for the cache directory lock: a successor reads the copies the old process made and
+    // writes none until the old one lets go.
+    if agent.waits_for_cache() {
+        info!(
+            "[cache] another process holds the cache directory lock: this one serves the copies it reads and stores none until that one lets go"
+        );
+        let a = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(KEY_LOCK_POLL).await;
+                let a = a.clone();
+                if tokio::task::spawn_blocking(move || a.take_over_cache())
+                    .await
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+        });
+    }
+
     let stream = link.start();
     let upgrade = UpgradeState::default();
     let handed_over = loop {
@@ -658,7 +686,11 @@ pub async fn run_waf_agent(
     // A successor writes in the key directory from the moment this process no longer accepts.
     proxy.stop_accepting(handed_over).await;
     let a = agent.clone();
-    let _ = tokio::task::spawn_blocking(move || a.release_keys()).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        a.release_keys();
+        a.release_cache();
+    })
+    .await;
     proxy.shutdown(handed_over).await;
     Ok(())
 }

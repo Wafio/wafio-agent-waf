@@ -228,8 +228,44 @@ pub(crate) fn upstream_request(
     ] {
         u.header_lines.push((name.to_vec(), value));
     }
+    // With the cache on, the answer is kept for every request that has the same key, so what the
+    // application may answer differently for must be in the key or not reach it: the headers a
+    // front-end writes beyond the three this agent writes itself are sent on only from a proxy the
+    // route trusts (and are keyed then), and a line of the client's for a header this agent writes
+    // does not stay beside it.
+    let cache_on = route.cache_active().is_some();
+    let untrusted = cache_on && !crate::cache::trusts(route, peer);
+    if untrusted {
+        let names: Vec<Vec<u8>> = u
+            .header_lines
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| crate::cache::unkeyed_input(n))
+            .cloned()
+            .collect();
+        for name in names {
+            u.del(&name);
+        }
+    }
+    if cache_on {
+        // Every spelling: a backend that folds `_` into `-` reads `X_Forwarded_Host` as the header.
+        let names: Vec<Vec<u8>> = u
+            .header_lines
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| crate::cache::forwarded_host_or_proto(n))
+            .cloned()
+            .collect();
+        for name in names {
+            u.del(&name);
+        }
+    }
     u.set(b"X-Forwarded-Host", &req.host);
-    let proto = req.peek("X-Forwarded-Proto");
+    let proto = if untrusted {
+        &[][..]
+    } else {
+        req.peek("X-Forwarded-Proto")
+    };
     u.set(
         b"X-Forwarded-Proto",
         if req.tls.is_some() {
@@ -453,9 +489,11 @@ async fn exchange(
         }
         return Ok(Exchange::Open(out, Box::new(up)));
     }
+    let mut whole = Vec::new();
     while let Some(chunk) = up.read_response_body().await? {
-        out.body.extend_from_slice(&chunk);
+        whole.extend_from_slice(&chunk);
     }
+    out.body = whole.into();
     if up.response_done() {
         shared
             .connector
@@ -568,7 +606,7 @@ pub(crate) fn apply_response_rules(
         ) {
             Ok(dec) => {
                 resp.assign_content_type(crate::sniff::sniff_content_type(&dec).as_bytes());
-                resp.body = dec;
+                resp.body = dec.into();
             }
             Err(e) => tracing::warn!(
                 "[inline-proxy] response decrypt error for {}: {e}",
@@ -586,7 +624,7 @@ pub(crate) fn apply_response_rules(
             .map(crate::pipeline::response_field_rule_from_engine)
             .collect();
         match wafio_agent_pages::field_paths::decrypt_json_response_fields(&resp.body, &rules) {
-            Ok(dec) => resp.body = dec,
+            Ok(dec) => resp.body = dec.into(),
             Err(e) => tracing::warn!(
                 "[inline-proxy] response JSON field decrypt error for {}: {e}",
                 String::from_utf8_lossy(uri)

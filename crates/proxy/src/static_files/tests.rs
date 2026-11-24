@@ -657,7 +657,7 @@ fn lines(r: &OutboundResponse, head: bool) -> String {
 fn the_answer_for_a_whole_file_names_its_type_validators_and_ranges() {
     let h = head(Plan::Whole, Body::Bytes(b"abcdef".to_vec()), 6);
     let mut r = head_of(&h, false, 0);
-    r.body = b"abcdef".to_vec();
+    r.body = b"abcdef".to_vec().into();
     assert_eq!(r.status, 200);
     let text = lines(&r, false);
     for want in [
@@ -686,7 +686,7 @@ fn a_part_a_head_a_big_file_and_the_statuses_without_a_body_announce_what_they_n
         6,
     );
     let mut r = head_of(&part, false, 0);
-    r.body = b"cde".to_vec();
+    r.body = b"cde".to_vec().into();
     let text = lines(&r, false);
     assert!(
         text.starts_with("HTTP/1.1 206 Partial Content\r\n"),

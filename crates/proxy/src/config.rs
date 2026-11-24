@@ -25,9 +25,11 @@ use wafio_domain::{
     timeout_or_default_ms,
 };
 
+use crate::cache::{AppCache, CacheSpec, RouteCache, Settings};
 use crate::cert_store::BookChange;
 use crate::maintenance::MaintenanceRoute;
 use crate::redirect::MainHost;
+use crate::signed_in::SessionNames;
 use crate::static_files::{StaticFolder, StaticSpec};
 
 /// What one app's requests are analysed with. Immutable once applied; a bundle replaces it as
@@ -76,6 +78,12 @@ pub struct AppSpec {
     pub compression: Option<CompressionSpec>,
     /// Files of a folder that the app answers itself; `None` = none.
     pub static_files: Option<StaticSpec>,
+    /// The response cache, checked; `None` = off.
+    pub cache: Option<CacheSpec>,
+    /// Names of the cookies that mark a visitor as signed in, besides the ones the agent knows
+    /// (the cache's own `session_cookies` count too). They decide what is compressed and what is
+    /// kept.
+    pub session_cookies: Vec<String>,
 }
 
 /// The compression settings of one app.
@@ -172,6 +180,10 @@ pub struct Route {
     pub(crate) compression: Option<CompressionSpec>,
     /// The folder that answers `GET` and `HEAD` after the verdict, if the app has one.
     pub(crate) static_files: Option<Arc<StaticFolder>>,
+    /// The response cache of the app; `Proxy::apply` binds its store.
+    pub(crate) cache: Option<RouteCache>,
+    /// The cookie names the app says are sessions.
+    pub(crate) session: SessionNames,
     pub(crate) target: Target,
     /// `timeouts.upstream_ms` resolved (default 30 s); ignored when `upstream_unlimited`.
     pub(crate) upstream_timeout: Duration,
@@ -188,6 +200,12 @@ pub struct Route {
 impl Route {
     pub fn app_id(&self) -> &str {
         &self.app_id
+    }
+
+    /// The settings and store of the cache when it is on and has a store to keep copies in.
+    pub(crate) fn cache_active(&self) -> Option<(&Settings, &Arc<AppCache>)> {
+        let cache = self.cache.as_ref()?;
+        Some((&cache.settings, cache.app.as_ref()?))
     }
 
     /// Whether the route sends the app's other host names to a main host or takes a path prefix
@@ -390,6 +408,12 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
             .static_files
             .as_ref()
             .map(|spec| Arc::new(StaticFolder::new(&app.app_id, spec))),
+        cache: app.cache.as_ref().map(RouteCache::new),
+        session: SessionNames::new(
+            app.session_cookies
+                .iter()
+                .chain(app.cache.iter().flat_map(|c| &c.session_cookies)),
+        ),
         target,
         upstream_timeout: upstream_to,
         upstream_unlimited,

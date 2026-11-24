@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod bundle;
+pub mod cache;
 pub mod challenge_key;
 pub mod duration_text;
 pub mod engine_lib;

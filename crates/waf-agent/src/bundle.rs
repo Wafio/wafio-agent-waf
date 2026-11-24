@@ -35,6 +35,11 @@ pub struct BundleApp {
     pub compression: Option<CompressionEntry>,
     /// Files served from a folder; absent or null is off.
     pub static_files: Option<StaticFilesEntry>,
+    /// The response cache; absent or null is off.
+    pub cache: Option<CacheEntry>,
+    /// Names of the cookies that hold a visitor's session, besides the ones the agent knows. They
+    /// decide what is compressed and what is kept, so they are sent whether or not the cache is on.
+    pub session_cookies: Vec<String>,
 }
 
 /// The `compression` object of an app as sent. `{}` is off: only `enabled: true` turns it on.
@@ -56,6 +61,31 @@ pub struct StaticFilesEntry {
     pub missing: String,
     /// Seconds of browser cache time; 0 sets none.
     pub max_age_s: i64,
+}
+
+/// The `cache` object of an app as sent, before any check (`wafio_proxy::CacheSpec::check` does
+/// that). The control plane sends it only while it is on and fills every number in; a number that
+/// is absent takes the default here too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub enabled: bool,
+    pub default_ttl_s: Option<i64>,
+    pub stale_if_error_s: Option<i64>,
+    pub disk_bytes: Option<i64>,
+    pub memory_bytes: Option<i64>,
+    pub max_object_bytes: Option<i64>,
+    pub session_cookies: Vec<String>,
+    pub rules: Vec<CacheRuleEntry>,
+}
+
+/// One path rule of the cache.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheRuleEntry {
+    pub prefix: String,
+    /// `cache` or `bypass`.
+    pub action: String,
+    pub ttl_s: i64,
+    pub signed_in: bool,
 }
 
 /// The `tls` object of an app as sent, before any check (`crate::tls::entry`). It never carries key
@@ -195,7 +225,7 @@ fn raw_slice(
     })
 }
 
-const APP_FIELDS: [&str; 19] = [
+const APP_FIELDS: [&str; 21] = [
     "app_id",
     "listen_host",
     "listen_port",
@@ -215,6 +245,8 @@ const APP_FIELDS: [&str; 19] = [
     "tls",
     "compression",
     "static_files",
+    "cache",
+    "session_cookies",
 ];
 
 const TLS_FIELDS: [&str; 8] = [
@@ -301,6 +333,74 @@ fn decode_static_files(
     )
 }
 
+/// An optional number: `None` for null, so that an absent number is told from a zero.
+fn optional_int(d: &mut DecodeTrace, v: &Value, out: &mut Option<i64>) {
+    let mut n = 0;
+    json_decode::int(d, v, &mut n);
+    *out = (!json_decode::is_null(v)).then_some(n);
+}
+
+fn decode_cache_rule(
+    d: &mut DecodeTrace,
+    v: &Value,
+    r: &mut CacheRuleEntry,
+) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.CacheRuleEntry",
+        "CacheRuleEntry",
+        &["prefix", "action", "ttl_s", "signed_in"],
+        |d, i, v| {
+            match i {
+                0 => json_decode::string(d, v, &mut r.prefix),
+                1 => json_decode::string(d, v, &mut r.action),
+                2 => json_decode::int(d, v, &mut r.ttl_s),
+                _ => json_decode::boolean(d, v, &mut r.signed_in),
+            }
+            Ok(())
+        },
+    )
+}
+
+fn decode_cache(d: &mut DecodeTrace, v: &Value, c: &mut CacheEntry) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.CacheEntry",
+        "CacheEntry",
+        &[
+            "enabled",
+            "default_ttl_s",
+            "stale_if_error_s",
+            "disk_bytes",
+            "memory_bytes",
+            "max_object_bytes",
+            "session_cookies",
+            "rules",
+        ],
+        |d, i, v| {
+            match i {
+                0 => json_decode::boolean(d, v, &mut c.enabled),
+                1 => optional_int(d, v, &mut c.default_ttl_s),
+                2 => optional_int(d, v, &mut c.stale_if_error_s),
+                3 => optional_int(d, v, &mut c.disk_bytes),
+                4 => optional_int(d, v, &mut c.memory_bytes),
+                5 => optional_int(d, v, &mut c.max_object_bytes),
+                6 => json_decode::strings(d, v, &mut c.session_cookies)?,
+                _ => json_decode::slice(
+                    d,
+                    v,
+                    &mut c.rules,
+                    "[]agent.CacheRuleEntry",
+                    decode_cache_rule,
+                )?,
+            }
+            Ok(())
+        },
+    )
+}
+
 fn decode_app(
     d: &mut DecodeTrace,
     sp: &Spans<'_>,
@@ -333,7 +433,9 @@ fn decode_app(
                 15 => json_decode::boolean(d, v, &mut a.fcgi_keep_conn),
                 16 => json_decode::optional(d, v, &mut a.tls, decode_tls)?,
                 17 => json_decode::optional(d, v, &mut a.compression, decode_compression)?,
-                _ => json_decode::optional(d, v, &mut a.static_files, decode_static_files)?,
+                18 => json_decode::optional(d, v, &mut a.static_files, decode_static_files)?,
+                19 => json_decode::optional(d, v, &mut a.cache, decode_cache)?,
+                _ => json_decode::strings(d, v, &mut a.session_cookies)?,
             }
             Ok(())
         },
@@ -581,6 +683,83 @@ mod tests {
             decode_bundle(br#"{"apps":[{"static_files":"/var/www"}]}"#).unwrap_err(),
             "apps.static_files: expected an object, got a string"
         );
+    }
+
+    #[test]
+    fn the_cache_object_and_the_session_cookie_names_are_read() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"a","session_cookies":["MyAuth","sb-token"],"cache":{"enabled":true,"default_ttl_s":60,"stale_if_error_s":0,"disk_bytes":33554432,"memory_bytes":null,"max_object_bytes":1024,"session_cookies":["Sid"],"rules":[{"prefix":"/blog/","action":"cache","ttl_s":120,"signed_in":true},{"prefix":"/admin/","action":"bypass","ttl_s":0,"signed_in":false}]}},
+               {"app_id":"b","cache":{"enabled":true}},
+               {"app_id":"c","cache":{}},
+               {"app_id":"d","cache":null,"session_cookies":null},
+               {"app_id":"e","cache":{"Enabled":true,"RULES":[{"PREFIX":"/x","future":1}],"future":2}}]}"#,
+        )
+        .unwrap();
+        let a = &b.apps[0];
+        assert_eq!(a.session_cookies, ["MyAuth", "sb-token"]);
+        let cache = a.cache.clone().unwrap();
+        assert_eq!(
+            (
+                cache.enabled,
+                cache.default_ttl_s,
+                cache.stale_if_error_s,
+                cache.disk_bytes,
+                cache.memory_bytes,
+                cache.max_object_bytes
+            ),
+            (true, Some(60), Some(0), Some(33_554_432), None, Some(1024)),
+            "a number that is absent or null is not a zero"
+        );
+        assert_eq!(cache.session_cookies, ["Sid"]);
+        assert_eq!(
+            cache.rules,
+            vec![
+                CacheRuleEntry {
+                    prefix: "/blog/".into(),
+                    action: "cache".into(),
+                    ttl_s: 120,
+                    signed_in: true
+                },
+                CacheRuleEntry {
+                    prefix: "/admin/".into(),
+                    action: "bypass".into(),
+                    ttl_s: 0,
+                    signed_in: false
+                },
+            ]
+        );
+        assert_eq!(
+            b.apps[1].cache,
+            Some(CacheEntry {
+                enabled: true,
+                ..CacheEntry::default()
+            })
+        );
+        assert_eq!(b.apps[2].cache, Some(CacheEntry::default()), "{{}} is off");
+        assert!(b.apps[3].cache.is_none() && b.apps[3].session_cookies.is_empty());
+        let e = b.apps[4].cache.clone().unwrap();
+        assert!(e.enabled);
+        assert_eq!(e.rules[0].prefix, "/x");
+        for (bad, why) in [
+            (
+                r#"{"apps":[{"cache":{"disk_bytes":"big"}}]}"#,
+                "apps.cache.disk_bytes: expected an integer, got a string",
+            ),
+            (
+                r#"{"apps":[{"cache":{"rules":[{"ttl_s":"x"}]}}]}"#,
+                "apps.cache.rules.ttl_s: expected an integer, got a string",
+            ),
+            (
+                r#"{"apps":[{"cache":"on"}]}"#,
+                "apps.cache: expected an object, got a string",
+            ),
+            (
+                r#"{"apps":[{"session_cookies":[1]}]}"#,
+                "apps.session_cookies: expected a string, got a number",
+            ),
+        ] {
+            assert_eq!(decode_bundle(bad.as_bytes()).unwrap_err(), why, "{bad}");
+        }
     }
 
     #[test]

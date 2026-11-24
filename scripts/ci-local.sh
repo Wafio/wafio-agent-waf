@@ -48,14 +48,15 @@ cargo fmt --all --check
 
 # test-tls: the agent reads its key directory from WAFIO_TEST_TLS_DIR, which the tests of the binary need, as it cannot be
 # made owned by the user the tests run as at the fixed path. test-cache-delay: the agent waits before it writes the bundle
-# cache, for the test that signals it while a write is pending. No release build enables either.
+# cache, for the test that signals it while a write is pending. test-response-cache: the agent keeps its response cache in
+# WAFIO_TEST_CACHE_DIR, which the test of the binary needs as it cannot make the fixed directory. No release build enables any.
 echo '== clippy'
-cargo clippy --locked --workspace --all-targets --profile "$profile" --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay -- -D warnings
+cargo clippy --locked --workspace --all-targets --profile "$profile" --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay,wafio-waf-agent/test-response-cache -- -D warnings
 
 # The Pebble cases run in the step `acme`; a Pebble the caller's shell still points at (the README's by-hand flow leaves its variables)
 # must not make this step run them against a Pebble that is down.
 echo '== test'
-env -u WAFIO_PEBBLE_DIRECTORY cargo test --locked --workspace --profile "$profile" --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay
+env -u WAFIO_PEBBLE_DIRECTORY cargo test --locked --workspace --profile "$profile" --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay,wafio-waf-agent/test-response-cache
 
 # The agent against Pebble, the ACME test server (needs docker). test-acme-gate.sh checks the step on a host with no docker.
 echo '== acme'
