@@ -171,6 +171,12 @@ impl RouteApp {
                     .await
                     .map(|(stream, rest)| (stream, shrink_idle_buffer(rest, consumed)));
             }
+            Ok(Done::File(f)) => {
+                let close = head.connection_close || *shutdown.borrow();
+                return relay_file(stream, buf, &head, *f, close, write_ms)
+                    .await
+                    .map(|(stream, rest)| (stream, shrink_idle_buffer(rest, consumed)));
+            }
             Err(_) => return None,
             Ok(Done::Upgrade(plan)) => {
                 // The client stream (and the bytes read past the handshake) become the relay's.
@@ -307,6 +313,60 @@ async fn relay(
         return None;
     }
     up.finish(shared).await;
+    if close {
+        finish_close(stream, Vec::new(), write_ms).await;
+        return None;
+    }
+    Some((stream, buf))
+}
+
+/// A file answer: the head goes out, then the span of the file in reads of
+/// [`crate::static_files::CHUNK`] bytes, each written within the write deadline. The length in the
+/// head was the file's size when it was opened and nothing is sent past it, so a file that grew is
+/// cut at that size. A file that is cut short (or cannot be read) ends the connection with no more
+/// bytes, which is how the client learns the body is incomplete. The connection stays open for the
+/// next request when the answer, the request and the draining server allow it.
+async fn relay_file(
+    mut stream: Stream,
+    buf: BytesMut,
+    req: &head_parser::Head,
+    file: crate::static_files::FileAnswer,
+    closing: bool,
+    write_ms: i64,
+) -> Option<(Stream, BytesMut)> {
+    let close = file.head.close || closing;
+    let wire = file.head.wire(req.http10, true, close, now_unix());
+    if !send(&mut stream, &[&wire], write_ms).await {
+        return None;
+    }
+    let (mut at, end) = (file.offset, file.offset + file.len);
+    let mut chunk = Vec::new();
+    while at < end {
+        let want = usize::try_from(end - at).map_or(crate::static_files::CHUNK, |n| {
+            n.min(crate::static_files::CHUNK)
+        });
+        let source = file.file.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            chunk.resize(want, 0);
+            let got = crate::static_files::read_at_full(&source, &mut chunk, at);
+            (chunk, got)
+        })
+        .await;
+        let (piece, got) = match read {
+            Ok((piece, Ok(got))) if got > 0 => (piece, got),
+            Ok(_) => return None,
+            Err(_) => {
+                crate::metrics::count_agent_panic();
+                return None;
+            }
+        };
+        if !send(&mut stream, &[&piece[..got]], write_ms).await {
+            return None;
+        }
+        crate::metrics::count_static_bytes(got as u64);
+        at += got as u64;
+        chunk = piece;
+    }
     if close {
         finish_close(stream, Vec::new(), write_ms).await;
         return None;

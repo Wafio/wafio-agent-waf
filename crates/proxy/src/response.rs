@@ -130,6 +130,15 @@ impl OutboundResponse {
         r
     }
 
+    /// The length a body-less answer announces: a `HEAD` answer, or one whose body is sent from a
+    /// file after the head.
+    pub(crate) fn declare_length(&mut self, len: u64) {
+        self.declared_length = Some((
+            i64::try_from(len).unwrap_or(i64::MAX),
+            len.to_string().into_bytes(),
+        ));
+    }
+
     /// Whether the body has no length up front (chunked, or ended by the upstream closing), which
     /// is the only kind that may never end.
     pub fn body_unframed(&self) -> bool {
@@ -437,7 +446,7 @@ fn reason_phrase(code: u16) -> &'static str {
 }
 
 /// An HTTP date such as `Mon, 02 Jan 2006 15:04:05 GMT`.
-fn http_date(unix: u64) -> String {
+pub(crate) fn http_date(unix: u64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",

@@ -33,6 +33,8 @@ pub struct BundleApp {
     pub tls: Option<TlsEntry>,
     /// Compression of the answers; absent or null is off.
     pub compression: Option<CompressionEntry>,
+    /// Files served from a folder; absent or null is off.
+    pub static_files: Option<StaticFilesEntry>,
 }
 
 /// The `compression` object of an app as sent. `{}` is off: only `enabled: true` turns it on.
@@ -41,6 +43,19 @@ pub struct CompressionEntry {
     pub enabled: bool,
     /// `None` = not sent: the default applies.
     pub min_bytes: Option<i64>,
+}
+
+/// The `static_files` object of an app as sent: the control plane sends it only while it is on,
+/// and `enabled: true` is what turns it on here too. The folder is not checked here
+/// (`wafio_proxy::StaticSpec::check` does that against the disk).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StaticFilesEntry {
+    pub enabled: bool,
+    pub root: String,
+    /// `app` or `not_found`; empty is `app`.
+    pub missing: String,
+    /// Seconds of browser cache time; 0 sets none.
+    pub max_age_s: i64,
 }
 
 /// The `tls` object of an app as sent, before any check (`crate::tls::entry`). It never carries key
@@ -180,7 +195,7 @@ fn raw_slice(
     })
 }
 
-const APP_FIELDS: [&str; 18] = [
+const APP_FIELDS: [&str; 19] = [
     "app_id",
     "listen_host",
     "listen_port",
@@ -199,6 +214,7 @@ const APP_FIELDS: [&str; 18] = [
     "fcgi_keep_conn",
     "tls",
     "compression",
+    "static_files",
 ];
 
 const TLS_FIELDS: [&str; 8] = [
@@ -262,6 +278,29 @@ fn decode_compression(
     )
 }
 
+fn decode_static_files(
+    d: &mut DecodeTrace,
+    v: &Value,
+    f: &mut StaticFilesEntry,
+) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.StaticFilesEntry",
+        "StaticFilesEntry",
+        &["enabled", "root", "missing", "max_age_s"],
+        |d, i, v| {
+            match i {
+                0 => json_decode::boolean(d, v, &mut f.enabled),
+                1 => json_decode::string(d, v, &mut f.root),
+                2 => json_decode::string(d, v, &mut f.missing),
+                _ => json_decode::int(d, v, &mut f.max_age_s),
+            }
+            Ok(())
+        },
+    )
+}
+
 fn decode_app(
     d: &mut DecodeTrace,
     sp: &Spans<'_>,
@@ -293,7 +332,8 @@ fn decode_app(
                 14 => a.maintenance = sp.raw(v),
                 15 => json_decode::boolean(d, v, &mut a.fcgi_keep_conn),
                 16 => json_decode::optional(d, v, &mut a.tls, decode_tls)?,
-                _ => json_decode::optional(d, v, &mut a.compression, decode_compression)?,
+                17 => json_decode::optional(d, v, &mut a.compression, decode_compression)?,
+                _ => json_decode::optional(d, v, &mut a.static_files, decode_static_files)?,
             }
             Ok(())
         },
@@ -495,6 +535,51 @@ mod tests {
         assert_eq!(
             decode_bundle(br#"{"apps":[{"compression":true}]}"#).unwrap_err(),
             "apps.compression: expected an object, got a boolean"
+        );
+    }
+
+    #[test]
+    fn the_static_files_object_is_read_and_only_enabled_true_turns_it_on() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"a","static_files":{"enabled":true,"root":"/var/www/a","missing":"not_found","max_age_s":3600}},
+               {"app_id":"b","static_files":{"enabled":true,"root":"/srv/b"}},
+               {"app_id":"c","static_files":{}},
+               {"app_id":"d","static_files":null},
+               {"app_id":"e"},
+               {"app_id":"f","static_files":{"Enabled":true,"ROOT":"/x","future":1}}]}"#,
+        )
+        .unwrap();
+        let entry = |enabled, root: &str, missing: &str, max_age_s| {
+            Some(StaticFilesEntry {
+                enabled,
+                root: root.into(),
+                missing: missing.into(),
+                max_age_s,
+            })
+        };
+        let got: Vec<_> = b.apps.iter().map(|a| a.static_files.clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                entry(true, "/var/www/a", "not_found", 3600),
+                entry(true, "/srv/b", "", 0),
+                entry(false, "", "", 0),
+                None,
+                None,
+                entry(true, "/x", "", 0),
+            ]
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"static_files":{"max_age_s":"10"}}]}"#).unwrap_err(),
+            "apps.static_files.max_age_s: expected an integer, got a string"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"static_files":{"root":5}}]}"#).unwrap_err(),
+            "apps.static_files.root: expected a string, got a number"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"static_files":"/var/www"}]}"#).unwrap_err(),
+            "apps.static_files: expected an object, got a string"
         );
     }
 

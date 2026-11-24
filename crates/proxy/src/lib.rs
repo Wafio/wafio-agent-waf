@@ -38,6 +38,7 @@ pub mod route;
 pub mod siem;
 mod signed_in;
 pub mod sniff;
+mod static_files;
 #[doc(hidden)]
 pub mod testing;
 pub mod upgrade;
@@ -49,6 +50,7 @@ pub use decision::{DecisionEvent, DecisionSink};
 pub use edge_stats::CompressionCounters;
 pub use proxy::{Proxy, ProxyOptions};
 pub use siem::{SiemEvent, SiemEventSender};
+pub use static_files::{MAX_BROWSER_CACHE_S, RefusalCode, StaticRefusal, StaticSpec};
 
 use std::cell::Cell;
 

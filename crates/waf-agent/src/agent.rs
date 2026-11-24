@@ -16,7 +16,10 @@ use wafio_control::{
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
 use wafio_proxy::cert_store::{BookChange, BookEntry, CertBook};
-use wafio_proxy::{AppAnalysisSetup, AppSpec, CompressionCounters, CompressionSpec, TlsSite};
+use wafio_proxy::{
+    AppAnalysisSetup, AppSpec, CompressionCounters, CompressionSpec, StaticRefusal, StaticSpec,
+    TlsSite,
+};
 
 use crate::bundle::{Bundle, BundleApp, CompressionEntry, UnblockEntry, decode_bundle};
 use crate::executor::{BaseExecutor, Stores, executor_for_rules};
@@ -91,14 +94,31 @@ struct State {
     refusal: Option<status::Refusal>,
     /// Which edge parts each app of the bundle in force has on.
     edge: HashMap<String, AppEdge>,
+    /// The folder each app serves static files from, as the proxy runs it. A bundle whose folder
+    /// the agent refuses leaves the one in this map serving.
+    static_files: HashMap<String, StaticSpec>,
 }
 
 /// The edge parts an app has on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AppEdge {
     /// A main host name or a path prefix.
     redirects: bool,
     compression: bool,
+    /// What became of the app's static files; `None` when the bundle has them off.
+    static_files: Option<StaticState>,
+}
+
+/// What the agent did with the static files of an app that has them on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StaticState {
+    Applied,
+    /// The agent could not apply the folder; `running_previous` is true when the folder of an
+    /// earlier bundle serves on, false when the part is off.
+    Refused {
+        refusal: StaticRefusal,
+        running_previous: bool,
+    },
 }
 
 /// The agent state minus the request path (the proxy crate's).
@@ -345,6 +365,9 @@ impl Agent {
             self.release_unblocked_entries(&b.unblock_entries);
             return Ok(());
         }
+        // The folders are looked at on the disk before the apply lock is taken: a slow disk must
+        // not hold up the certificates and the statuses that wait for it.
+        let mut folders = check_static_files(&b.apps);
         // One apply at a time; the proxy call happens under it too.
         let mut st = self.lock();
         st.refusal = None;
@@ -394,6 +417,7 @@ impl Agent {
         let mut executors: HashMap<String, (Arc<AppAnalysisSetup>, Stores)> = HashMap::new();
         let mut specs: Vec<AppSpec> = Vec::new();
         let mut edge: HashMap<String, AppEdge> = HashMap::new();
+        let mut running: HashMap<String, StaticSpec> = HashMap::new();
         let mut addresses: HashSet<String> = HashSet::new();
         let mut unbindable = false;
         let mut with_scripts = 0u64;
@@ -426,11 +450,40 @@ impl Agent {
             exec.analyze.custom_tuning_rules = tuning;
             let exec = Arc::new(exec);
             executors.insert(app.app_id.clone(), (exec.clone(), stores));
+            // A folder that does not pass is not a reason to refuse the bundle: the app keeps the
+            // folder an earlier bundle gave it, and the control plane is told.
+            let (folder, static_state) = match folders.remove(&app.app_id) {
+                None => (None, None),
+                Some(Ok(folder)) => (Some(folder), Some(StaticState::Applied)),
+                Some(Err(refusal)) => {
+                    let previous = st.static_files.get(&app.app_id).cloned();
+                    tracing::warn!(
+                        "[waf-bundle] app {:?}: static files refused, {} {:?}; {}",
+                        app.app_id.chars().take(64).collect::<String>(),
+                        refusal.code.as_str(),
+                        refusal.detail,
+                        if previous.is_some() {
+                            "the folder of the earlier bundle serves on"
+                        } else {
+                            "no folder serves"
+                        }
+                    );
+                    let running_previous = previous.is_some();
+                    (
+                        previous,
+                        Some(StaticState::Refused {
+                            refusal,
+                            running_previous,
+                        }),
+                    )
+                }
+            };
             let spec = app_spec(
                 app,
                 exec,
                 tls.get(&app.app_id)
                     .map(|applied| tls_site(&app.app_id, applied, &book)),
+                folder,
             );
             // The route is built here, so a bad route fails before later apps are built.
             let route = match wafio_proxy::config::build_route(&spec) {
@@ -445,8 +498,12 @@ impl Agent {
                 AppEdge {
                     redirects: route.redirects(),
                     compression: spec.compression.is_some(),
+                    static_files: static_state,
                 },
             );
+            if let Some(folder) = &spec.static_files {
+                running.insert(app.app_id.clone(), folder.clone());
+            }
             // An app with an HTTPS site opens no listener at its bundle address, so that address
             // is neither checked for a duplicate nor for a port that cannot be bound.
             if app.listen_port > 0 && spec.tls.is_none() {
@@ -478,6 +535,7 @@ impl Agent {
         st.generation = b.generation;
         st.agent_id = b.agent_id.clone();
         st.edge = edge;
+        st.static_files = running;
         if let Some(keys) = st.tls.as_mut() {
             keys.commit(tls);
         }
@@ -605,7 +663,7 @@ impl Agent {
         };
         let mut apps: Vec<_> = edge
             .into_iter()
-            .filter(|(_, e)| every_app || e.redirects || e.compression)
+            .filter(|(_, e)| every_app || e.redirects || e.compression || e.static_files.is_some())
             .collect();
         apps.sort_by(|a, b| a.0.cmp(&b.0));
         apps.into_iter()
@@ -626,6 +684,20 @@ impl Agent {
                         skipped_streamed: c.skipped_streamed,
                         bytes_saved: c.bytes_saved,
                     });
+                }
+                match &e.static_files {
+                    None => {}
+                    Some(StaticState::Applied) => features.push(applied("static_files")),
+                    Some(StaticState::Refused {
+                        refusal,
+                        running_previous,
+                    }) => features.push(EdgeFeatureState {
+                        feature: "static_files".into(),
+                        state: "refused".into(),
+                        code: refusal.code.as_str().into(),
+                        detail: refusal.detail.clone(),
+                        running_previous: *running_previous,
+                    }),
                 }
                 EdgeStatus {
                     app_id,
@@ -724,7 +796,12 @@ fn tls_site(app_id: &str, applied: &Applied, book: &CertBook) -> TlsSite {
 /// The `AppSpec` of a bundle app (`listen_port` ≤ 0 = no listener). A port above 65535 is
 /// refused by `install_bundle` for an app without an HTTPS site; for an app with one it becomes 0,
 /// since that app opens no listener at its bundle address.
-fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>, tls: Option<TlsSite>) -> AppSpec {
+fn app_spec(
+    app: &BundleApp,
+    executor: Arc<AppAnalysisSetup>,
+    tls: Option<TlsSite>,
+    static_files: Option<StaticSpec>,
+) -> AppSpec {
     AppSpec {
         app_id: app.app_id.clone(),
         listen_host: app.listen_host.clone(),
@@ -740,7 +817,22 @@ fn app_spec(app: &BundleApp, executor: Arc<AppAnalysisSetup>, tls: Option<TlsSit
         analysis: executor,
         tls,
         compression: compression_spec(app.compression.as_ref()),
+        static_files,
     }
+}
+
+/// What the disk says of the folder of each app that has static files switched on, by app id. The
+/// bundle carries the part only while it is on, and `enabled: true` is what counts here.
+fn check_static_files(apps: &[BundleApp]) -> HashMap<String, Result<StaticSpec, StaticRefusal>> {
+    apps.iter()
+        .filter_map(|app| {
+            let files = app.static_files.as_ref().filter(|f| f.enabled)?;
+            Some((
+                app.app_id.clone(),
+                StaticSpec::check(&files.root, &files.missing, files.max_age_s),
+            ))
+        })
+        .collect()
 }
 
 /// The compression of an app: `None` unless the bundle turns it on. A size that is negative is

@@ -187,9 +187,9 @@ The black-box suites that start an agent binary and drive it over HTTP and gRPC 
 ## Hello features
 
 The agent reports in `Hello.features`: `script_rules` (it runs script rules in its own process), `maintenance_mode` (it
-serves the maintenance page, see below), `edge_redirects` and `edge_compression` (it applies the main host name and the path
-prefix of an app and compresses its answers, and reports them in `EdgeStatus`, see "Main host name and path prefix" and
-"Compression"), `tls_certificates` (it takes `CertificateInstall` and sends `CertificateStatus`, see
+serves the maintenance page, see below), `edge_redirects`, `edge_compression` and `edge_static_files` (it applies the main host
+name and the path prefix of an app, compresses its answers and serves files from a folder, and reports them in `EdgeStatus`, see
+"Main host name and path prefix", "Compression" and "Static files"), `tls_certificates` (it takes `CertificateInstall` and sends `CertificateStatus`, see
 "HTTPS from the agent") and, only when no engine is installed, `no_semantic_engine`. The official agent never sends the last
 one. `tls_certificates` goes in every Hello of an agent that could use its key directory at start; without one the start logs a
 warning that names the directory and the cause, the feature is left out, and the `tls` objects of the bundles are ignored. The
@@ -741,11 +741,68 @@ to the answers the agent reads whole from an HTTP or FastCGI application.
 - Metrics: `wafio_waf_compression_responses{encoding}`, `wafio_waf_compression_bytes{dir}` (before and after) and
   `wafio_waf_compression_skipped{reason}` (`streamed`, `too_large`, `busy`, `grew`).
 
+## Static files
+
+An app with `static_files` in its bundle entry answers `GET` and `HEAD` for the files of one folder itself, after the verdict and
+without a request to the application: `{"enabled": true, "root": "/var/www/shop/public", "missing": "app", "max_age_s": 3600}`.
+`root` is an absolute folder of at most 1,024 bytes with no empty, `.` or `..` segment, no control character and no replacement
+character. `missing` is `app` (the default; a request whose file is not in the folder goes to the application as it would without
+the folder) or `not_found` (the folder is the whole site: a miss is `404`, and a method other than `GET` and `HEAD` is `405` with
+`Allow: GET, HEAD`). `max_age_s` is 0 to 31,536,000; above 0 it sets `Cache-Control: max-age=`. The control plane sends the part only
+while it is on, and only `enabled: true` turns it on here.
+
+**The folder is checked when a bundle is applied**, and a folder that does not pass does not refuse the bundle: the app keeps the
+folder an earlier bundle gave it (none if it had none), the rest of the bundle applies, and `EdgeStatus` says `static_files`
+`refused` with a code, the folder in `detail` and `running_previous`. The codes: `invalid` (a value out of range or not valid text),
+`root_missing`, `root_not_directory`, `root_unreadable` (the folder cannot be opened, or is under `/home`, `/root` or `/run/user`,
+which the unit hides with `ProtectHome=yes`; the agent refuses such a folder for what it is and writes no drop-in), and
+`root_forbidden` (the root folder `/`, a folder that is, is below or is above `/etc`, `/root`, `/proc`, `/sys`, `/dev`, `/run`,
+`/boot`, `/usr`, `/var/lib/wafio-waf-agent` or `/var/cache/wafio-waf`). The forbidden list is run on the text and again on the
+folder the path opens (`/proc/self/fd/<fd>` says where). The agent runs as a user that must be able to read the folder, and needs `/proc`.
+
+- **No link below the root is followed.** The folder is opened by its path on every request, so the path itself may hold links (a
+  deploy's `current` link is followed when it moves). From there each segment is opened with `openat(O_NOFOLLOW)`, a directory
+  with `O_DIRECTORY`, and the last name with `O_NOFOLLOW | O_NONBLOCK`, then looked at with `fstat`: only a regular file is served.
+  A link, FIFO, device, socket, or any error of an open is a miss. Laravel's `storage:link` points outside `public`, so the files
+  behind it are not served from the folder: such a request goes to the application. A hard link looks like the file it is, so keep
+  `fs.protected_hardlinks=1` (the default of current distributions) and do not let untrusted users write below the folder.
+- **The folder is checked again on every request.** The `(st_dev, st_ino)` of the directory the root path opens is compared with the
+  pair that passed. When it differs, `/proc/self/fd/<fd>` is read and the forbidden list is run on where the directory is before
+  anything is served; the new pair is kept when it passes. A `current` link that is moved to `/etc` or to the key directory serves
+  nothing (a miss) until it is moved back.
+- **Never served**, decided on the text before any system call: a segment that starts with a dot (a first `.well-known` is allowed),
+  a last name that ends in `.php`, `.php3` to `.php8`, `.phtml`, `.phar` or `.phps` in any case, a segment holding a control byte, a
+  backslash or NUL, a path of more than 4 KiB or 64 segments, and a segment whose lower-case name is on a copy of the names the host
+  agent never sheds from its trace ring (`private`, `shadow`, `cron`, `passwd`, `security`, `profile`, `network`, and the rest of
+  `crates/proxy/tests/data/trace-keep-names.json`, which a test compares with the copy). An open of such a name is always reported by
+  the host agent and raises credential alerts against this process, so the folder never opens one. These are misses too. A folder
+  whose own path holds one of these names is opened on every request, and the host agent sees that open: do not choose one.
+- The path looked up is the one the application would see: decoded, dot segments resolved, and with the path prefix taken off. A
+  path outside the prefix is `404` before it gets here. A request with an `Upgrade` header is the application's.
+- A directory: its `index.html` for a path that ends in `/` (the root included), else `308` to the path with a `/` when it has one,
+  and a miss when it does not. There is no listing.
+- The answer: the type from a table of extensions (`application/octet-stream` for the rest; text types carry `charset=utf-8`),
+  `X-Content-Type-Options: nosniff`, `Last-Modified`, `ETag` (`"<modification time in hex>-<size in hex>"`), `Accept-Ranges: bytes`
+  and the cache time. `304` for `If-None-Match` (weak comparison, `*` and lists) and, without it, `If-Modified-Since`. A `Range` of one
+  span is `206` with `Content-Range`; several spans, another unit, a form that does not parse or an end before its start get the
+  whole file; a span outside the file is `416` with `Content-Range: bytes */<size>`; `If-Range` keeps the range only for the file's
+  strong tag or exact modification date. `If-Match` and `If-Unmodified-Since` are not evaluated.
+- A body of 1 MiB or less is read whole and compressed like an upstream answer when the app has compression on (`200` only: a part
+  and a `304` are not). A bigger one is sent from its open descriptor in 256 KiB reads, each written within the write timeout, and
+  never past the size `fstat` gave: a file that grew is cut there, and one that is cut short ends the connection, which is how the
+  client learns the body is incomplete. The memory held for a download is one read buffer, so it does not follow the size of the file.
+  A `HEAD` answer reads nothing, and says nothing of an encoding (a `GET` for the same file may be compressed).
+- A decision event for the answer carries the verdict action and the status of the answer. A request that is blocked, or that a
+  per-path rule blocks, is never answered from the folder.
+- Metrics: `wafio_waf_static_responses{status}` (`200`, `206`, `304`, `308`, `404`, `405`, `416`; a `404` or `405` is counted when the
+  folder answers it, not when the request goes on to the application) and `wafio_waf_static_bytes`.
+
 ## Edge status and cache purge
 
 An agent that applies the parts above sends `EdgeStatus` for the apps of the bundle in force. After a bundle is applied and when a
 stream comes up it sends one for every app, so the control plane learns the generation each app runs: an app that has a part on (a
-main host name, a path prefix or compression) names the parts that run (`redirects`, `compression`, each `applied`) and, for
+main host name, a path prefix, compression or static files) names the parts that run (`redirects`, `compression`, `static_files`,
+each `applied`, or `static_files` `refused` with a code and the folder, see "Static files") and, for
 compression, what the app did in the last hour (answers sent compressed, answers that came in pieces and were not, and the bytes
 saved); an app with no part on gets a status with no features and no counters. That is also how a save that switches the last part
 of an app off is answered: the status at the new generation, with nothing running. Every minute while a stream is up the agent sends
@@ -900,7 +957,7 @@ Cargo.toml  Cargo.lock       workspace of 18 crates
 crates/
   waf-agent                  the library and the binary wafio-waf-agent-open: flags, run loop, bundle apply, key directory, uploaded and ordered certificates, reload
   control                    gRPC link to the control plane, bundle cache, telemetry
-  proxy                      per-application reverse proxy and WebSocket handling, HTTPS listeners and certificates, main host redirect, path prefix, compression
+  proxy                      per-application reverse proxy and WebSocket handling, HTTPS listeners and certificates, main host redirect, path prefix, compression, static files
   application                request analysis pipeline, in-memory block and rate-limit stores
   engine-api                 the engine boundary: scan configuration, finding names, coverage marks, the Engine trait
   engine-abi                 the C interface to an engine in a shared library: structs, symbols, header, encodings

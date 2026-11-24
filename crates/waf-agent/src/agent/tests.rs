@@ -22,6 +22,8 @@ struct FakeProxy {
     tls: Mutex<Vec<Vec<Option<wafio_proxy::TlsSite>>>>,
     /// The compression of each app of each apply.
     compression: Mutex<Vec<Vec<Option<CompressionSpec>>>>,
+    /// The static folder of each app of each apply.
+    static_files: Mutex<Vec<Vec<Option<wafio_proxy::StaticSpec>>>>,
     /// What the proxy counts, by app.
     counted: Mutex<HashMap<String, CompressionCounters>>,
     fail: Mutex<Option<String>>,
@@ -48,6 +50,10 @@ impl RouteSink for FakeProxy {
             .lock()
             .unwrap()
             .push(apps.iter().map(|a| a.compression).collect());
+        self.static_files
+            .lock()
+            .unwrap()
+            .push(apps.iter().map(|a| a.static_files.clone()).collect());
         // The book follows the bundle, as the proxy's does.
         self.book.follow(
             apps.iter()

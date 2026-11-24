@@ -28,6 +28,7 @@ use wafio_domain::{
 use crate::cert_store::BookChange;
 use crate::maintenance::MaintenanceRoute;
 use crate::redirect::MainHost;
+use crate::static_files::{StaticFolder, StaticSpec};
 
 /// What one app's requests are analysed with. Immutable once applied; a bundle replaces it as
 /// a whole.
@@ -73,6 +74,8 @@ pub struct AppSpec {
     pub tls: Option<TlsSite>,
     /// Compression of the answers the upstream sends whole; `None` = off.
     pub compression: Option<CompressionSpec>,
+    /// Files of a folder that the app answers itself; `None` = none.
+    pub static_files: Option<StaticSpec>,
 }
 
 /// The compression settings of one app.
@@ -167,6 +170,8 @@ pub struct Route {
     /// Where the other host names of the app are sent; `None` = nowhere.
     pub(crate) main_host: Option<MainHost>,
     pub(crate) compression: Option<CompressionSpec>,
+    /// The folder that answers `GET` and `HEAD` after the verdict, if the app has one.
+    pub(crate) static_files: Option<Arc<StaticFolder>>,
     pub(crate) target: Target,
     /// `timeouts.upstream_ms` resolved (default 30 s); ignored when `upstream_unlimited`.
     pub(crate) upstream_timeout: Duration,
@@ -381,6 +386,10 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
         edge: app.tls.is_some(),
         main_host,
         compression: app.compression,
+        static_files: app
+            .static_files
+            .as_ref()
+            .map(|spec| Arc::new(StaticFolder::new(&app.app_id, spec))),
         target,
         upstream_timeout: upstream_to,
         upstream_unlimited,

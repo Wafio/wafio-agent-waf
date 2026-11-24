@@ -1,4 +1,4 @@
-//! The edge parts of an app (main host name, path prefix, compression) from the bundle: what goes
+//! The edge parts of an app (main host name, path prefix, compression, static files) from the bundle: what goes
 //! to the proxy, what the bundle refuses, what the control plane hears of them, and how a cache
 //! purge is answered.
 
@@ -424,5 +424,367 @@ fn the_compression_cases_of_the_control_plane_get_the_same_answer() {
             (false, _) => assert_eq!(running, None, "{name}: off"),
             (true, None) => panic!("{name}: a case that passes has a result"),
         }
+    }
+}
+
+// Static files.
+
+/// A folder made for a test, removed at the end of it.
+struct Folder(std::path::PathBuf);
+
+impl Folder {
+    fn new(tag: &str) -> Folder {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wafio-agent-static-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Folder(dir.canonicalize().unwrap())
+    }
+
+    fn path(&self) -> String {
+        self.0.to_str().unwrap().to_owned()
+    }
+}
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn files_part(root: &str, missing: &str, max_age_s: i64) -> String {
+    format!(
+        r#","static_files":{{"enabled":true,"root":{},"missing":"{missing}","max_age_s":{max_age_s}}}"#,
+        serde_json::json!(root)
+    )
+}
+
+/// The `static_files` feature of an app's status: state, code, detail, `running_previous`.
+fn static_feature(s: &EdgeStatus) -> Option<(String, String, String, bool)> {
+    s.features
+        .iter()
+        .find(|f| f.feature == "static_files")
+        .map(|f| {
+            (
+                f.state.clone(),
+                f.code.clone(),
+                f.detail.clone(),
+                f.running_previous,
+            )
+        })
+}
+
+fn running_folder(proxy: &FakeProxy) -> Option<String> {
+    proxy.static_files.lock().unwrap().last().unwrap()[0]
+        .as_ref()
+        .map(|spec| spec.root().to_owned())
+}
+
+#[test]
+fn a_bundle_with_a_folder_gives_the_proxy_its_folder_and_the_control_plane_an_applied_status() {
+    let (a, proxy, _ready) = agent();
+    let folder = Folder::new("applied");
+    let on = files_part(&folder.path(), "not_found", 3600);
+    let both = format!(r#"{on},"compression":{{"enabled":true}}"#);
+    apply(
+        &a,
+        &bundle_of(&[
+            app_with("p1", 18080, &on),
+            app_with("p2", 18081, &both),
+            app_with("p3", 18082, ""),
+        ]),
+        5,
+    )
+    .unwrap();
+    let sent = proxy.static_files.lock().unwrap()[0].clone();
+    assert_eq!(
+        sent[0].as_ref().map(|s| s.root()),
+        Some(folder.path().as_str())
+    );
+    assert!(sent[1].is_some() && sent[2].is_none());
+
+    // The refresh names the app that has the part and no other.
+    let statuses = a.edge_statuses(false);
+    let ids: Vec<_> = statuses.iter().map(|s| s.app_id.as_str()).collect();
+    assert_eq!(ids, ["p1", "p2"]);
+    let p1 = &statuses[0];
+    assert_eq!(features(p1), [("static_files", "applied")]);
+    assert_eq!(
+        static_feature(p1),
+        Some(("applied".into(), String::new(), String::new(), false))
+    );
+    assert!(
+        p1.compression.is_none() && p1.cache.is_none(),
+        "no counters for the folder"
+    );
+    assert_eq!(
+        features(&statuses[1]),
+        [("compression", "applied"), ("static_files", "applied")]
+    );
+    assert_eq!(p1.generation, 5);
+}
+
+#[test]
+fn a_folder_the_agent_cannot_use_leaves_the_bundle_in_and_says_why() {
+    let (a, proxy, _ready) = agent();
+    let scratch = Folder::new("refused");
+    let file = scratch.0.join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    for (generation, (root, missing, max_age, code)) in [
+        (
+            scratch.0.join("nowhere").to_str().unwrap().to_owned(),
+            "app",
+            0,
+            "root_missing",
+        ),
+        (
+            file.to_str().unwrap().to_owned(),
+            "app",
+            0,
+            "root_not_directory",
+        ),
+        ("/etc".to_owned(), "app", 0, "root_forbidden"),
+        (
+            "/usr/share/nginx/html".to_owned(),
+            "app",
+            0,
+            "root_forbidden",
+        ),
+        ("/".to_owned(), "app", 0, "root_forbidden"),
+        ("/home/deploy/site".to_owned(), "app", 0, "root_unreadable"),
+        ("relative/folder".to_owned(), "app", 0, "invalid"),
+        ("/var/www/../etc".to_owned(), "app", 0, "invalid"),
+        (scratch.path(), "both", 0, "invalid"),
+        (scratch.path(), "app", -1, "invalid"),
+        (scratch.path(), "app", 31_536_001, "invalid"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let generation = i64::try_from(generation).unwrap() + 1;
+        apply(
+            &a,
+            &bundle_of(&[app_with("p1", 18080, &files_part(&root, missing, max_age))]),
+            generation,
+        )
+        .unwrap_or_else(|e| panic!("{root}: the bundle is not refused for a folder: {e:?}"));
+        assert_eq!(a.generation().0, generation, "{root}");
+        assert_eq!(running_folder(&proxy), None, "{root}: nothing serves");
+        let statuses = a.edge_statuses(false);
+        assert_eq!(
+            statuses.len(),
+            1,
+            "{root}: the refusal is reported with the refresh too"
+        );
+        let (state, got, detail, previous) = static_feature(&statuses[0]).unwrap();
+        assert_eq!(
+            (state.as_str(), got.as_str(), previous),
+            ("refused", code, false),
+            "{root}"
+        );
+        assert!(
+            detail.len() <= 256 && !detail.chars().any(char::is_control),
+            "{root}: {detail}"
+        );
+    }
+    // The detail names the folder.
+    apply(
+        &a,
+        &bundle_of(&[app_with("p1", 18080, &files_part("/etc/wafio", "app", 0))]),
+        50,
+    )
+    .unwrap();
+    assert_eq!(
+        static_feature(&a.edge_statuses(false)[0]).unwrap().2,
+        "/etc/wafio"
+    );
+}
+
+/// A bundle whose folder the agent refuses keeps the folder the app already has, and says so; a
+/// bundle without the part turns it off for good.
+#[test]
+fn a_refused_folder_keeps_the_folder_that_ran_before_and_switching_it_off_ends_that() {
+    let (a, proxy, _ready) = agent();
+    let good = Folder::new("kept");
+    let gone = Folder::new("gone");
+    apply(
+        &a,
+        &bundle_of(&[app_with("p1", 18080, &files_part(&good.path(), "app", 60))]),
+        1,
+    )
+    .unwrap();
+    assert_eq!(running_folder(&proxy), Some(good.path()));
+
+    // The next bundle names a folder that is not there: the old one serves on.
+    let missing = gone.path() + "/removed";
+    apply(
+        &a,
+        &bundle_of(&[app_with("p1", 18080, &files_part(&missing, "app", 60))]),
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        running_folder(&proxy),
+        Some(good.path()),
+        "the earlier folder serves on"
+    );
+    let s = a.edge_statuses(true);
+    assert_eq!(
+        static_feature(&s[0]),
+        Some((
+            "refused".into(),
+            "root_missing".into(),
+            missing.clone(),
+            true
+        ))
+    );
+    assert_eq!(s[0].generation, 2);
+
+    // And again: the folder that runs is still the first one.
+    apply(
+        &a,
+        &bundle_of(&[app_with("p1", 18080, &files_part("/etc", "app", 60))]),
+        3,
+    )
+    .unwrap();
+    assert_eq!(running_folder(&proxy), Some(good.path()));
+    assert!(static_feature(&a.edge_statuses(true)[0]).unwrap().3);
+
+    // A good folder replaces it.
+    let other = Folder::new("other");
+    apply(
+        &a,
+        &bundle_of(&[app_with("p1", 18080, &files_part(&other.path(), "app", 60))]),
+        4,
+    )
+    .unwrap();
+    assert_eq!(running_folder(&proxy), Some(other.path()));
+    assert_eq!(
+        static_feature(&a.edge_statuses(true)[0]).unwrap().0,
+        "applied"
+    );
+
+    // The part is left out: off, and no status for it.
+    apply(&a, &bundle_of(&[app_with("p1", 18080, "")]), 5).unwrap();
+    assert_eq!(running_folder(&proxy), None);
+    assert_eq!(static_feature(&a.edge_statuses(true)[0]), None);
+    assert!(a.edge_statuses(false).is_empty());
+    // A refusal now has nothing to keep running.
+    apply(
+        &a,
+        &bundle_of(&[app_with("p1", 18080, &files_part(&missing, "app", 60))]),
+        6,
+    )
+    .unwrap();
+    assert_eq!(running_folder(&proxy), None);
+    assert_eq!(
+        static_feature(&a.edge_statuses(true)[0]),
+        Some(("refused".into(), "root_missing".into(), missing, false))
+    );
+    // `enabled: false` is off like an absent part.
+    let off = r#","static_files":{"enabled":false,"root":"/etc","missing":"bogus","max_age_s":-5}"#;
+    apply(&a, &bundle_of(&[app_with("p1", 18080, off)]), 7).unwrap();
+    assert_eq!(running_folder(&proxy), None);
+    assert_eq!(static_feature(&a.edge_statuses(true)[0]), None);
+}
+
+/// What the part is for each app is its own: one app's refusal does not touch another's.
+#[test]
+fn the_folders_of_two_apps_are_kept_apart() {
+    let (a, proxy, _ready) = agent();
+    let (one, two) = (Folder::new("one"), Folder::new("two"));
+    apply(
+        &a,
+        &bundle_of(&[
+            app_with("p1", 18080, &files_part(&one.path(), "app", 0)),
+            app_with("p2", 18081, &files_part(&two.path(), "not_found", 0)),
+        ]),
+        1,
+    )
+    .unwrap();
+    apply(
+        &a,
+        &bundle_of(&[
+            app_with("p1", 18080, &files_part("/etc", "app", 0)),
+            app_with("p2", 18081, &files_part(&two.path(), "not_found", 0)),
+        ]),
+        2,
+    )
+    .unwrap();
+    let running = proxy.static_files.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        running[0].as_ref().map(|s| s.root()),
+        Some(one.path().as_str())
+    );
+    assert_eq!(
+        running[1].as_ref().map(|s| s.root()),
+        Some(two.path().as_str())
+    );
+    let s = a.edge_statuses(false);
+    assert_eq!(
+        static_feature(&s[0]).map(|f| (f.0, f.3)),
+        Some(("refused".into(), true))
+    );
+    assert_eq!(
+        static_feature(&s[1]).map(|f| (f.0, f.3)),
+        Some(("applied".into(), false))
+    );
+    // An app that leaves the bundle takes its folder with it.
+    apply(
+        &a,
+        &bundle_of(&[app_with(
+            "p2",
+            18081,
+            &files_part(&two.path(), "not_found", 0),
+        )]),
+        3,
+    )
+    .unwrap();
+    apply(
+        &a,
+        &bundle_of(&[app_with("p1", 18080, &files_part("/etc", "app", 0))]),
+        4,
+    )
+    .unwrap();
+    assert_eq!(
+        running_folder(&proxy),
+        None,
+        "the folder of a removed app does not come back"
+    );
+}
+
+/// The control plane's cases for `static_files`. It sends the part in its normal form, so a case
+/// that passes is run with its `result`; a case it refuses must be `invalid` here too. What the
+/// disk says about a folder that does not exist is another matter (`root_missing`) and is not
+/// what these cases are about.
+#[test]
+fn the_static_files_cases_of_the_control_plane_get_the_same_answer() {
+    for case in delivery_cases("static_files", 15) {
+        let name = case["name"].as_str().unwrap();
+        let refused = case.get("message").is_some();
+        let from = if refused {
+            &case["in"]
+        } else {
+            &case["result"]
+        };
+        let root = match from["root"].as_str().unwrap() {
+            // A part that is off carries no folder, and the agent never gets it.
+            "" if !refused => "/srv/x",
+            root => root,
+        };
+        let got = wafio_proxy::StaticSpec::check(
+            root,
+            from["missing"].as_str().unwrap(),
+            from["max_age_s"].as_i64().unwrap(),
+        );
+        let invalid = got
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.code == wafio_proxy::RefusalCode::Invalid);
+        assert_eq!(invalid, refused, "{name}: {got:?}");
     }
 }

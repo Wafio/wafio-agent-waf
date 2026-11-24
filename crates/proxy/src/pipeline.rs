@@ -3,8 +3,8 @@
 //! challenge verify endpoint, path-encoding reject, IP reputation gate,
 //! challenge gate (skipped only for a WebSocket handshake this route takes over), decrypt field
 //! rules, body inspection, Analyze, verdict merge, block page / rule challenge / monitor, then
-//! WebSocket takeover, FastCGI or HTTP upstream. Detection runs via `run_detection` (16 MiB
-//! stack).
+//! WebSocket takeover, main host redirect, the app's folder of static files, FastCGI or HTTP
+//! upstream. Detection runs via `run_detection` (16 MiB stack).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -50,6 +50,8 @@ pub(crate) enum Done {
     Respond(OutboundResponse),
     /// The head of a response whose body the route relays from the upstream as it arrives.
     Stream(Box<crate::upstream::Streamed>),
+    /// A file of the app's static folder that is sent from its open descriptor after the head.
+    File(Box<crate::static_files::FileAnswer>),
     /// WebSocket takeover: the session becomes the relay's client stream.
     Upgrade(Box<WsPlan>),
 }
@@ -682,6 +684,23 @@ pub(crate) async fn handle(
         return answer(r);
     }
 
+    // The app's folder of files answers `GET` and `HEAD` for a file it holds, after the verdict
+    // like everything that reaches the application. A request that asks for an upgrade is the
+    // application's.
+    if let Some(folder) = &route.static_files
+        && !req.has_upgrade()
+        && let Some(done) = crate::static_files::serve(shared, route, folder, &req).await
+    {
+        let status = match &done {
+            Done::Respond(r) => r.status,
+            Done::File(f) => f.head.status,
+            Done::Stream(s) => s.head.status,
+            Done::Upgrade(_) => 101,
+        };
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, status);
+        return Ok(done);
+    }
+
     // Allow (or monitor-mode block) → upstream, encrypt rules applied to what it receives.
     let target = upstream_target(route, &req);
     let (mut fbody, mut fct) = (det.body, det.raw_ct.clone());
@@ -835,6 +854,7 @@ mod tests {
                 canonical_host: None,
             }),
             compression: None,
+            static_files: None,
         })
         .unwrap()
     }

@@ -50,6 +50,7 @@ pub const FEATURE_TLS_CERTIFICATES: &str = "tls_certificates";
 /// an app, and compresses its answers, and says so in `EdgeStatus`.
 const FEATURE_EDGE_REDIRECTS: &str = "edge_redirects";
 const FEATURE_EDGE_COMPRESSION: &str = "edge_compression";
+const FEATURE_EDGE_STATIC_FILES: &str = "edge_static_files";
 
 struct Stats;
 
@@ -338,6 +339,7 @@ pub async fn run_waf_agent(
         FEATURE_MAINTENANCE_MODE.into(),
         FEATURE_EDGE_REDIRECTS.into(),
         FEATURE_EDGE_COMPRESSION.into(),
+        FEATURE_EDGE_STATIC_FILES.into(),
     ];
     // Only an agent that could use its key directory at start takes certificates: without one the
     // `tls` objects of its bundles are ignored, and the control plane must not send a key.

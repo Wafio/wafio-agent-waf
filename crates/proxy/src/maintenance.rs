@@ -314,6 +314,7 @@ mod tests {
             analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
             tls: None,
             compression: None,
+            static_files: None,
         })
         .unwrap()
     }
