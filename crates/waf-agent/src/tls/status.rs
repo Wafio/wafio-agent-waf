@@ -250,6 +250,7 @@ mod tests {
             listen: "0.0.0.0:443".into(),
             redirect_listen: None,
             hosts: vec!["shop.example.com".into()],
+            canonical_host: None,
             source: Source::Uploaded,
             certificate: Some(Certificate {
                 id: CERT.into(),
@@ -315,6 +316,7 @@ mod tests {
             listen: "0.0.0.0:443".into(),
             redirect_listen: None,
             hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+            canonical_host: None,
             source: Source::Acme,
             certificate: None,
             request_id: request_id.into(),

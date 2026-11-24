@@ -20,6 +20,10 @@ struct FakeProxy {
     applied: Mutex<Vec<Vec<(String, u16, String)>>>,
     /// The HTTPS site of each app of each apply.
     tls: Mutex<Vec<Vec<Option<wafio_proxy::TlsSite>>>>,
+    /// The compression of each app of each apply.
+    compression: Mutex<Vec<Vec<Option<CompressionSpec>>>>,
+    /// What the proxy counts, by app.
+    counted: Mutex<HashMap<String, CompressionCounters>>,
     fail: Mutex<Option<String>>,
     /// What an apply that fails with `BIND_ERROR` says it could not bind.
     unbound: Mutex<Option<(String, std::io::ErrorKind)>>,
@@ -40,6 +44,10 @@ impl RouteSink for FakeProxy {
             .lock()
             .unwrap()
             .push(apps.iter().map(|a| a.tls.clone()).collect());
+        self.compression
+            .lock()
+            .unwrap()
+            .push(apps.iter().map(|a| a.compression).collect());
         // The book follows the bundle, as the proxy's does.
         self.book.follow(
             apps.iter()
@@ -55,6 +63,10 @@ impl RouteSink for FakeProxy {
 
     fn bind_failure(&self) -> Option<(String, std::io::ErrorKind)> {
         self.unbound.lock().unwrap().clone()
+    }
+
+    fn compression_counters(&self, app_id: &str) -> Option<CompressionCounters> {
+        self.counted.lock().unwrap().get(app_id).copied()
     }
 }
 
@@ -1390,4 +1402,5 @@ fn a_bundle_cannot_be_applied_between_the_check_of_an_install_and_its_commit() {
     assert_eq!(a.generation().0, 2);
 }
 
+mod edge;
 mod orders;

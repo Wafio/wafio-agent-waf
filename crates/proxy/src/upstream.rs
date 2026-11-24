@@ -174,12 +174,15 @@ impl UpstreamHeaders {
     }
 }
 
-/// Builds the upstream request of the HTTP path. `forward_ct` replaces the Content-Type when
-/// encrypt rules rewrote the body.
+/// Builds the upstream request of the HTTP path. `target` is the request target it sends
+/// (`redirect::upstream_target`); `forward_ct` replaces the Content-Type when encrypt rules
+/// rewrote the body.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn upstream_request(
     route: &Route,
     t: &HttpTarget,
     req: &InboundRequest,
+    target: &[u8],
     peer: &IpAddress,
     remote: &str,
     body: &[u8],
@@ -279,12 +282,7 @@ pub(crate) fn upstream_request(
         UpstreamHeaders::del_all(&mut u.header_lines, b"Transfer-Encoding");
     }
     let cl = u.content_length.clone();
-    let mut head = u.build(
-        &req.method,
-        &req.forward_request_target,
-        cl.as_deref(),
-        body.len(),
-    )?;
+    let mut head = u.build(&req.method, target, cl.as_deref(), body.len())?;
     if req.proto_pre11 {
         // The request protocol is kept: an HTTP/1.0 request goes to the upstream as HTTP/1.0.
         head.set_version(Version::HTTP_10);

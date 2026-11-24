@@ -313,6 +313,7 @@ fn with_tls(mut a: AppSpec, port: u16, hosts: &[&str], files: &CertFiles) -> App
             placeholder: false,
         }),
         redirect_listen: None,
+        canonical_host: None,
     });
     a
 }
@@ -1737,4 +1738,237 @@ async fn the_redirect_listener_answers_503_until_the_app_has_a_real_certificate_
     );
     assert_eq!(ask("other.test").await.status, 404);
     assert_eq!(up.count(), 0);
+}
+
+/// `a` with `canonical` as its main host name.
+fn with_main_host(mut a: AppSpec, canonical: &str) -> AppSpec {
+    a.tls.as_mut().unwrap().canonical_host = Some(canonical.to_owned());
+    a
+}
+
+/// A shop that answers on `shop.test` and `www.shop.test`, with `shop.test` as its main host.
+fn shop_with_main_host(up: &TestUpstream, port: u16, files: &CertFiles) -> AppSpec {
+    with_main_host(
+        tls_app("shop", up, port, &["shop.test", "www.shop.test"], files),
+        "shop.test",
+    )
+}
+
+#[tokio::test]
+async fn another_host_of_an_app_is_sent_to_its_main_host_and_the_main_host_is_served() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test", "www.shop.test"]);
+    let port = free_port();
+    let h = Harness::new();
+    h.proxy
+        .apply(vec![shop_with_main_host(&up, port, &files)])
+        .unwrap();
+
+    let mut www = Https::connect(port, &pki, "www.shop.test").await.unwrap();
+    let r = www
+        .send(&get_host("www.shop.test", "/cart?a=1&b=%20"))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 308);
+    assert_eq!(
+        r.header("location"),
+        Some(format!("https://shop.test:{port}/cart?a=1&b=%20").as_str())
+    );
+    assert_eq!(up.count(), 0, "a redirect never reaches the upstream");
+    let ev = h.last_event();
+    assert_eq!(
+        (s(&ev.action), ev.status, s(&ev.host), s(&ev.uri)),
+        ("allow", 308, "www.shop.test", "/cart?a=1&b=%20"),
+        "the answer is recorded like a forwarded one, with the status the client got"
+    );
+
+    // The same connection may carry the other host name: the name of the request decides.
+    let r = www
+        .send(&get_host("WWW.Shop.TEST:8443", "/x"))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 308);
+    // 308 keeps the method: a POST is repeated as a POST, and its body went nowhere.
+    let body = b"a=1";
+    let post = format!(
+        "POST /order HTTP/1.1\r\nHost: www.shop.test\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut raw = post.into_bytes();
+    raw.extend_from_slice(body);
+    let r = www.send(&raw).await.unwrap();
+    assert_eq!(r.status, 308);
+    assert_eq!(
+        r.header("location"),
+        Some(format!("https://shop.test:{port}/order").as_str())
+    );
+    assert_eq!(up.count(), 0);
+
+    let mut main = Https::connect(port, &pki, "shop.test").await.unwrap();
+    let r = main
+        .send(&get_host("shop.test", "/cart?a=1"))
+        .await
+        .unwrap();
+    assert_eq!((r.status, r.text()), (200, "ok".to_owned()));
+    assert_eq!(up.last().line, "GET /cart?a=1 HTTP/1.1");
+    // An app with no main host serves each name as before.
+    let plain = Harness::new();
+    let port = free_port();
+    plain
+        .proxy
+        .apply(vec![tls_app(
+            "shop",
+            &up,
+            port,
+            &["shop.test", "www.shop.test"],
+            &files,
+        )])
+        .unwrap();
+    let mut c = Https::connect(port, &pki, "www.shop.test").await.unwrap();
+    let r = c.send(&get_host("www.shop.test", "/")).await.unwrap();
+    assert_eq!(r.status, 200);
+}
+
+#[tokio::test]
+async fn a_request_that_is_blocked_is_blocked_whatever_host_it_names() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test", "www.shop.test"]);
+    let port = free_port();
+    let mut a = shop_with_main_host(&up, port, &files);
+    // The flood limit decides without an engine: the second request in a minute is blocked.
+    a.analysis =
+        analysis_setup(r#"{"l7_flood":{"enabled":true,"max_requests":1,"window_sec":60}}"#);
+    let h = Harness::new();
+    h.proxy.apply(vec![a]).unwrap();
+
+    let mut c = Https::connect(port, &pki, "www.shop.test").await.unwrap();
+    let first = c.send(&get_host("www.shop.test", "/a")).await.unwrap();
+    assert_eq!(first.status, 308, "within the limit it is sent on");
+    let second = c.send(&get_host("www.shop.test", "/a")).await.unwrap();
+    assert_ne!(second.status, 308, "a block is not redirected");
+    assert!(second.header("location").is_none());
+    let ev = h.last_event();
+    assert_eq!(s(&ev.action), "block", "{ev:?}");
+    assert_eq!(up.count(), 0);
+}
+
+#[tokio::test]
+async fn an_upgrade_request_to_another_host_goes_upstream_and_is_not_redirected() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test", "www.shop.test"]);
+    let port = free_port();
+    let mut a = shop_with_main_host(&up, port, &files);
+    // A handshake without an allowed Origin is refused by the WebSocket takeover, which comes
+    // before the redirect.
+    a.rules_json =
+        br#"{"websocket":{"origin_check":{"enabled":true,"allowed_origins":["https://good.test"]}}}"#
+            .to_vec();
+    let h = Harness::new();
+    h.proxy.apply(vec![a]).unwrap();
+
+    let mut c = Https::connect(port, &pki, "www.shop.test").await.unwrap();
+    let h2c = "GET /x HTTP/1.1\r\nHost: www.shop.test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n";
+    let r = c.send(h2c.as_bytes()).await.unwrap();
+    assert_eq!((r.status, r.text()), (200, "ok".to_owned()));
+    assert_eq!(up.last().line, "GET /x HTTP/1.1");
+
+    let mut ws = Https::connect(port, &pki, "www.shop.test").await.unwrap();
+    let handshake = "GET /socket HTTP/1.1\r\nHost: www.shop.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    let r = ws.send(handshake.as_bytes()).await.unwrap();
+    assert_eq!(r.status, 403, "the takeover answered, not the redirect");
+    assert!(r.header("location").is_none());
+    assert_eq!(up.count(), 1);
+    drop(h);
+}
+
+#[tokio::test]
+async fn the_http_listener_sends_every_host_of_the_app_to_its_main_host_in_one_hop() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test", "www.shop.test"]);
+    let (port, plain) = (free_port(), free_port());
+    let mut a = shop_with_main_host(&up, port, &files);
+    a.tls.as_mut().unwrap().redirect_listen = Some(format!("127.0.0.1:{plain}"));
+    let h = Harness::new();
+    h.proxy.apply(vec![a]).unwrap();
+    let to: SocketAddr = format!("127.0.0.1:{plain}").parse().unwrap();
+    let ask = |host: &str, target: &str| {
+        let raw = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        async move { one(to, raw.as_bytes()).await }
+    };
+
+    for host in ["www.shop.test", "WWW.shop.test:80", "shop.test"] {
+        let r = ask(host, "/a/b?c=d").await;
+        assert_eq!(r.status, 308, "{host}");
+        assert_eq!(
+            r.header("location"),
+            Some(format!("https://shop.test:{port}/a/b?c=d").as_str()),
+            "{host}: one hop, straight to the main host"
+        );
+    }
+    assert_eq!(ask("other.test", "/").await.status, 404);
+
+    // Without a main host the name of the request is kept.
+    let (port, plain) = (free_port(), free_port());
+    let mut a = tls_app("shop", &up, port, &["shop.test", "www.shop.test"], &files);
+    a.tls.as_mut().unwrap().redirect_listen = Some(format!("127.0.0.1:{plain}"));
+    let h2 = Harness::new();
+    h2.proxy.apply(vec![a]).unwrap();
+    let to: SocketAddr = format!("127.0.0.1:{plain}").parse().unwrap();
+    let raw = "GET /a HTTP/1.1\r\nHost: www.shop.test\r\n\r\n";
+    let r = one(to, raw.as_bytes()).await;
+    assert_eq!(
+        r.header("location"),
+        Some(format!("https://www.shop.test:{port}/a").as_str())
+    );
+    assert_eq!(up.count(), 0);
+    drop(h);
+}
+
+#[tokio::test]
+async fn a_new_main_host_replaces_the_old_one_on_the_next_apply_without_a_restart() {
+    let up = http_upstream().await;
+    let pki = Pki::new();
+    let files = pki.leaf("shop", &["shop.test", "www.shop.test"]);
+    let (port, plain) = (free_port(), free_port());
+    let make = |canonical: Option<&str>| {
+        let mut a = tls_app("shop", &up, port, &["shop.test", "www.shop.test"], &files);
+        a.tls.as_mut().unwrap().redirect_listen = Some(format!("127.0.0.1:{plain}"));
+        match canonical {
+            Some(c) => with_main_host(a, c),
+            None => a,
+        }
+    };
+    let h = Harness::new();
+    h.proxy.apply(vec![make(Some("shop.test"))]).unwrap();
+    let mut c = Https::connect(port, &pki, "shop.test").await.unwrap();
+    assert_eq!(
+        c.send(&get_host("shop.test", "/")).await.unwrap().status,
+        200
+    );
+
+    // The main host moves to www: the same connection now gets the redirect for shop.test.
+    h.proxy.apply(vec![make(Some("www.shop.test"))]).unwrap();
+    let r = c.send(&get_host("shop.test", "/p?q=1")).await.unwrap();
+    assert_eq!(r.status, 308);
+    assert_eq!(
+        r.header("location"),
+        Some(format!("https://www.shop.test:{port}/p?q=1").as_str())
+    );
+    let to: SocketAddr = format!("127.0.0.1:{plain}").parse().unwrap();
+    let r = one(to, b"GET / HTTP/1.1\r\nHost: shop.test\r\n\r\n").await;
+    assert_eq!(
+        r.header("location"),
+        Some(format!("https://www.shop.test:{port}/").as_str())
+    );
+
+    // Cleared: back to serving every name.
+    h.proxy.apply(vec![make(None)]).unwrap();
+    assert_eq!(
+        c.send(&get_host("shop.test", "/")).await.unwrap().status,
+        200
+    );
 }

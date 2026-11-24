@@ -19,8 +19,10 @@
 pub mod body_reader;
 pub mod cert_store;
 pub mod client_hello;
+mod compress;
 pub mod config;
 pub mod decision;
+mod edge_stats;
 pub mod fastcgi;
 pub mod head_parser;
 pub(crate) mod https;
@@ -29,10 +31,12 @@ pub(crate) mod maintenance;
 pub mod metrics;
 pub mod pipeline;
 pub mod proxy;
+mod redirect;
 pub mod request;
 pub mod response;
 pub mod route;
 pub mod siem;
+mod signed_in;
 pub mod sniff;
 #[doc(hidden)]
 pub mod testing;
@@ -40,8 +44,9 @@ pub mod upgrade;
 pub mod upstream;
 pub mod websocket;
 
-pub use config::{AppAnalysisSetup, AppSpec, TlsSite};
+pub use config::{AppAnalysisSetup, AppSpec, CompressionSpec, MAX_MIN_COMPRESS_BYTES, TlsSite};
 pub use decision::{DecisionEvent, DecisionSink};
+pub use edge_stats::CompressionCounters;
 pub use proxy::{Proxy, ProxyOptions};
 pub use siem::{SiemEvent, SiemEventSender};
 

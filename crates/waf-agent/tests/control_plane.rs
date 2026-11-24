@@ -1,7 +1,8 @@
 //! Black-box test with the real binary: an in-test fake control plane (tonic, mTLS with the
 //! control crate's fixture CA) checks what `wafio-waf-agent` sends — Hello (kind, version,
-//! the features `script_rules`, `maintenance_mode`, `tls_certificates` and `no_semantic_engine`), the first heartbeat with host info and
-//! counters, the malware sync
+//! the features `script_rules`, `maintenance_mode`, `edge_redirects`, `edge_compression`, `tls_certificates` and
+//! `no_semantic_engine`), the first heartbeat with host info and counters, the edge status of an app after its bundle, the
+//! answer to a cache purge, the malware sync
 //! into the security-data dir given by `--security-data-dir`, the bundle ack, READY after the
 //! live bundle, the bundle cache, a block decision with its credentials redacted, the refusal of a
 //! certificate install. A bundle is acked before its cache write, so the last tests hold the write
@@ -268,10 +269,12 @@ async fn agent_talks_to_the_control_plane() {
         vec![
             "script_rules",
             "maintenance_mode",
+            "edge_redirects",
+            "edge_compression",
             "tls_certificates",
             "no_semantic_engine"
         ],
-        "the agent runs script rules, serves the maintenance page itself and has a key directory it can use, and this binary has no engine"
+        "the agent runs script rules, serves the maintenance page itself, applies the main host, the path prefix and compression, has a key directory it can use, and this binary has no engine"
     );
 
     // The stream: Hello, then the first heartbeat with host info and the agent's counters.
@@ -300,7 +303,7 @@ async fn agent_talks_to_the_control_plane() {
 
     // A live bundle: acked, cached, READY, the listener proxies.
     let bundle = format!(
-        r#"{{"agent_id":"cf4","project_id":"p","generation":1,"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block","rules_json":{{"path_exceptions":[{{"path":"/search","block":{{}}}}]}}}}]}}"#
+        r#"{{"agent_id":"cf4","project_id":"p","generation":1,"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block","proxy_config":{{"strip_path_prefix":"/shop"}},"compression":{{"enabled":true,"min_bytes":2}},"rules_json":{{"path_exceptions":[{{"path":"/shop/search","block":{{}}}}]}}}}]}}"#
     );
     let bu = BundleUpdate {
         command_id: "b1".into(),
@@ -313,14 +316,36 @@ async fn agent_talks_to_the_control_plane() {
         }))
         .await
         .unwrap();
+    let mut edge = None;
     let ack = loop {
-        if let Some(Out::Ack(a)) = c.next().await.kind
-            && a.command_id == "b1"
-        {
-            break a;
+        match c.next().await.kind {
+            Some(Out::Ack(a)) if a.command_id == "b1" => break a,
+            Some(Out::EdgeStatus(s)) => edge = Some(s),
+            _ => {}
         }
     };
     assert!(ack.ok, "bundle refused: {}", ack.error);
+    // The edge parts the bundle turns on are reported for the app, with the generation of the bundle.
+    let edge = match edge {
+        Some(s) => s,
+        None => loop {
+            if let Some(Out::EdgeStatus(s)) = c.next().await.kind {
+                break s;
+            }
+        },
+    };
+    assert_eq!((edge.app_id.as_str(), edge.generation), ("web", 3));
+    let features: Vec<_> = edge
+        .features
+        .iter()
+        .map(|f| (f.feature.as_str(), f.state.as_str(), f.code.as_str()))
+        .collect();
+    assert_eq!(
+        features,
+        [("redirects", "applied", ""), ("compression", "applied", "")]
+    );
+    assert_eq!(edge.compression, Some(EdgeCompressionCounters::default()));
+    assert!(edge.cache.is_none() && edge.unix_time > 0);
     notify
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
@@ -333,7 +358,7 @@ async fn agent_talks_to_the_control_plane() {
     // The ack does not wait for the cache write.
     let cache = common::cached_bundle(&dir.join("state"), 3).await;
     assert!(cache.contains("\"generation\":3"), "{cache}");
-    let ok = tokio::task::spawn_blocking(move || get(listen, "/hello", ""))
+    let ok = tokio::task::spawn_blocking(move || get(listen, "/shop/hello", ""))
         .await
         .unwrap();
     assert!(ok.starts_with("HTTP/1.1 200") && ok.ends_with("ok"), "{ok}");
@@ -343,7 +368,7 @@ async fn agent_talks_to_the_control_plane() {
     let blocked = tokio::task::spawn_blocking(move || {
         get(
             listen,
-            "/search?q=anything",
+            "/shop/search?q=anything",
             "Authorization: Bearer secret-token\r\n",
         )
     })
@@ -411,6 +436,37 @@ async fn agent_talks_to_the_control_plane() {
         (false, "not_in_bundle")
     );
 
+    // A purge: this build has no response cache, so an app of the bundle has none, and an app that is
+    // not in it is not named by it.
+    for (id, app, code) in [
+        ("cp1", "web", "cache_off"),
+        (
+            "cp2",
+            "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11",
+            "not_in_bundle",
+        ),
+    ] {
+        c.out
+            .send(Ok(ServerMessage {
+                kind: Some(In::CachePurge(CachePurge {
+                    command_id: id.into(),
+                    app_id: app.into(),
+                    scope: "app".into(),
+                    url: String::new(),
+                })),
+            }))
+            .await
+            .unwrap();
+        let ack = loop {
+            if let Some(Out::Ack(a)) = c.next().await.kind
+                && a.command_id == id
+            {
+                break a;
+            }
+        };
+        assert_eq!((ack.ok, ack.error.as_str()), (false, code), "{id}");
+    }
+
     // KeyRotation: acked, the agent reconnects with the new key...
     let kr = KeyRotation {
         command_id: "k1".into(),
@@ -476,7 +532,7 @@ async fn agent_talks_to_the_control_plane() {
         .await
         .unwrap();
     assert!(status.success(), "predecessor: {status:?}");
-    let ok = tokio::task::spawn_blocking(move || get(listen, "/again", ""))
+    let ok = tokio::task::spawn_blocking(move || get(listen, "/shop/again", ""))
         .await
         .unwrap();
     assert!(ok.starts_with("HTTP/1.1 200"), "successor serves: {ok}");

@@ -252,6 +252,16 @@ struct Sink {
     refuse: Mutex<HashMap<String, AckCode>>,
     /// The install under this command id makes the sink panic.
     panic_on: Mutex<Option<String>>,
+    /// What `statuses` hands the link each time it asks.
+    edge_statuses: Mutex<Vec<EdgeStatus>>,
+    /// The `every_app` argument of each `statuses` call.
+    edge_asks: Mutex<Vec<bool>>,
+    /// Every purge the sink got.
+    purges: Mutex<Vec<CachePurge>>,
+    /// Purges this sink refuses, by command id.
+    purge_refusals: Mutex<HashMap<String, PurgeCode>>,
+    /// The purge under this command id makes the sink panic.
+    purge_panics_on: Mutex<Option<String>>,
 }
 
 impl BundleSink for Sink {
@@ -294,6 +304,24 @@ impl CertificateSink for Sink {
         }
         self.log.lock().unwrap().push(format!("install {id} end"));
         match self.refuse.lock().unwrap().get(&id) {
+            Some(code) => Err(*code),
+            None => Ok(()),
+        }
+    }
+}
+
+impl EdgeSink for Sink {
+    fn statuses(&self, every_app: bool) -> Vec<EdgeStatus> {
+        self.edge_asks.lock().unwrap().push(every_app);
+        self.edge_statuses.lock().unwrap().clone()
+    }
+
+    fn purge(&self, purge: &CachePurge) -> Result<(), PurgeCode> {
+        self.purges.lock().unwrap().push(purge.clone());
+        if self.purge_panics_on.lock().unwrap().as_deref() == Some(purge.command_id.as_str()) {
+            panic!("sink failed");
+        }
+        match self.purge_refusals.lock().unwrap().get(&purge.command_id) {
             Some(code) => Err(*code),
             None => Ok(()),
         }
@@ -385,6 +413,7 @@ fn link_writing(
         cfg,
         Hooks {
             bundles: sink.clone(),
+            edge: sink.clone(),
             certificates: sink,
             stats: Arc::new(Stats),
             security_data: sec,
@@ -1173,6 +1202,141 @@ async fn a_reported_certificate_status_goes_out_on_the_stream() {
         }
     };
     assert_eq!(got, status);
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+fn edge_status(app: &str, generation: i64) -> EdgeStatus {
+    EdgeStatus {
+        app_id: app.into(),
+        generation,
+        features: vec![EdgeFeatureState {
+            feature: "compression".into(),
+            state: "applied".into(),
+            ..Default::default()
+        }],
+        compression: Some(EdgeCompressionCounters {
+            responses: 3,
+            skipped_streamed: 1,
+            bytes_saved: 4096,
+        }),
+        unix_time: 1_700_000_000,
+        ..Default::default()
+    }
+}
+
+/// The next edge status, with the heartbeats and acks before it left out.
+async fn next_edge_status(c: &mut Conn) -> EdgeStatus {
+    loop {
+        match c.next().await.expect("stream open").kind {
+            Some(Out::EdgeStatus(s)) => return s,
+            Some(Out::Heartbeat(_) | Out::Ack(_)) => {}
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+}
+
+/// The statuses of the edge sink go out when a stream comes up, after each live bundle and when
+/// the agent asks, one message per app, as the sink made them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_statuses_go_out_on_connect_after_a_bundle_and_on_request() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("edge");
+    let sink = Arc::new(Sink::default());
+    let (a, b) = (
+        "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11",
+        "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77",
+    );
+    *sink.edge_statuses.lock().unwrap() = vec![edge_status(a, 4), edge_status(b, 4)];
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+
+    let first = next_edge_status(&mut c).await;
+    assert_eq!(first, edge_status(a, 4));
+    assert_eq!(next_edge_status(&mut c).await, edge_status(b, 4));
+
+    // A live bundle: the sink is asked again, after the bundle is applied.
+    *sink.edge_statuses.lock().unwrap() = vec![edge_status(a, 5)];
+    c.send(bundle_message("b1", 5)).await;
+    assert_eq!(next_edge_status(&mut c).await, edge_status(a, 5));
+
+    link.report_edge();
+    assert_eq!(next_edge_status(&mut c).await, edge_status(a, 5));
+    let asks = sink.edge_asks.lock().unwrap().clone();
+    assert!(
+        asks.len() >= 3 && asks.iter().all(|&every_app| every_app),
+        "a new stream, a live bundle and a request all ask for every app: {asks:?}"
+    );
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+/// A purge is handed to the sink whole and acked with its code, `""` when it is done. A sink that
+/// panics is `busy` (the control plane sends it again), and the link goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cache_purge_is_acked_with_the_code_of_the_sink() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("purge");
+    let sink = Arc::new(Sink::default());
+    {
+        let mut refusals = sink.purge_refusals.lock().unwrap();
+        refusals.insert("gone".into(), PurgeCode::NotInBundle);
+        refusals.insert("off".into(), PurgeCode::CacheOff);
+        refusals.insert("bad".into(), PurgeCode::Invalid);
+        refusals.insert("later".into(), PurgeCode::Busy);
+    }
+    *sink.purge_panics_on.lock().unwrap() = Some("boom".into());
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+
+    let ids = ["done", "gone", "off", "bad", "later", "boom", "after"];
+    for id in ids {
+        c.send(In::CachePurge(CachePurge {
+            command_id: id.into(),
+            app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+            scope: "prefix".into(),
+            url: format!("/shop/{id}"),
+        }))
+        .await;
+    }
+    let acks = c.next_acks(ids.len()).await;
+    assert_eq!(
+        acks.iter()
+            .map(|a| (a.command_id.as_str(), a.ok, a.error.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("done", true, ""),
+            ("gone", false, "not_in_bundle"),
+            ("off", false, "cache_off"),
+            ("bad", false, "invalid"),
+            ("later", false, "busy"),
+            ("boom", false, "busy"),
+            ("after", true, ""),
+        ]
+    );
+    let got = sink.purges.lock().unwrap().clone();
+    assert_eq!(got.len(), ids.len());
+    assert_eq!(
+        got[0],
+        CachePurge {
+            command_id: "done".into(),
+            app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+            scope: "prefix".into(),
+            url: "/shop/done".into(),
+        }
+    );
     task.abort();
     clean_up(&link, state).await;
 }

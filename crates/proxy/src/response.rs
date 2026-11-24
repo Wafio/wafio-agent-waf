@@ -181,6 +181,15 @@ impl OutboundResponse {
         }
     }
 
+    /// The values of every header line named `k` (not the special headers), in order.
+    pub(crate) fn values<'a>(&'a self, k: &[u8]) -> impl Iterator<Item = &'a [u8]> + use<'a> {
+        let k = title_case_header_key(k);
+        self.header_lines
+            .iter()
+            .filter(move |(n, _)| *n == k)
+            .map(|(_, v)| v.as_slice())
+    }
+
     /// Handles the special response headers; true when handled.
     fn special(&mut self, k: &[u8], v: &[u8], add: bool) -> bool {
         match k {

@@ -28,6 +28,7 @@ else
 fi
 
 echo '== proto'
+scripts/test-sync-proto.sh
 scripts/sync-proto.sh --check
 
 echo '== notices'

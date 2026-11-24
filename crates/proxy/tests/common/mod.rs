@@ -344,6 +344,7 @@ pub fn app(id: &str, port: u16, upstream: &str) -> AppSpec {
         maintenance: Vec::new(),
         analysis: analysis_setup(RULES),
         tls: None,
+        compression: None,
     }
 }
 
