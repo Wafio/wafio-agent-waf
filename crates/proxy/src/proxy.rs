@@ -19,6 +19,7 @@ use crate::edge_stats::{CompressionCounters, EdgeStats};
 use crate::https::{RedirectTarget, TLS_HANDSHAKE_TIMEOUT};
 use crate::listeners::{ROUTE_DRAIN_GRACE, RouteManager, RouteSpec, Serves};
 use crate::route::CONNECTION_LIMIT;
+use crate::static_files::{DISK_DEADLINE, DiskGate};
 
 /// Process-wide dependencies, set once at start.
 pub struct ProxyOptions {
@@ -39,6 +40,9 @@ pub struct ProxyOptions {
     pub tls_handshake_timeout: Duration,
     /// Connections one listener serves at once; more are closed (a plain listener answers 503).
     pub connection_limit: usize,
+    /// Blocking threads that the folders of static files may use at once (twice the workers, at
+    /// least 8, unless set). A request that finds none free for 100 ms goes to the application.
+    pub disk_slots: usize,
 }
 
 impl ProxyOptions {
@@ -52,6 +56,7 @@ impl ProxyOptions {
             drain_timeout: ROUTE_DRAIN_GRACE,
             tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
             connection_limit: CONNECTION_LIMIT,
+            disk_slots: DiskGate::default_slots(),
         }
     }
 }
@@ -68,6 +73,8 @@ pub(crate) struct Shared {
     pub book: Arc<CertBook>,
     /// What the edge parts of each app count.
     pub edge: EdgeStats,
+    /// The blocking threads the folders of static files share.
+    pub disk: DiskGate,
 }
 
 pub struct Proxy {
@@ -94,6 +101,7 @@ impl Proxy {
             transport: TransportConnector::new(None),
             book: Arc::default(),
             edge: EdgeStats::default(),
+            disk: DiskGate::new(opts.disk_slots, DISK_DEADLINE),
         });
         Proxy {
             shared: shared.clone(),

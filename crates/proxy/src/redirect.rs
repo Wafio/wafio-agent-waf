@@ -92,6 +92,16 @@ pub(crate) fn outside_prefix(route: &Route, req: &InboundRequest) -> bool {
     !prefix.is_empty() && below_prefix(prefix, &req.forward_path).is_none()
 }
 
+/// The decoded path the application sees: the request path with the route's path prefix taken
+/// off (as for [`upstream_target`]), else the path as it is.
+pub(crate) fn app_path<'a>(route: &Route, req: &'a InboundRequest) -> &'a [u8] {
+    let prefix = route.proxy_config.strip_path_prefix.as_bytes();
+    if prefix.is_empty() {
+        return &req.forward_path;
+    }
+    below_prefix(prefix, &req.forward_path).unwrap_or(&req.forward_path)
+}
+
 /// The request target the upstream gets: the public one, with the route's path prefix taken off
 /// when the path equals it or goes on with `/` (`/` when nothing is left). The prefix is matched
 /// on the decoded path, dot segments already resolved. A request that asks for an upgrade is not
@@ -147,6 +157,7 @@ mod tests {
             analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
             tls,
             compression: None,
+            static_files: None,
         })
         .unwrap()
     }
@@ -421,6 +432,7 @@ mod tests {
                 analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
                 tls: None,
                 compression: None,
+                static_files: None,
             };
             let e = build_route(&spec).err().expect(bad);
             assert!(e.contains("strip_path_prefix"), "{bad}: {e}");

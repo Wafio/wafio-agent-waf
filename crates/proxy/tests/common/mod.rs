@@ -345,6 +345,7 @@ pub fn app(id: &str, port: u16, upstream: &str) -> AppSpec {
         analysis: analysis_setup(RULES),
         tls: None,
         compression: None,
+        static_files: None,
     }
 }
 

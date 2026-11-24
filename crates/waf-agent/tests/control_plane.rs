@@ -1,6 +1,6 @@
 //! Black-box test with the real binary: an in-test fake control plane (tonic, mTLS with the
 //! control crate's fixture CA) checks what `wafio-waf-agent` sends — Hello (kind, version,
-//! the features `script_rules`, `maintenance_mode`, `edge_redirects`, `edge_compression`, `tls_certificates` and
+//! the features `script_rules`, `maintenance_mode`, `edge_redirects`, `edge_compression`, `edge_static_files`, `tls_certificates` and
 //! `no_semantic_engine`), the first heartbeat with host info and counters, the edge status of an app after its bundle, the
 //! answer to a cache purge, the malware sync
 //! into the security-data dir given by `--security-data-dir`, the bundle ack, READY after the
@@ -271,10 +271,11 @@ async fn agent_talks_to_the_control_plane() {
             "maintenance_mode",
             "edge_redirects",
             "edge_compression",
+            "edge_static_files",
             "tls_certificates",
             "no_semantic_engine"
         ],
-        "the agent runs script rules, serves the maintenance page itself, applies the main host, the path prefix and compression, has a key directory it can use, and this binary has no engine"
+        "the agent runs script rules, serves the maintenance page itself, applies the main host, the path prefix, compression and static files, has a key directory it can use, and this binary has no engine"
     );
 
     // The stream: Hello, then the first heartbeat with host info and the agent's counters.
@@ -302,8 +303,12 @@ async fn agent_talks_to_the_control_plane() {
     );
 
     // A live bundle: acked, cached, READY, the listener proxies.
+    let site = dir.join("site");
+    std::fs::create_dir_all(&site).unwrap();
+    std::fs::write(site.join("static.txt"), "from the folder").unwrap();
+    let root = serde_json::json!(site.to_str().unwrap());
     let bundle = format!(
-        r#"{{"agent_id":"cf4","project_id":"p","generation":1,"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block","proxy_config":{{"strip_path_prefix":"/shop"}},"compression":{{"enabled":true,"min_bytes":2}},"rules_json":{{"path_exceptions":[{{"path":"/shop/search","block":{{}}}}]}}}}]}}"#
+        r#"{{"agent_id":"cf4","project_id":"p","generation":1,"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block","proxy_config":{{"strip_path_prefix":"/shop"}},"compression":{{"enabled":true,"min_bytes":2}},"static_files":{{"enabled":true,"root":{root},"missing":"app","max_age_s":60}},"rules_json":{{"path_exceptions":[{{"path":"/shop/search","block":{{}}}}]}}}}]}}"#
     );
     let bu = BundleUpdate {
         command_id: "b1".into(),
@@ -342,7 +347,11 @@ async fn agent_talks_to_the_control_plane() {
         .collect();
     assert_eq!(
         features,
-        [("redirects", "applied", ""), ("compression", "applied", "")]
+        [
+            ("redirects", "applied", ""),
+            ("compression", "applied", ""),
+            ("static_files", "applied", "")
+        ]
     );
     assert_eq!(edge.compression, Some(EdgeCompressionCounters::default()));
     assert!(edge.cache.is_none() && edge.unix_time > 0);
@@ -362,6 +371,16 @@ async fn agent_talks_to_the_control_plane() {
         .await
         .unwrap();
     assert!(ok.starts_with("HTTP/1.1 200") && ok.ends_with("ok"), "{ok}");
+    // A file of the app's folder is answered by the agent, under the path prefix, and a path that
+    // is not in it goes on to the application.
+    let file = tokio::task::spawn_blocking(move || get(listen, "/shop/static.txt", ""))
+        .await
+        .unwrap();
+    assert!(
+        file.starts_with("HTTP/1.1 200") && file.ends_with("from the folder"),
+        "{file}"
+    );
+    assert!(file.contains("Cache-Control: max-age=60\r\n"), "{file}");
 
     // A blocked request (the path of the app is blocked by a rule; this agent has no engine): the decision reaches
     // the control plane with credentials redacted.

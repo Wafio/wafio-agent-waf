@@ -52,6 +52,34 @@ pub(crate) fn count_compression_skipped(reason: usize) {
     COMPRESSION_SKIPPED[reason].fetch_add(1, Ordering::Relaxed);
 }
 
+/// The statuses a folder of static files answers, one counter each: the file (`200`), a part of it
+/// (`206`), not modified (`304`), the directory's slash (`308`), a range outside the file (`416`)
+/// and, for an app that answers its own misses, `404`, `405` and `503` (the disk is busy).
+pub const STATIC_STATUSES: [u16; 8] = [200, 206, 304, 308, 404, 405, 416, 503];
+pub static STATIC_RESPONSES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Looks and reads of a folder that were not made because every disk slot was taken, or that did
+/// not return in time (a disk that does not answer).
+pub static STATIC_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+/// Bytes of the bodies of those answers, as sent.
+pub static STATIC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a static answer of `status` with `bytes` of body already in hand; a body that is read
+/// from a file as it is sent is counted by [`count_static_bytes`].
+pub(crate) fn count_static(status: u16, bytes: u64) {
+    if let Some(i) = STATIC_STATUSES.iter().position(|&s| s == status) {
+        STATIC_RESPONSES[i].fetch_add(1, Ordering::Relaxed);
+    }
+    count_static_bytes(bytes);
+}
+
+pub(crate) fn count_static_bytes(bytes: u64) {
+    STATIC_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn count_static_unavailable() {
+    STATIC_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Most distinct coverage flags kept as labels; the rest count as "other".
 const COVERAGE_LABEL_CAP: usize = 32;
 
