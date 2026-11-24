@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use wafio_agent_pages::goodbot::VerifiedBotChecker;
 use wafio_application::RateLimitStore;
@@ -821,16 +821,46 @@ fn app_spec(
     }
 }
 
+/// How long all the folder checks of one bundle may take together.
+const STATIC_CHECK_DEADLINE: Duration = Duration::from_secs(3);
+
 /// What the disk says of the folder of each app that has static files switched on, by app id. The
-/// bundle carries the part only while it is on, and `enabled: true` is what counts here.
+/// bundle carries the part only while it is on, and `enabled: true` is what counts here. Each
+/// check runs on its own thread against one deadline for all of them, so a disk that does not
+/// answer (a network mount whose server is down) cannot hold up the bundle, the certificates
+/// queued behind it or the other folders: its app is refused as `root_unreadable` and its thread
+/// stays parked.
 fn check_static_files(apps: &[BundleApp]) -> HashMap<String, Result<StaticSpec, StaticRefusal>> {
-    apps.iter()
+    check_static_files_within(apps, STATIC_CHECK_DEADLINE, StaticSpec::check)
+}
+
+fn check_static_files_within(
+    apps: &[BundleApp],
+    deadline: Duration,
+    check: fn(&str, &str, i64) -> Result<StaticSpec, StaticRefusal>,
+) -> HashMap<String, Result<StaticSpec, StaticRefusal>> {
+    let started = Instant::now();
+    let pending: Vec<_> = apps
+        .iter()
         .filter_map(|app| {
             let files = app.static_files.as_ref().filter(|f| f.enabled)?;
-            Some((
-                app.app_id.clone(),
-                StaticSpec::check(&files.root, &files.missing, files.max_age_s),
-            ))
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (root, missing, max_age_s) =
+                (files.root.clone(), files.missing.clone(), files.max_age_s);
+            std::thread::spawn(move || {
+                let _ = tx.send(check(&root, &missing, max_age_s));
+            });
+            Some((app.app_id.clone(), files.root.as_str(), rx))
+        })
+        .collect();
+    pending
+        .into_iter()
+        .map(|(app_id, root, rx)| {
+            let left = deadline.saturating_sub(started.elapsed());
+            let result = rx
+                .recv_timeout(left)
+                .unwrap_or_else(|_| Err(StaticRefusal::no_answer(root)));
+            (app_id, result)
         })
         .collect()
 }

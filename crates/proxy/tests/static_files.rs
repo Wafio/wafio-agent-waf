@@ -10,12 +10,13 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use wafio_proxy::{AppSpec, CompressionSpec, StaticSpec};
+use wafio_proxy::{AppSpec, CompressionSpec, Proxy, ProxyOptions, StaticSpec};
 
 /// A scratch directory, removed at the end of the test.
 struct Dir(PathBuf);
@@ -1303,4 +1304,63 @@ async fn the_folder_answers_are_counted_by_status() {
     assert!(count(200) >= before_200 + 2);
     assert!(count(404) > before_404);
     assert!(STATIC_BYTES.load(Relaxed) >= bytes + 26);
+}
+
+/// A proxy whose folders may use `slots` blocking threads at once.
+fn limited(slots: usize, app: AppSpec) -> (Harness, SocketAddr) {
+    let events: Events = Arc::default();
+    let ev = events.clone();
+    let mut opts = ProxyOptions::new(Arc::new(move |e| ev.lock().unwrap().push(e)));
+    opts.disk_slots = slots;
+    let addr = format!("127.0.0.1:{}", app.listen_port).parse().unwrap();
+    let proxy = Proxy::new(opts);
+    proxy.apply(vec![app]).unwrap();
+    (Harness { proxy, events }, addr)
+}
+
+/// A request that finds every disk slot taken does not wait on the disk: after a short wait it
+/// goes to the application, or is answered 503 when the folder is the whole site. Both are counted.
+#[tokio::test]
+async fn a_request_that_finds_no_disk_slot_goes_to_the_application_or_gets_503() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use wafio_proxy::metrics::STATIC_UNAVAILABLE;
+    let dir = Dir::new("slots");
+    dir.file("public/hello.txt", b"hello, folder");
+    for (missing, status, body, asked) in [
+        ("app", 200, FROM_APP, 1),
+        ("not_found", 503, &b"Service Unavailable"[..], 0),
+    ] {
+        let up = upstream().await;
+        let a = folder_app(free_port(), &up, &dir.path("public"), missing, 0);
+        let (_h, addr) = limited(0, a);
+        let before = STATIC_UNAVAILABLE.load(Relaxed);
+        let r = one(addr, &get("/hello.txt")).await;
+        assert_eq!((r.status, r.body.as_slice()), (status, body), "{missing}");
+        assert_eq!(up.count(), asked, "{missing}: the application was asked");
+        assert!(STATIC_UNAVAILABLE.load(Relaxed) > before, "{missing}");
+    }
+}
+
+/// With one slot and many requests at once, none is turned away: each waits its turn for the slot
+/// on a disk that answers, and every one gets the file from the folder.
+#[tokio::test]
+async fn with_one_disk_slot_a_burst_on_a_healthy_disk_is_served_from_the_folder() {
+    let dir = Dir::new("one-slot");
+    dir.file("public/hello.txt", b"hello, folder");
+    let up = upstream().await;
+    let a = folder_app(free_port(), &up, &dir.path("public"), "", 0);
+    let (_h, addr) = limited(1, a);
+    let tasks: Vec<_> = (0..40)
+        .map(|_| {
+            tokio::spawn(async move {
+                let r = one(addr, &get("/hello.txt")).await;
+                (r.status, r.body)
+            })
+        })
+        .collect();
+    for t in tasks {
+        let (status, body) = t.await.unwrap();
+        assert_eq!((status, body.as_slice()), (200, &b"hello, folder"[..]));
+    }
+    assert_eq!(up.count(), 0, "the application was not asked");
 }

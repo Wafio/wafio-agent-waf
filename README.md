@@ -757,8 +757,12 @@ folder an earlier bundle gave it (none if it had none), the rest of the bundle a
 `root_missing`, `root_not_directory`, `root_unreadable` (the folder cannot be opened, or is under `/home`, `/root` or `/run/user`,
 which the unit hides with `ProtectHome=yes`; the agent refuses such a folder for what it is and writes no drop-in), and
 `root_forbidden` (the root folder `/`, a folder that is, is below or is above `/etc`, `/root`, `/proc`, `/sys`, `/dev`, `/run`,
-`/boot`, `/usr`, `/var/lib/wafio-waf-agent` or `/var/cache/wafio-waf`). The forbidden list is run on the text and again on the
-folder the path opens (`/proc/self/fd/<fd>` says where). The agent runs as a user that must be able to read the folder, and needs `/proc`.
+`/boot`, `/usr`, `/var/lib/wafio-waf-agent` or `/var/cache/wafio-waf`, and a folder with a segment on the list of names that are never
+served, see below: `/srv/private/site` and `/var/www/profile` are refused, in any case). The forbidden checks are run on the text and
+again on the folder the path opens (`/proc/self/fd/<fd>` says where). The agent runs as a user that must be able to read the folder, and
+needs `/proc`. The checks of one bundle run on their own threads under one deadline of 3 seconds: a folder on a disk that does not answer
+(a network mount whose server is down) is refused as `root_unreadable` with the detail `<folder> (no answer from the disk)`, and the
+rest of the bundle applies without it.
 
 - **No link below the root is followed.** The folder is opened by its path on every request, so the path itself may hold links (a
   deploy's `current` link is followed when it moves). From there each segment is opened with `openat(O_NOFOLLOW)`, a directory
@@ -767,16 +771,24 @@ folder the path opens (`/proc/self/fd/<fd>` says where). The agent runs as a use
   behind it are not served from the folder: such a request goes to the application. A hard link looks like the file it is, so keep
   `fs.protected_hardlinks=1` (the default of current distributions) and do not let untrusted users write below the folder.
 - **The folder is checked again on every request.** The `(st_dev, st_ino)` of the directory the root path opens is compared with the
-  pair that passed. When it differs, `/proc/self/fd/<fd>` is read and the forbidden list is run on where the directory is before
-  anything is served; the new pair is kept when it passes. A `current` link that is moved to `/etc` or to the key directory serves
-  nothing (a miss) until it is moved back.
+  pair that passed. When it differs, `/proc/self/fd/<fd>` is read and the forbidden checks are run on where the directory is before
+  anything is served; the new pair is kept when it passes. A `current` link that is moved to `/etc`, to the key directory or to a
+  folder under a name that is never served serves nothing (a miss) until it is moved back.
 - **Never served**, decided on the text before any system call: a segment that starts with a dot (a first `.well-known` is allowed),
   a last name that ends in `.php`, `.php3` to `.php8`, `.phtml`, `.phar` or `.phps` in any case, a segment holding a control byte, a
   backslash or NUL, a path of more than 4 KiB or 64 segments, and a segment whose lower-case name is on a copy of the names the host
   agent never sheds from its trace ring (`private`, `shadow`, `cron`, `passwd`, `security`, `profile`, `network`, and the rest of
   `crates/proxy/tests/data/trace-keep-names.json`, which a test compares with the copy). An open of such a name is always reported by
-  the host agent and raises credential alerts against this process, so the folder never opens one. These are misses too. A folder
-  whose own path holds one of these names is opened on every request, and the host agent sees that open: do not choose one.
+  the host agent and raises credential alerts against this process, so the folder never opens one. These are misses too, so
+  `/profile/avatar.png` is a miss. The folder's own path may not hold one either: the root is opened by its path on every request,
+  and the host agent would see an open that it never sheds at the rate of the requests, so the agent refuses such a folder as
+  `root_forbidden` (at the apply, and again for where a moved link leads).
+- **The disk cannot hold the agent up.** Every look and every read of a file runs on a blocking thread of the runtime, and the folders
+  share a few slots of that pool (twice the workers, at least 8). A request that finds every slot taken waits up to 100 ms for one (a
+  burst on a healthy disk is served), then goes to the application, or is answered `503` when `missing` is `not_found`, and is
+  counted. A look or a read that has not returned in 5 seconds is given up the same way, and its slot stays taken until the call
+  returns, so a disk that does not answer parks at most the slots and never the rest of the pool (the control link, compression and
+  the key work). A download that cannot get a slot for the next read within 5 seconds ends the connection.
 - The path looked up is the one the application would see: decoded, dot segments resolved, and with the path prefix taken off. A
   path outside the prefix is `404` before it gets here. A request with an `Upgrade` header is the application's.
 - A directory: its `index.html` for a path that ends in `/` (the root included), else `308` to the path with a `/` when it has one,
@@ -794,8 +806,9 @@ folder the path opens (`/proc/self/fd/<fd>` says where). The agent runs as a use
   A `HEAD` answer reads nothing, and says nothing of an encoding (a `GET` for the same file may be compressed).
 - A decision event for the answer carries the verdict action and the status of the answer. A request that is blocked, or that a
   per-path rule blocks, is never answered from the folder.
-- Metrics: `wafio_waf_static_responses{status}` (`200`, `206`, `304`, `308`, `404`, `405`, `416`; a `404` or `405` is counted when the
-  folder answers it, not when the request goes on to the application) and `wafio_waf_static_bytes`.
+- Metrics: `wafio_waf_static_responses{status}` (`200`, `206`, `304`, `308`, `404`, `405`, `416`, `503`; a `404`, `405` or `503` is
+  counted when the folder answers it, not when the request goes on to the application), `wafio_waf_static_bytes` and
+  `wafio_waf_static_unavailable` (looks and reads that got no slot or no answer from the disk).
 
 ## Edge status and cache purge
 

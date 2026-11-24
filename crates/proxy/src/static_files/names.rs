@@ -84,7 +84,7 @@ pub(super) const KEPT_NAMES: [&str; 66] = [
 const LONGEST_KEPT: usize = 24;
 
 /// Whether `segment`, in any case, is one of [`KEPT_NAMES`].
-fn kept_name(segment: &[u8]) -> bool {
+pub(super) fn kept_name(segment: &[u8]) -> bool {
     if segment.len() > LONGEST_KEPT {
         return false;
     }

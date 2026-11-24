@@ -13,8 +13,8 @@ use wafio_engine_api::engine;
 use wafio_proxy::metrics::{
     ANALYZE_LATENCY_HISTOGRAM, COMPRESSED_BROTLI, COMPRESSED_GZIP, COMPRESSION_BYTES_IN,
     COMPRESSION_BYTES_OUT, COMPRESSION_SKIP_REASONS, COMPRESSION_SKIPPED, MAINTENANCE_RESPONSES,
-    PANIC_COUNT, STATIC_BYTES, STATIC_RESPONSES, STATIC_STATUSES, coverage_flag_samples,
-    latency_percentiles,
+    PANIC_COUNT, STATIC_BYTES, STATIC_RESPONSES, STATIC_STATUSES, STATIC_UNAVAILABLE,
+    coverage_flag_samples, latency_percentiles,
 };
 
 use crate::tls::metrics::TlsMetrics;
@@ -146,7 +146,7 @@ pub fn register_agent_metrics(reg: &Registry, link: Arc<ControlLink>, tls: &Arc<
     );
     reg.labeled_counter(
         "wafio_waf_static_responses",
-        "Answers a folder of static files gave, by status: 200 and 206 (the file or a part of it), 304, 308 (a directory asked for without its slash), 416, and 404 and 405 for an app that answers its own misses.",
+        "Answers a folder of static files gave, by status: 200 and 206 (the file or a part of it), 304, 308 (a directory asked for without its slash), 416, and 404, 405 and 503 (the disk is busy) for an app that answers its own misses.",
         move || {
             STATIC_STATUSES
                 .iter()
@@ -159,6 +159,11 @@ pub fn register_agent_metrics(reg: &Registry, link: Arc<ControlLink>, tls: &Arc<
         "wafio_waf_static_bytes",
         "Bytes of the bodies of the answers of static folders, as sent.",
         || u(STATIC_BYTES.load(Ordering::Relaxed)),
+    );
+    reg.counter(
+        "wafio_waf_static_unavailable",
+        "Lookups and reads of a static folder that were not made because every disk slot was taken, or that did not return in time because the disk did not answer.",
+        || u(STATIC_UNAVAILABLE.load(Ordering::Relaxed)),
     );
     reg.labeled_counter(
         "wafio_waf_jail_refused",
@@ -330,6 +335,7 @@ mod tests {
             r#"wafio_waf_static_responses_total{status="200"}"#,
             r#"wafio_waf_static_responses_total{status="416"}"#,
             "wafio_waf_static_bytes_total",
+            "wafio_waf_static_unavailable_total",
             r#"wafio_waf_challenge_pinned_evictions_total{store="spent_tokens"}"#,
             r#"wafio_waf_challenge_pinned_evictions_total{store="revoked_cookies"}"#,
             "wafio_waf_challenge_verify_limited_total",

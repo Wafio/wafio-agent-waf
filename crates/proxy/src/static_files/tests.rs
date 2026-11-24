@@ -73,6 +73,21 @@ fn a_folder_that_is_forbidden_or_hidden_is_refused_by_its_text() {
         ("/var", F),
         ("/var/lib", F),
         ("/var/cache", F),
+        // A segment on the names the host agent never sheds, in any case, wherever it stands: the
+        // root is opened by its path on every request.
+        ("/srv/private/site", F),
+        ("/srv/site/private", F),
+        ("/srv/PRIVATE/site", F),
+        ("/var/www/profile", F),
+        ("/var/www/Profile/public", F),
+        ("/srv/security", F),
+        ("/srv/network/site", F),
+        ("/srv/group", F),
+        ("/srv/hosts/site", F),
+        ("/srv/.docker/site", F),
+        ("/srv/cron.d/site", F),
+        ("/srv/systemd/site", F),
+        ("/srv/wafio-waf-agent/site", F),
         // The folders the unit hides read as missing there, and are refused for that.
         ("/home", U),
         ("/home/deploy", U),
@@ -101,6 +116,13 @@ fn a_folder_that_only_looks_like_a_forbidden_one_is_judged_by_the_disk() {
         "/homebrew/site",
         "/rootfs",
         "/run2",
+        // A name that only holds a kept one.
+        "/srv/private-site",
+        "/srv/privately",
+        "/srv/profiles",
+        "/srv/my.profile",
+        "/srv/group2/site",
+        "/srv/the-hosts/site",
     ] {
         let (code, _) = refusal(root);
         assert_eq!(code, RefusalCode::RootMissing, "{root}");
@@ -250,6 +272,70 @@ fn a_folder_whose_path_leads_to_a_forbidden_folder_is_refused_for_where_it_leads
         refusal(&s.path("to-proc-self")).0,
         RefusalCode::RootForbidden
     );
+}
+
+/// A link can lead to a folder whose own path holds a kept name: the host agent would see the
+/// open of it on every request, so it is refused for where it leads.
+#[test]
+fn a_folder_whose_path_leads_through_a_kept_name_is_refused_for_where_it_leads() {
+    let s = Scratch::new("leads-kept");
+    let private = s.dir("private/site");
+    s.dir("plain/site");
+    s.link("site-link", &private);
+    s.link("plain-link", s.0.join("plain/site"));
+    assert!(StaticSpec::check(&s.path("plain-link"), "", 0).is_ok());
+    let r = StaticSpec::check(&s.path("site-link"), "", 0).unwrap_err();
+    assert_eq!(
+        (r.code, r.detail.as_str()),
+        (RefusalCode::RootForbidden, private.to_str().unwrap()),
+        "the detail names the folder the path opens"
+    );
+}
+
+/// The same after the apply: a `current` link that moves to a folder under a kept name serves
+/// nothing, the first time and when the pair is already known, and serves again when it moves back.
+#[test]
+fn a_current_link_repointed_below_a_kept_name_serves_nothing_and_a_return_serves_again() {
+    let s = Scratch::new("repoint-kept");
+    s.file("releases/1/index.html", b"one");
+    s.file("private/site/index.html", b"under a kept name");
+    s.file("Profile/index.html", b"in any case");
+    s.link("current", "releases/1");
+    let f = folder(&s.path("current"));
+    assert_eq!(served(&f, "/").unwrap(), b"one");
+    for target in [s.0.join("private/site"), s.0.join("Profile")] {
+        std::fs::remove_file(s.0.join("current")).unwrap();
+        s.link("current", &target);
+        for _ in 0..3 {
+            assert!(served(&f, "/").is_none(), "{}", target.display());
+            assert!(served(&f, "/index.html").is_none(), "{}", target.display());
+        }
+        assert!(f.refused.load(Ordering::Relaxed));
+        std::fs::remove_file(s.0.join("current")).unwrap();
+        s.link("current", "releases/1");
+        assert_eq!(served(&f, "/").unwrap(), b"one");
+        assert!(!f.refused.load(Ordering::Relaxed));
+    }
+}
+
+/// The note of a disk that did not answer is kept when the folder is long, and the folder is
+/// cleaned like any other detail.
+#[test]
+fn the_refusal_for_a_disk_that_does_not_answer_names_the_folder_and_keeps_its_note() {
+    let r = StaticRefusal::no_answer("/mnt/nfs/site");
+    assert_eq!(
+        (r.code, r.detail.as_str()),
+        (
+            RefusalCode::RootUnreadable,
+            "/mnt/nfs/site (no answer from the disk)"
+        )
+    );
+    let long = format!("/{}", "é".repeat(600));
+    let r = StaticRefusal::no_answer(&long);
+    assert!(r.detail.len() <= 256, "{}", r.detail.len());
+    assert!(r.detail.ends_with(" (no answer from the disk)"));
+    let r = StaticRefusal::no_answer("/mnt/a\u{1}b");
+    assert_eq!(r.detail, "/mnt/a?b (no answer from the disk)");
 }
 
 #[test]

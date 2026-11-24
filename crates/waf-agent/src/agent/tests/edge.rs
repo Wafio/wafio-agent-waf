@@ -555,6 +555,9 @@ fn a_folder_the_agent_cannot_use_leaves_the_bundle_in_and_says_why() {
             "root_forbidden",
         ),
         ("/".to_owned(), "app", 0, "root_forbidden"),
+        // A name the host agent never sheds, in the folder's own path.
+        ("/srv/private/site".to_owned(), "app", 0, "root_forbidden"),
+        ("/var/www/profile".to_owned(), "app", 0, "root_forbidden"),
         ("/home/deploy/site".to_owned(), "app", 0, "root_unreadable"),
         ("relative/folder".to_owned(), "app", 0, "invalid"),
         ("/var/www/../etc".to_owned(), "app", 0, "invalid"),
@@ -754,6 +757,83 @@ fn the_folders_of_two_apps_are_kept_apart() {
         running_folder(&proxy),
         None,
         "the folder of a removed app does not come back"
+    );
+}
+
+/// A disk that does not answer holds up neither the bundle nor the other folders: the check of its
+/// app is refused as `root_unreadable` once the one deadline of all the checks has passed, and the
+/// checks that did answer keep their result.
+#[test]
+fn a_folder_check_that_gets_no_answer_from_the_disk_is_refused_within_one_deadline() {
+    fn answers_or_hangs(
+        root: &str,
+        missing: &str,
+        max_age_s: i64,
+    ) -> Result<wafio_proxy::StaticSpec, wafio_proxy::StaticRefusal> {
+        if root.starts_with("/hang") {
+            loop {
+                std::thread::park();
+            }
+        }
+        wafio_proxy::StaticSpec::check(root, missing, max_age_s)
+    }
+    let entry = |enabled, root: &str| {
+        Some(crate::bundle::StaticFilesEntry {
+            enabled,
+            root: root.into(),
+            missing: String::new(),
+            max_age_s: 0,
+        })
+    };
+    let app = |id: &str, files| BundleApp {
+        app_id: id.into(),
+        static_files: files,
+        ..Default::default()
+    };
+    let good = Folder::new("answers");
+    let apps = [
+        app("hung-a", entry(true, "/hang/a")),
+        app("good", entry(true, &good.path())),
+        app("hung-b", entry(true, "/hang/b")),
+        app("hung-c", entry(true, "/hang/c")),
+        app("off", entry(false, "/hang/off")),
+        app("none", None),
+    ];
+    let started = Instant::now();
+    let got = check_static_files_within(&apps, Duration::from_millis(500), answers_or_hangs);
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "three folders that do not answer share one deadline: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(got.len(), 4, "an app with the part off is not checked");
+    assert!(got["good"].is_ok());
+    for (id, root) in [
+        ("hung-a", "/hang/a"),
+        ("hung-b", "/hang/b"),
+        ("hung-c", "/hang/c"),
+    ] {
+        let refusal = got[id].as_ref().unwrap_err();
+        assert_eq!(
+            refusal.code,
+            wafio_proxy::RefusalCode::RootUnreadable,
+            "{id}"
+        );
+        assert_eq!(
+            refusal.detail,
+            format!("{root} (no answer from the disk)"),
+            "{id}"
+        );
+    }
+
+    // A disk that answers is not waited on for the deadline.
+    let started = Instant::now();
+    let got = check_static_files_within(&apps[1..2], Duration::from_secs(30), answers_or_hangs);
+    assert!(got["good"].is_ok());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
     );
 }
 

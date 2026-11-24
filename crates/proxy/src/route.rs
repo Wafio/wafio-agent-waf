@@ -173,7 +173,7 @@ impl RouteApp {
             }
             Ok(Done::File(f)) => {
                 let close = head.connection_close || *shutdown.borrow();
-                return relay_file(stream, buf, &head, *f, close, write_ms)
+                return relay_file(&self.shared, stream, buf, &head, *f, close, write_ms)
                     .await
                     .map(|(stream, rest)| (stream, shrink_idle_buffer(rest, consumed)));
             }
@@ -324,9 +324,11 @@ async fn relay(
 /// [`crate::static_files::CHUNK`] bytes, each written within the write deadline. The length in the
 /// head was the file's size when it was opened and nothing is sent past it, so a file that grew is
 /// cut at that size. A file that is cut short (or cannot be read) ends the connection with no more
-/// bytes, which is how the client learns the body is incomplete. The connection stays open for the
-/// next request when the answer, the request and the draining server allow it.
+/// bytes, which is how the client learns the body is incomplete: so does a read that gets no disk
+/// slot or no answer from the disk in time. The connection stays open for the next request when the
+/// answer, the request and the draining server allow it.
 async fn relay_file(
+    shared: &Shared,
     mut stream: Stream,
     buf: BytesMut,
     req: &head_parser::Head,
@@ -346,19 +348,16 @@ async fn relay_file(
             n.min(crate::static_files::CHUNK)
         });
         let source = file.file.clone();
-        let read = tokio::task::spawn_blocking(move || {
-            chunk.resize(want, 0);
-            let got = crate::static_files::read_at_full(&source, &mut chunk, at);
-            (chunk, got)
-        })
-        .await;
-        let (piece, got) = match read {
-            Ok((piece, Ok(got))) if got > 0 => (piece, got),
-            Ok(_) => return None,
-            Err(_) => {
-                crate::metrics::count_agent_panic();
-                return None;
-            }
+        let read = shared
+            .disk
+            .run(shared.disk.deadline(), move || {
+                chunk.resize(want, 0);
+                let got = crate::static_files::read_at_full(&source, &mut chunk, at);
+                (chunk, got)
+            })
+            .await;
+        let Some((piece, Ok(got @ 1..))) = read else {
+            return None;
         };
         if !send(&mut stream, &[&piece[..got]], write_ms).await {
             return None;

@@ -13,8 +13,12 @@
 //!
 //! A file of 1 MiB or less is read whole and can be compressed like an upstream answer; a bigger
 //! one is sent from its open descriptor in 256 KiB reads ([`FileAnswer`], written by the route).
+//!
+//! Every look and every read runs on a blocking thread through the [`DiskGate`], which bounds how
+//! many threads the folders may hold and how long a request waits for the disk.
 
 mod answer;
+mod gate;
 mod mime;
 mod names;
 mod walk;
@@ -32,6 +36,7 @@ use crate::proxy::Shared;
 use crate::request::{InboundRequest, push_escaped_path, push_forward_query};
 use crate::response::{OutboundResponse, http_date};
 use answer::{Conditions, Meta, Plan};
+pub(crate) use gate::{DISK_DEADLINE, DiskGate, LOOKUP_WAIT};
 use walk::Found;
 
 /// The longest browser cache time: 365 days.
@@ -99,6 +104,20 @@ pub struct StaticRefusal {
     pub detail: String,
 }
 
+impl StaticRefusal {
+    /// The refusal for a folder whose disk did not answer within the time the caller allowed. The
+    /// note after the folder survives the cut to 256 bytes.
+    pub fn no_answer(root: &str) -> StaticRefusal {
+        const NOTE: &str = " (no answer from the disk)";
+        let mut detail = detail_within(root, DETAIL_MAX - NOTE.len());
+        detail.push_str(NOTE);
+        StaticRefusal {
+            code: RefusalCode::RootUnreadable,
+            detail,
+        }
+    }
+}
+
 /// What happens to a request whose file is not in the folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Missing {
@@ -126,13 +145,19 @@ fn under(path: &str, base: &str) -> bool {
 }
 
 /// Whether a folder may not be served, for the path it has now: one the unit hides, or one that is
-/// the root folder, a forbidden folder, below one or above one.
+/// the root folder, a forbidden folder, below one or above one, or one with a segment on the names
+/// the host agent never sheds from its trace ring. The agent opens the root by its path on every
+/// request, so such a name in the path would turn each request into an event that cannot be shed.
 fn root_fault(path: &str, forbidden: &[&str]) -> Option<RefusalCode> {
     if HIDDEN_BY_UNIT.iter().any(|hidden| under(path, hidden)) {
         return Some(RefusalCode::RootUnreadable);
     }
-    (path == "/" || forbidden.iter().any(|f| under(path, f) || under(f, path)))
-        .then_some(RefusalCode::RootForbidden)
+    (path == "/"
+        || forbidden.iter().any(|f| under(path, f) || under(f, path))
+        || path
+            .split('/')
+            .any(|segment| names::kept_name(segment.as_bytes())))
+    .then_some(RefusalCode::RootForbidden)
 }
 
 /// A root that is an absolute path of at most 1,024 bytes with no empty, `.` or `..` segment, no
@@ -149,17 +174,24 @@ fn root_text_valid(root: &str) -> bool {
             .all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
-/// `text` for the control plane to show: control characters become `?`, at most 256 bytes.
-fn detail(text: &str) -> String {
+/// The longest `detail` of a refusal, in bytes.
+const DETAIL_MAX: usize = 256;
+
+/// `text` for the control plane to show: control characters become `?`, at most `max` bytes.
+fn detail_within(text: &str, max: usize) -> String {
     let mut out = String::new();
     for c in text.chars() {
         let c = if c.is_control() { '?' } else { c };
-        if out.len() + c.len_utf8() > 256 {
+        if out.len() + c.len_utf8() > max {
             break;
         }
         out.push(c);
     }
     out
+}
+
+fn detail(text: &str) -> String {
+    detail_within(text, DETAIL_MAX)
 }
 
 /// Where an open directory is, as the kernel says.
@@ -174,10 +206,11 @@ fn resolved_path(dir: &File) -> Option<String> {
 impl StaticSpec {
     /// Checks the settings of an app's `static_files` and the folder, and says what is wrong:
     /// `invalid` for a text or a number that is out of range (`missing` is `app`, `not_found` or
-    /// empty for `app`; the browser cache time 0 to [`MAX_BROWSER_CACHE_S`]), `root_forbidden`,
-    /// `root_unreadable` (a folder under `/home` and the like, which the unit hides),
-    /// `root_missing`, `root_not_directory`, or `root_unreadable` again for a folder that cannot
-    /// be opened. The forbidden list is run on the text and on the folder the path opens.
+    /// empty for `app`; the browser cache time 0 to [`MAX_BROWSER_CACHE_S`]), `root_forbidden`
+    /// (also for a folder with a segment such as `private` or `profile`, a name the host agent
+    /// never sheds), `root_unreadable` (a folder under `/home` and the like, which the unit
+    /// hides), `root_missing`, `root_not_directory`, or `root_unreadable` again for a folder that
+    /// cannot be opened. The forbidden check is run on the text and on the folder the path opens.
     pub fn check(root: &str, missing: &str, max_age_s: i64) -> Result<StaticSpec, StaticRefusal> {
         StaticSpec::check_against(root, missing, max_age_s, FORBIDDEN_ROOTS)
     }
@@ -463,14 +496,14 @@ fn head_of(hit: &Hit, head: bool, max_age_s: u32) -> OutboundResponse {
     r
 }
 
-/// A plain answer of the folder: `404` or `405`, counted.
+/// A plain answer of the folder: `404`, `405` or `503`, counted.
 fn refusal(status: u16) -> Done {
     let mut r = OutboundResponse::error(
         status,
-        if status == 404 {
-            "Not Found"
-        } else {
-            "Method Not Allowed"
+        match status {
+            404 => "Not Found",
+            503 => "Service Unavailable",
+            _ => "Method Not Allowed",
         },
     );
     if status == 405 {
@@ -498,8 +531,9 @@ fn add_slash(req: &InboundRequest) -> Done {
 }
 
 /// The folder's answer for `req`, or `None` when the request is the application's: a file that is
-/// not there with `missing: app`, and every method but `GET` and `HEAD` with it. Runs after the
-/// verdict; a request that asks for an upgrade never gets here.
+/// not there with `missing: app`, every method but `GET` and `HEAD` with it, and any request the
+/// disk gate turned away or the disk did not answer (`missing: not_found` says `503` for those).
+/// Runs after the verdict; a request that asks for an upgrade never gets here.
 pub(crate) async fn serve(
     shared: &Shared,
     route: &Route,
@@ -515,12 +549,14 @@ pub(crate) async fn serve(
     let conditions = conditions(req);
     let looked = {
         let folder = folder.clone();
-        tokio::task::spawn_blocking(move || folder.lookup(&path, &conditions, head)).await
+        shared
+            .disk
+            .run(LOOKUP_WAIT, move || folder.lookup(&path, &conditions, head))
+            .await
     };
-    let outcome = looked.unwrap_or_else(|_| {
-        crate::metrics::count_agent_panic();
-        Outcome::Missing
-    });
+    let Some(outcome) = looked else {
+        return own.then(|| refusal(503));
+    };
     let hit = match outcome {
         Outcome::Missing => return own.then(|| refusal(404)),
         Outcome::Slash => return Some(add_slash(req)),

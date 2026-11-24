@@ -215,13 +215,15 @@ pub fn set_block_in_place(on: bool) {
 /// threads and the per-request memory stay bounded; the rest wait here, holding no thread.
 fn detection_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SLOTS.get_or_init(|| {
-        let workers = match WORKERS.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => std::thread::available_parallelism().map_or(1, usize::from),
-            n => n,
-        };
-        tokio::sync::Semaphore::new(workers.max(2))
-    })
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(worker_count().max(2)))
+}
+
+/// The worker threads of the runtime, or the CPUs when it was not built by [`runtime_builder`].
+fn worker_count() -> usize {
+    match WORKERS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => std::thread::available_parallelism().map_or(1, usize::from),
+        n => n,
+    }
 }
 
 /// [`run_detection`] for a request of `weight` bytes (its body): a big one first waits for one of
