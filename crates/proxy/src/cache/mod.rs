@@ -33,8 +33,8 @@ use control::{CacheControl, MAX_LIFETIME_S, vary_names};
 use format::{MAX_KEY, StoredHead, Times};
 use index::MEMORY_COPY_MAX;
 use key::{
-    Bucket, FileId, PrimaryId, file_id, is_https, keyed_inputs, primary_id, primary_key,
-    request_header_values, variant,
+    Bucket, FileId, PrimaryId, file_id, is_https, keyed_inputs, normalized, primary_id,
+    primary_key, request_header_values, variant,
 };
 use store::Store;
 
@@ -296,19 +296,26 @@ fn has_body(req: &InboundRequest, body_read: bool) -> bool {
     body_read || length || has_line(req, &[b"transfer-encoding"])
 }
 
-/// The headers that make a request say it is another method.
+/// The headers that make a request say it is another method, as a CGI parameter names them: the
+/// `_` spelling of a name is the same parameter as the `-` one.
 const OVERRIDES: [&[u8]; 3] = [
     b"x-http-method-override",
     b"x-http-method",
     b"x-method-override",
 ];
 
+fn has_override(req: &InboundRequest) -> bool {
+    req.lines
+        .iter()
+        .any(|(n, _)| OVERRIDES.contains(&&normalized(n)[..]))
+}
+
 /// Whether the peer is a proxy the route trusts to say what it was asked for.
 pub(crate) fn trusts(route: &Route, peer: &IpAddress) -> bool {
     route.proxy_config.may_supply_forwarded_headers(peer)
 }
 
-pub(crate) use key::{forwarded_host_or_proto, unkeyed_input};
+pub(crate) use key::{forwarded_host, forwarded_host_or_proto, unkeyed_input};
 
 /// Whether the route has the cache on and the peer is not a proxy it trusts: what such a peer says
 /// in the headers that are not part of the key is not sent to the application.
@@ -333,7 +340,7 @@ pub(crate) fn plan(
         || req.has_upgrade()
         || !(get || req.method == b"HEAD")
         || has_body(req, body_read)
-        || has_line(req, &OVERRIDES)
+        || has_override(req)
         || crate::upstream::rewrites_response_body(route, &req.forward_path)
     {
         return Plan::Bypass;
@@ -508,33 +515,35 @@ pub(crate) fn decide(
     })
 }
 
-/// The longest the answer waits for its copy to be written. The write goes on past it.
+/// The longest a request waits for the files of a drop to be deleted. The deletion goes on past it.
 const STORE_WAIT: Duration = Duration::from_millis(500);
 
 /// Offers the answer of the application to the store, which keeps it when [`decide`] allows. The
-/// answer is sent after the copy is written, or after [`STORE_WAIT`] when the disk is slow.
-pub(crate) async fn fill(
+/// copy is written behind the visitor: the answer goes out at once, and what bounds the work is
+/// the budget of bytes in flight, taken here, and the wait for a disk slot. The body is shared with
+/// the answer, not copied.
+pub(crate) fn fill(
     shared: &Shared,
     route: &Route,
     ask: &Ask,
     req: &InboundRequest,
     resp: &OutboundResponse,
-) -> bool {
+) {
     let Some((settings, app)) = route.cache_active() else {
-        return false;
+        return;
     };
     if !app.can_store() {
-        return false;
+        return;
     }
     let Ok(p) = decide(settings, ask, req, resp, store::now()) else {
-        return false;
+        return;
     };
     let size = format::file_len(&p.key, &p.head, &resp.body);
     let Some(permit) = u32::try_from(size)
         .ok()
         .and_then(|n| app.budget().clone().try_acquire_many_owned(n).ok())
     else {
-        return false;
+        return;
     };
     let item = Store {
         id: p.id,
@@ -547,18 +556,20 @@ pub(crate) async fn fill(
         times: p.times,
     };
     let app = app.clone();
-    let job = shared.disk.run_counting(LOOKUP_WAIT, no_count, move || {
-        let _permit = permit;
-        app.store(item)
-    });
-    match tokio::time::timeout(STORE_WAIT, job).await {
-        Ok(Some(Ok(()))) => true,
-        Ok(Some(Err(store::Skip::Disk(e)))) => {
+    let storing = app.storing();
+    let disk = shared.disk.clone();
+    tokio::spawn(async move {
+        let _storing = storing;
+        let stored = disk
+            .run_counting(LOOKUP_WAIT, no_count, move || {
+                let _permit = permit;
+                app.store(item)
+            })
+            .await;
+        if let Some(Err(store::Skip::Disk(e))) = stored {
             tracing::debug!("[cache] a copy was not written: {e}");
-            false
         }
-        _ => false,
-    }
+    });
 }
 
 fn no_count() {}
@@ -652,7 +663,7 @@ pub(crate) async fn drop_copies(
             ))
         })
         .collect();
-    let gone = app.drop_primaries(&primaries);
+    let gone = app.drop_primaries(&primaries, store::now());
     if gone.is_empty() {
         return;
     }

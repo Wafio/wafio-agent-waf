@@ -21,6 +21,7 @@ pub(crate) const LOOKUP_WAIT: Duration = Duration::from_millis(100);
 /// The fewest slots a gate has; more workers get two slots each.
 const MIN_SLOTS: usize = 8;
 
+#[derive(Clone)]
 pub(crate) struct DiskGate {
     slots: Arc<Semaphore>,
     deadline: Duration,

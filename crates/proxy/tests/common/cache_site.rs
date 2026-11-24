@@ -4,8 +4,8 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -118,16 +118,60 @@ pub async fn site(up: TestUpstream, spec: CacheSpec, edit: impl FnOnce(&mut AppS
     }
 }
 
+/// The cache host behind each address a test serves on, so a request can wait for the copy of its
+/// answer, which is written after the answer has gone out.
+static HOSTS: Mutex<Vec<(SocketAddr, Weak<CacheHost>)>> = Mutex::new(Vec::new());
+
 /// A proxy over `host` that serves `app`.
 pub fn serve_with(host: &Arc<CacheHost>, app: AppSpec) -> (Harness, SocketAddr) {
+    serve_with_slots(host, app, None)
+}
+
+/// [`serve_with`] with the number of disk slots the proxy has.
+pub fn serve_with_slots(
+    host: &Arc<CacheHost>,
+    app: AppSpec,
+    slots: Option<usize>,
+) -> (Harness, SocketAddr) {
     let events: Events = Arc::default();
     let ev = events.clone();
     let mut opts = ProxyOptions::new(Arc::new(move |e| ev.lock().unwrap().push(e)));
     opts.cache = Some(host.clone());
+    if let Some(slots) = slots {
+        opts.disk_slots = slots;
+    }
     let addr = format!("127.0.0.1:{}", app.listen_port).parse().unwrap();
+    HOSTS.lock().unwrap().push((addr, Arc::downgrade(host)));
     let proxy = Proxy::new(opts);
     proxy.apply(vec![app]).unwrap();
     (Harness { proxy, events }, addr)
+}
+
+/// Waits until no copy is being written for the proxy at `addr`.
+pub async fn copies_written(addr: SocketAddr) {
+    let host = HOSTS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(a, _)| *a == addr)
+        .and_then(|(_, h)| h.upgrade());
+    let Some(host) = host else { return };
+    for _ in 0..2000 {
+        if host.stores_in_flight() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("a copy is still being written after ten seconds");
+}
+
+/// [`one`] for a test that expects the copy of the answer to be there for its next request: it
+/// returns when the copy is written.
+pub async fn fetch(addr: SocketAddr, raw: &[u8]) -> ReplyParts {
+    let reply = one(addr, raw).await;
+    copies_written(addr).await;
+    reply
 }
 
 /// The same proxy with the app replaced (a new bundle).

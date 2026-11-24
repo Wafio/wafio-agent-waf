@@ -755,10 +755,17 @@ pub(crate) async fn handle(
             // With the cache on, what an untrusted peer says in the headers that are not part of
             // the key is not sent on, and the scheme is the connection's: PHP would answer by it.
             let drop_unkeyed = cache::drops_unkeyed_inputs(route, &peer);
+            // The host is the agent's word too, as on the HTTP path, from every peer: a trusted
+            // proxy that passes the client's `X-Forwarded-Host` on would make the application
+            // write it into its links, and the key does not hold it.
+            let cache_on = route.cache_active().is_some();
             hm.retain(|k, _| {
                 if drop_unkeyed
                     && (crate::cache::unkeyed_input(k) || crate::cache::forwarded_host_or_proto(k))
                 {
+                    return false;
+                }
+                if cache_on && crate::cache::forwarded_host(k) {
                     return false;
                 }
                 match cgi_header_param(k).as_slice() {
@@ -769,6 +776,9 @@ pub(crate) async fn handle(
             });
             if over_tls {
                 hm.insert(b"X-Forwarded-Proto".to_vec(), vec![b"https".to_vec()]);
+            }
+            if cache_on {
+                hm.insert(b"X-Forwarded-Host".to_vec(), vec![req.host.clone()]);
             }
             hm.insert(b"X-Real-IP".to_vec(), vec![remote.as_bytes().to_vec()]);
             hm.insert(
@@ -838,7 +848,7 @@ pub(crate) async fn handle(
             }
             if cache_plan.fills() {
                 if let Plan::Lookup(ask) = &cache_plan {
-                    cache::fill(shared, route, ask, &req, &resp).await;
+                    cache::fill(shared, route, ask, &req, &resp);
                 }
                 if matches!(route.target, Target::Http(_)) {
                     crate::upstream::apply_response_header_rules(route, &mut resp);

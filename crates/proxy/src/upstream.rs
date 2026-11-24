@@ -248,8 +248,17 @@ pub(crate) fn upstream_request(
         }
     }
     if cache_on {
-        u.del(b"X-Forwarded-Host");
-        u.del(b"X-Forwarded-Proto");
+        // Every spelling: a backend that folds `_` into `-` reads `X_Forwarded_Host` as the header.
+        let names: Vec<Vec<u8>> = u
+            .header_lines
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| crate::cache::forwarded_host_or_proto(n))
+            .cloned()
+            .collect();
+        for name in names {
+            u.del(&name);
+        }
     }
     u.set(b"X-Forwarded-Host", &req.host);
     let proto = if untrusted {
@@ -480,9 +489,11 @@ async fn exchange(
         }
         return Ok(Exchange::Open(out, Box::new(up)));
     }
+    let mut whole = Vec::new();
     while let Some(chunk) = up.read_response_body().await? {
-        out.body.extend_from_slice(&chunk);
+        whole.extend_from_slice(&chunk);
     }
+    out.body = whole.into();
     if up.response_done() {
         shared
             .connector
@@ -595,7 +606,7 @@ pub(crate) fn apply_response_rules(
         ) {
             Ok(dec) => {
                 resp.assign_content_type(crate::sniff::sniff_content_type(&dec).as_bytes());
-                resp.body = dec;
+                resp.body = dec.into();
             }
             Err(e) => tracing::warn!(
                 "[inline-proxy] response decrypt error for {}: {e}",
@@ -613,7 +624,7 @@ pub(crate) fn apply_response_rules(
             .map(crate::pipeline::response_field_rule_from_engine)
             .collect();
         match wafio_agent_pages::field_paths::decrypt_json_response_fields(&resp.body, &rules) {
-            Ok(dec) => resp.body = dec,
+            Ok(dec) => resp.body = dec.into(),
             Err(e) => tracing::warn!(
                 "[inline-proxy] response JSON field decrypt error for {}: {e}",
                 String::from_utf8_lossy(uri)

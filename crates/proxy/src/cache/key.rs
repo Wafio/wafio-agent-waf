@@ -54,7 +54,7 @@ impl Bucket {
 
 /// `name` with `_` as `-` and lower case, the way a name of an unkeyed input is compared (a CGI
 /// parameter makes both spellings one).
-fn normalized(name: &[u8]) -> Vec<u8> {
+pub(crate) fn normalized(name: &[u8]) -> Vec<u8> {
     name.iter()
         .map(|&c| {
             if c == b'_' {
@@ -82,12 +82,14 @@ pub(crate) fn unkeyed_input(name: &[u8]) -> bool {
         )
 }
 
+/// `X-Forwarded-Host`, in any spelling a CGI parameter folds into it.
+pub(crate) fn forwarded_host(name: &[u8]) -> bool {
+    normalized(name) == b"x-forwarded-host"
+}
+
 /// `X-Forwarded-Host` and `X-Forwarded-Proto`, which the agent writes itself where it can.
 pub(crate) fn forwarded_host_or_proto(name: &[u8]) -> bool {
-    matches!(
-        &normalized(name)[..],
-        b"x-forwarded-host" | b"x-forwarded-proto"
-    )
+    forwarded_host(name) || normalized(name) == b"x-forwarded-proto"
 }
 
 /// The scheme of the request: HTTPS when the agent ended TLS, else what `X-Forwarded-Proto` of a
@@ -282,6 +284,38 @@ mod tests {
             "Forwarded-For",
         ] {
             assert!(!unkeyed_input(name.as_bytes()), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_host_and_proto_the_agent_writes_are_named_in_every_spelling_a_cgi_parameter_folds() {
+        for name in [
+            "X-Forwarded-Host",
+            "x-forwarded-host",
+            "X_Forwarded_Host",
+            "X_FORWARDED_HOST",
+            "X-Forwarded_Host",
+        ] {
+            assert!(forwarded_host(name.as_bytes()), "{name}");
+            assert!(forwarded_host_or_proto(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "X-Forwarded-Proto",
+            "x_forwarded_proto",
+            "X_Forwarded_PROTO",
+        ] {
+            assert!(!forwarded_host(name.as_bytes()), "{name}");
+            assert!(forwarded_host_or_proto(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "X-Forwarded-For",
+            "X-Forwarded-Hosts",
+            "X-Forwarded-Port",
+            "X-Host",
+            "Host",
+            "",
+        ] {
+            assert!(!forwarded_host_or_proto(name.as_bytes()), "{name}");
         }
     }
 

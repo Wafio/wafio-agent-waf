@@ -12,10 +12,11 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use tokio::sync::Semaphore;
@@ -52,7 +53,60 @@ pub(crate) struct HostState {
     holder: AtomicBool,
     ready: AtomicBool,
     cleaned: AtomicBool,
+    /// Answers that are being written behind the visitor's back.
+    stores: AtomicUsize,
     pub budget: Arc<Semaphore>,
+}
+
+/// An answer that is being stored: the host counts it until this is dropped.
+pub(crate) struct Storing(Arc<HostState>);
+
+impl Drop for Storing {
+    fn drop(&mut self) {
+        self.0.stores.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The most primary keys a process that cannot delete files remembers a write for. Past it the
+/// notes are replaced by one time, which ends every copy stored up to then.
+const DROPPED_MAX: usize = 4096;
+
+/// What a process that cannot delete files knows has ended: a write to a URL ends its copies, but
+/// the files of them stay on disk while another process holds the lock, and a process that later
+/// reads the directory again would take them for live. The copies are told by primary key and
+/// the second of the write: a file stored in that second or before is one the write ended; one
+/// stored after is newer than the write.
+#[derive(Default)]
+struct Dropped {
+    primaries: HashMap<PrimaryId, u64>,
+    /// Every copy stored at or before this second has ended: the notes outgrew [`DROPPED_MAX`].
+    floor: Option<u64>,
+}
+
+impl Dropped {
+    fn record(&mut self, primaries: &[PrimaryId], at: u64) {
+        for primary in primaries {
+            let newest = self.primaries.entry(*primary).or_insert(at);
+            *newest = (*newest).max(at);
+        }
+        if self.primaries.len() > DROPPED_MAX {
+            self.primaries.clear();
+            self.floor = Some(self.floor.map_or(at, |f| f.max(at)));
+        }
+    }
+
+    fn ended(&self, primary: &PrimaryId, stored_at: u64) -> bool {
+        self.floor.is_some_and(|f| stored_at <= f)
+            || self
+                .primaries
+                .get(primary)
+                .is_some_and(|&at| stored_at <= at)
+    }
+
+    fn clear(&mut self) {
+        self.primaries.clear();
+        self.floor = None;
+    }
 }
 
 /// An answer to put on disk.
@@ -63,7 +117,7 @@ pub(crate) struct Store {
     pub primary_len: usize,
     pub names: Vec<Vec<u8>>,
     pub head: Vec<u8>,
-    pub body: Vec<u8>,
+    pub body: Bytes,
     pub times: Times,
 }
 
@@ -80,7 +134,9 @@ pub(crate) struct AppCache {
     pub id: String,
     dir: PathBuf,
     host: Arc<HostState>,
+    /// Lock order: the index first, then this.
     index: Mutex<Index>,
+    dropped: Mutex<Dropped>,
     /// `stale_if_error_s` of the settings in force: the window kept past an answer's life when
     /// the answer names none of its own.
     stale_s: AtomicU32,
@@ -93,6 +149,7 @@ impl AppCache {
             dir: root.join(id),
             host,
             index: Mutex::new(Index::default()),
+            dropped: Mutex::new(Dropped::default()),
             stale_s: AtomicU32::new(0),
         }
     }
@@ -111,6 +168,12 @@ impl AppCache {
 
     pub fn budget(&self) -> &Arc<Semaphore> {
         &self.host.budget
+    }
+
+    /// Counts an answer as being stored until the guard is dropped.
+    pub fn storing(&self) -> Storing {
+        self.host.stores.fetch_add(1, Ordering::AcqRel);
+        Storing(self.host.clone())
     }
 
     /// Reads and checks the file of an entry. A file that is not what the index says (a size, a
@@ -163,9 +226,19 @@ impl AppCache {
         }
     }
 
-    /// Drops every entry of these primary keys now, and deletes their files.
-    pub fn drop_primaries(&self, primaries: &[PrimaryId]) -> Vec<FileId> {
-        self.index().drop_primaries(primaries)
+    /// Drops every entry of these primary keys now and returns their files, which the caller
+    /// deletes. `at` is the second of the write that ended them. A process that cannot be sure its
+    /// deletes reach the disk (it does not hold the lock, or has not read the directory yet) notes
+    /// the write too, so the files that are left are not taken for live when it reads the directory
+    /// again.
+    pub fn drop_primaries(&self, primaries: &[PrimaryId], at: u64) -> Vec<FileId> {
+        let mut index = self.index();
+        let gone = index.drop_primaries(primaries);
+        if !(self.host.holder.load(Ordering::Acquire) && self.host.ready.load(Ordering::Acquire)) {
+            lock(&self.dropped).record(primaries, at);
+        }
+        drop(index);
+        gone
     }
 
     /// Entries, bytes on disk and bytes in memory.
@@ -333,6 +406,7 @@ impl CacheHost {
                 holder: AtomicBool::new(false),
                 ready: AtomicBool::new(false),
                 cleaned: AtomicBool::new(false),
+                stores: AtomicUsize::new(0),
                 budget: Arc::new(Semaphore::new(IN_FLIGHT_MAX)),
             }),
             lock: Mutex::new(None),
@@ -462,9 +536,20 @@ impl CacheHost {
             let mut gone = Vec::new();
             {
                 let mut ix = app.index();
+                let mut dropped = lock(&app.dropped);
                 ix.clear();
                 for e in entries {
+                    // A write ended this copy while this process could not delete its file.
+                    if dropped.ended(&e.primary, e.times.stored_at) {
+                        gone.push(e.id);
+                        continue;
+                    }
                     gone.extend(ix.insert(e.id, e.primary, e.names, e.size, e.times));
+                }
+                // The writer deletes those files below; a process that cannot keeps its notes for
+                // the day it takes the lock.
+                if self.holds_lock() {
+                    dropped.clear();
                 }
             }
             doomed.push((app, gone));
@@ -587,6 +672,12 @@ impl CacheHost {
         lock(&self.apps).get(app_id).map(|a| a.usage())
     }
 
+    /// How many answers are being written behind the visitors who got them, for a test.
+    #[doc(hidden)]
+    pub fn stores_in_flight(&self) -> usize {
+        self.state.stores.load(Ordering::Acquire)
+    }
+
     /// Waits until answers are stored, for a test.
     #[doc(hidden)]
     pub fn wait_writable(&self, wait: Duration) -> bool {
@@ -675,7 +766,7 @@ mod tests {
             key,
             names: Vec::new(),
             head: head(),
-            body: body.to_vec(),
+            body: Bytes::copy_from_slice(body),
             times,
         }
     }
@@ -778,6 +869,109 @@ mod tests {
             Err(Skip::NotWriter)
         ));
         b.store(answer("two", b"2", FRESH)).unwrap();
+    }
+
+    fn has(app: &AppCache, name: &str) -> bool {
+        app.index()
+            .find(
+                &primary_id(name.as_bytes()),
+                name.as_bytes(),
+                |_| Vec::new(),
+                200,
+            )
+            .is_some()
+    }
+
+    #[test]
+    fn a_write_answered_without_the_lock_is_not_undone_when_the_lock_is_taken() {
+        let dir = Dir::new();
+        let first = CacheHost::open(&dir.0, uid()).unwrap();
+        first.commit(&[limits("shop", 1 << 20)]);
+        assert!(first.wait_writable(Duration::from_secs(5)));
+        let second = CacheHost::open(&dir.0, uid()).unwrap();
+        second.commit(&[limits("shop", 1 << 20)]);
+        assert!(!second.holds_lock() && second.is_ready());
+        let (a, b) = (first.app("shop").unwrap(), second.app("shop").unwrap());
+        let at = |stored_at| Times { stored_at, ..FRESH };
+        // The first stores after the second built its index, so the second's index holds neither.
+        a.store(answer("one", b"1", at(100))).unwrap();
+        a.store(answer("two", b"2", at(100))).unwrap();
+        // A write at second 150 to the URL of "one": nothing to drop here, and the files stay.
+        assert!(b.drop_primaries(&[primary_id(b"one")], 150).is_empty());
+        let file = |name: &str| format::path_of(&dir.0.join("shop"), &answer(name, b"", FRESH).id);
+        assert!(file("one").exists());
+        first.release();
+        assert!(second.take_over());
+        assert!(!has(&b, "one"), "the write ended it");
+        assert!(!file("one").exists(), "and its file went with it");
+        assert!(has(&b, "two") && file("two").exists());
+        assert!(
+            lock(&b.dropped).primaries.is_empty(),
+            "the files are gone, so is the note"
+        );
+        // A copy stored after the write is newer than it.
+        b.store(answer("one", b"3", at(151))).unwrap();
+        assert!(has(&b, "one"));
+        // The writer deletes its drops at once and keeps no note.
+        assert_eq!(b.drop_primaries(&[primary_id(b"two")], 160).len(), 1);
+        assert!(lock(&b.dropped).primaries.is_empty());
+        assert!(!has(&b, "two"));
+    }
+
+    #[test]
+    fn a_process_that_cannot_delete_keeps_its_notes_for_the_day_it_can() {
+        let dir = Dir::new();
+        let first = CacheHost::open(&dir.0, uid()).unwrap();
+        first.commit(&[limits("shop", 1 << 20)]);
+        assert!(first.wait_writable(Duration::from_secs(5)));
+        let second = CacheHost::open(&dir.0, uid()).unwrap();
+        second.commit(&[limits("shop", 1 << 20)]);
+        let (a, b) = (first.app("shop").unwrap(), second.app("shop").unwrap());
+        a.store(answer(
+            "one",
+            b"1",
+            Times {
+                stored_at: 100,
+                ..FRESH
+            },
+        ))
+        .unwrap();
+        b.drop_primaries(&[primary_id(b"one")], 150);
+        // The lock is still the first's: reading the directory again hides the copy and deletes
+        // nothing, and the note stays.
+        second.rescan();
+        assert!(!has(&b, "one"));
+        assert!(format::path_of(&dir.0.join("shop"), &answer("one", b"", FRESH).id).exists());
+        assert_eq!(lock(&b.dropped).primaries.len(), 1);
+        first.release();
+        assert!(second.take_over());
+        assert!(!format::path_of(&dir.0.join("shop"), &answer("one", b"", FRESH).id).exists());
+    }
+
+    #[test]
+    fn the_notes_of_writes_are_bounded_and_past_the_bound_end_everything_stored_before_the_last() {
+        let mut d = Dropped::default();
+        let (a, b) = (primary_id(b"a"), primary_id(b"b"));
+        d.record(&[a], 10);
+        assert!(
+            d.ended(&a, 9) && d.ended(&a, 10),
+            "the second of the write counts"
+        );
+        assert!(!d.ended(&a, 11), "a later copy is newer");
+        assert!(!d.ended(&b, 5), "another URL is not named");
+        d.record(&[a], 4);
+        assert!(d.ended(&a, 10), "an older write does not lower the note");
+        d.clear();
+        for n in 0..DROPPED_MAX as u32 {
+            d.record(&[primary_id(&n.to_le_bytes())], 20);
+        }
+        assert_eq!(d.primaries.len(), DROPPED_MAX);
+        assert!(!d.ended(&b, 20), "up to the bound each URL is named");
+        d.record(&[primary_id(b"one more")], 30);
+        assert!(d.primaries.is_empty(), "past it the notes were replaced");
+        assert!(d.ended(&b, 30) && !d.ended(&b, 31));
+        d.clear();
+        assert!(!d.ended(&a, 1) && !d.ended(&b, 1));
     }
 
     #[test]

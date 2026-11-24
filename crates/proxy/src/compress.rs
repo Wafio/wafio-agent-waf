@@ -3,7 +3,7 @@
 //! compressed, only counted.
 
 use std::io::Write;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use tokio::sync::Semaphore;
 
@@ -276,8 +276,8 @@ async fn apply_with(
             count_compression_skipped(SKIP_BUSY);
             return;
         };
-        let shared = Arc::new(std::mem::take(&mut resp.body));
-        let job = shared.clone();
+        // The job reads a share of the body while the answer keeps it.
+        let job = resp.body.clone();
         let packed = tokio::task::spawn_blocking(move || encode(encoding, &job))
             .await
             .unwrap_or_else(|_| {
@@ -285,8 +285,6 @@ async fn apply_with(
                 None
             });
         drop(permit);
-        // The job is done, or gone with its panic: this is the last holder.
-        resp.body = Arc::try_unwrap(shared).unwrap_or_else(|held| (*held).clone());
         packed
     };
     let Some(packed) = packed.filter(|p| p.len() < len) else {
@@ -311,7 +309,7 @@ async fn apply_with(
     }
     resp.del(b"Accept-Ranges");
     resp.set(b"Content-Encoding", encoding.token());
-    resp.body = packed;
+    resp.body = packed.into();
 }
 
 /// Counts an answer that came in pieces and would have been compressed had it come whole.

@@ -852,13 +852,16 @@ allow after it, and what is over the quota. Switching the cache off, or taking t
 
 **Host.** When settings change, the sum of `disk_bytes` over the apps must be at most the free space plus what the cache holds minus 5 %
 of the file system (`disk_too_small`, detail `<bytes allowed> <bytes asked>`), and the sum of `memory_bytes` at most a quarter of the
-memory of the host or its cgroup (`memory_too_small`, detail the memory in bytes). Then every app whose settings changed is
-refused and the others go on: settings are never reduced to fit, and an app that ran with other settings keeps them
-(`running_previous`). An apply whose cache holds an index that is not built within three seconds does not check the disk.
+memory of the host or its cgroup (`memory_too_small`, detail the memory in bytes). The check runs when an app asks for more disk or
+memory than it runs with (a new app asks for more than it has). If the sums do not fit, every app that asks for more is refused and
+the others go on: settings are never reduced to fit, and an app that ran with other settings keeps them (`running_previous`). An app
+that asks for the same or less, or only changes a rule, a lifetime or a cookie name, is always applied, so an operator can shrink a quota
+on a full disk. An apply whose cache holds an index that is not built within three seconds does not check the disk.
 
 **What is looked up.** Only a request the verdict allows reads or fills the cache, after the main host redirect and before the folder of
 static files and the application. A request with a `log` or `monitor` verdict, an `Upgrade`, a method other than `GET` and `HEAD`, a body, a
-length above 0 or `Transfer-Encoding` on a `GET`, `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override`, a path under a
+length above 0 or `Transfer-Encoding` on a `GET`, `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (also with `_` for `-`, which
+a CGI parameter makes the same header), a path under a
 `bypass` rule, a path with `;` under any rule (`..;` is `..` to some servers), or a path that the app's `response_decrypt_aes` or
 `response_field_rules` rewrite goes to the application as it is, unread and unstored. Every answer of that path carries `X-Cache`: `HIT` (from
 a copy), `MISS` (asked the application, whether or not the answer was kept), `BYPASS`; a file of the static folder is `BYPASS`. An
@@ -874,7 +877,9 @@ or by more than that, is not kept. The SHA-256 of the whole key names the file a
 (`-For`, `-Host`, `-Proto`), `X-Original-*`, `X-Host`, `X-Rewrite-URL`, `Forwarded`, `Front-End-Https` and `X-Url-Scheme` is not sent to the
 application (HTTP and FastCGI), unless the peer is a proxy the route trusts (`trust_forwarded` and `trusted_proxies`): then they are sent
 and are part of the key, and a request with more than 256 bytes of them is not cached. A line of the client's for `X-Forwarded-Host` or
-`X-Forwarded-Proto` does not stay beside the agent's, and the scheme the application is told is the connection's.
+`X-Forwarded-Proto`, in any spelling (`_` for `-` too), does not stay beside the agent's, and the scheme the application is told is the
+connection's. The host is always the agent's word: a FastCGI application is sent `X-Forwarded-Host` with the host of the request and never
+the client's or a proxy's, because the key does not hold what a proxy says there.
 
 **Signed in.** A request is signed in when it carries `Authorization`, the userinfo of an absolute-form target, or a cookie whose name,
 in any case, holds `sess` (`PHPSESSID`, `laravel_session`, `ASP.NET_SessionId`), starts with `wordpress_logged_in_`, `wp-postpass_`,
@@ -892,7 +897,7 @@ or `s-maxage`, is of a file type or a rule covers the path, and an answer to a s
 what the application said without the headers of the connection (`Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`,
 `Upgrade`), `Date`, `Age` and `X-Cache`, with compression's changes: compression runs before the copy is made, so each bucket has its own copy.
 The response header rules (`resp_headers`) run on every answer as it is sent, copies included, so a change to them reaches stored
-copies at once.
+copies at once. The copy is written behind the answer: the visitor does not wait for the disk.
 
 **A copy that is fresh** is sent with `Age` (the age the application gave plus the time here). `HEAD` is answered from the copy of a `GET`.
 `If-None-Match` (weak comparison, `*`), else `If-Modified-Since` against the copy's `Last-Modified`, gives `304` with the headers a `304`
@@ -913,8 +918,10 @@ to 256 KiB from their second hit, up to `memory_bytes` (0 keeps every copy on di
 
 Not built yet: the lock for one fill of a key at a time and the marks for answers that cannot be kept, `stale-while-revalidate`, `stale-if-error`,
 revalidation, purge, the counters of `EdgeStatus` and the Prometheus series of the cache, what happens when the file system fills while the
-agent runs, files of the static folder in the memory tier, and the Hello feature `edge_cache`. A purge of the process that does not hold the lock,
-and a `POST` it answers, leave the files of the copies for the process that does (they are read again when it takes over).
+agent runs, files of the static folder in the memory tier, and the Hello feature `edge_cache`. A write that a process without the lock answers
+(a reload's successor) drops the copies from its index and is remembered with its second, up to 4096 URLs; the process that takes the lock deletes
+the files of copies stored in that second or before when it reads the directory again. Past 4096 URLs it deletes every copy stored up to the last
+write.
 
 ## Edge status and cache purge
 

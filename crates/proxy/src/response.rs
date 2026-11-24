@@ -1,6 +1,7 @@
 //! An outbound response (special headers, `add`/`set`/`del` semantics, the server's defaults) and
 //! its writing to a Pingora session.
 
+use bytes::Bytes;
 use pingora::http::ResponseHeader;
 use pingora::protocols::http::ServerSession;
 use wafio_agent_pages::challenge_handler::PageResponse;
@@ -27,15 +28,17 @@ pub struct OutboundResponse {
     pub http10: bool,
     /// The `Content-Length` as parsed from an upstream response, as a number and as written
     /// (`None`: built here, nothing set until it is written). Kept for the statuses and HEAD
-    /// answers whose `Content-Length` is never recomputed from the body.
-    declared_length: Option<(i64, Vec<u8>)>,
+    /// answers whose `Content-Length` is never recomputed from the body. The text is a boxed slice
+    /// to keep the response below the size clippy accepts for the enums that hold it by value.
+    declared_length: Option<(i64, Box<[u8]>)>,
     /// The status message of an upstream answer: written back as the upstream said it, the
     /// standard text only when it said none.
     reason: Option<Vec<u8>>,
     /// The body follows as chunks (a streamed answer to an HTTP/1.1 client), so `wire` writes
     /// `Transfer-Encoding: chunked`.
     pub chunked: bool,
-    pub body: Vec<u8>,
+    /// Shared, so the response cache keeps a copy while the answer goes out without copying it.
+    pub body: Bytes,
 }
 
 /// 1xx, 204 and 304 carry no body: their `Content-Length` is never set from the body.
@@ -61,7 +64,7 @@ impl OutboundResponse {
     pub fn with(status: u16, content_type: &str, body: impl Into<Vec<u8>>) -> OutboundResponse {
         let mut r = OutboundResponse::new(status);
         r.content_type = Some(content_type.as_bytes().to_vec());
-        r.body = body.into();
+        r.body = Bytes::from(body.into());
         r
     }
 
@@ -126,7 +129,7 @@ impl OutboundResponse {
         if http10 && !r.close {
             r.close = !list_contains_token(&connection, b"keep-alive");
         }
-        r.declared_length = Some((len, bytes));
+        r.declared_length = Some((len, bytes.into_boxed_slice()));
         r
     }
 
@@ -135,7 +138,7 @@ impl OutboundResponse {
     pub(crate) fn declare_length(&mut self, len: u64) {
         self.declared_length = Some((
             i64::try_from(len).unwrap_or(i64::MAX),
-            len.to_string().into_bytes(),
+            len.to_string().into_bytes().into_boxed_slice(),
         ));
     }
 
@@ -223,7 +226,7 @@ impl OutboundResponse {
         if let Some(c) = p.set_cookie {
             r.cookies.push(c);
         }
-        r.body = p.body;
+        r.body = p.body.into();
         r
     }
 
@@ -385,7 +388,7 @@ impl OutboundResponse {
             if !skips_content_length(self.status) && (!no_body || !self.body.is_empty()) {
                 (
                     self.body.len() as i64,
-                    self.body.len().to_string().into_bytes(),
+                    self.body.len().to_string().into_bytes().into_boxed_slice(),
                 )
             } else {
                 self.declared_length.clone().unwrap_or_default()
@@ -544,7 +547,7 @@ pub async fn write(s: &mut ServerSession, r: OutboundResponse) -> pingora::Resul
     let h = r.header()?;
     s.write_response_header(Box::new(h)).await?;
     if !r.body.is_empty() {
-        s.write_response_body(r.body.into(), true).await?;
+        s.write_response_body(r.body, true).await?;
     }
     s.finish_body().await
 }
@@ -563,7 +566,7 @@ mod tests {
                 headers.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())),
             )
             .with_reason(Some("Gone Missing"));
-            r.body = b"nothing here".to_vec();
+            r.body = Bytes::from_static(b"nothing here");
             r
         };
         let r = upstream(&[
@@ -608,7 +611,7 @@ mod tests {
         assert!(!back.close && back.peek(b"Connection").is_none());
         // Sent with the length of what it holds and the message it had.
         let mut sent = back.clone();
-        sent.body = b"x".to_vec();
+        sent.body = Bytes::from_static(b"x");
         let w = String::from_utf8(sent.wire(false, false, false, 0)).unwrap();
         assert!(
             w.starts_with("HTTP/1.1 404 Gone Missing\r\n") && w.contains("Content-Length: 1\r\n"),

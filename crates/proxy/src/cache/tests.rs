@@ -292,6 +292,10 @@ fn a_get_with_a_body_and_a_method_override_are_never_read_or_stored() {
         "X-HTTP-Method-Override: DELETE\r\n",
         "x-http-method: PUT\r\n",
         "X-Method-Override: POST\r\n",
+        // A CGI parameter folds `_` into `-`: the application reads these as the same headers.
+        "X_HTTP_Method_Override: DELETE\r\n",
+        "X_Http_Method: PUT\r\n",
+        "x_method_override: POST\r\n",
     ] {
         assert!(is_bypass(&planned(&s, &get("/", head))), "{head}");
         assert!(
@@ -480,7 +484,7 @@ fn answer(status: u16, headers: &[(&str, &str)], body: &[u8]) -> OutboundRespons
         false,
         all.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())),
     );
-    r.body = body.to_vec();
+    r.body = body.to_vec().into();
     r
 }
 

@@ -579,7 +579,7 @@ pub(crate) async fn serve(
             })))
         }
         Body::Bytes(bytes) => {
-            response.body = bytes;
+            response.body = bytes.into();
             if let (Some(spec), 200) = (&route.compression, response.status) {
                 let stats = shared.edge.app(&route.app_id);
                 crate::compress::apply(&stats, spec, req, &route.session, &mut response).await;

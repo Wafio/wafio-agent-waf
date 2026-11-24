@@ -138,12 +138,22 @@ pub(crate) fn host_view(setup: Option<&CacheSetup>, apps: &[BundleApp]) -> Optio
     })
 }
 
+/// Whether `spec` asks for more disk or memory than the settings that run now: an app that runs
+/// none asks for more than it has.
+fn grew(running: &HashMap<String, CacheSpec>, id: &str, spec: &CacheSpec) -> bool {
+    running
+        .get(id)
+        .is_none_or(|old| spec.disk_bytes > old.disk_bytes || spec.memory_bytes > old.memory_bytes)
+}
+
 /// What an apply does with the cache of each app of `apps`. `running` holds the settings that run
-/// now. An app with its cache on gets its settings checked, an app id that cannot name a
-/// directory is refused, and when any settings changed the sums of disk and memory over all the
-/// apps are held to what the host allows: then every app whose settings changed is refused (never
-/// reduced) and the others go on. When the directory cannot be used every app is refused, with
-/// the cache on or off.
+/// now. An app with its cache on gets its settings checked, and an app id that cannot name a
+/// directory is refused. When an app asks for more disk or memory than it runs with, the sums over
+/// all the apps are held to what the host allows: if they do not fit, every app that asks for more
+/// is refused (never reduced) and keeps what it ran with. An app that asks for the same or less,
+/// or only edits a rule, a lifetime or a cookie name, is always applied: refusing it would leave
+/// the host no better off. When the directory cannot be used every app is refused, with the cache
+/// on or off.
 pub(crate) fn plan(
     setup: &CacheSetup,
     apps: &[BundleApp],
@@ -190,11 +200,9 @@ pub(crate) fn plan(
             }
         }
     }
-    let changed = valid
-        .iter()
-        .any(|(id, spec)| running.get(*id) != Some(spec));
+    let asks_more = valid.iter().any(|(id, spec)| grew(running, id, spec));
     let verdict = match view.and_then(|v| Some((v.facts?, v.in_use))) {
-        Some((facts, in_use)) if changed => {
+        Some((facts, in_use)) if asks_more => {
             let disk = valid.iter().map(|(_, s)| s.disk_bytes).sum::<u64>();
             let memory = valid.iter().map(|(_, s)| s.memory_bytes).sum::<u64>();
             // What the cache holds is not known: the disk is not checked, and never failed for it.
@@ -207,9 +215,8 @@ pub(crate) fn plan(
         _ => Ok(()),
     };
     for (id, spec) in valid {
-        let unchanged = running.get(id) == Some(&spec);
         let plan = match &verdict {
-            Err(refusal) if !unchanged => {
+            Err(refusal) if grew(running, id, &spec) => {
                 tracing::warn!(
                     "[waf-bundle] app {:?}: cache refused, {} {:?}",
                     id.chars().take(64).collect::<String>(),
@@ -536,8 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn when_the_disk_is_too_small_every_app_whose_settings_changed_is_refused_and_none_is_reduced()
-    {
+    fn when_the_disk_is_too_small_every_app_that_asks_for_more_is_refused_and_none_is_reduced() {
         let (setup, _dir) = ready();
         let small = view(10 * GIB as u64, 100 * GIB as u64, 64 * GIB as u64, Some(0));
         // 5 GiB may be asked for in all: two apps of 4 GiB do not fit, whichever is new.
@@ -580,6 +586,80 @@ mod tests {
             panic!()
         };
         assert_eq!(previous.as_ref().map(|s| s.disk_bytes), Some(4 << 30));
+    }
+
+    #[test]
+    fn a_full_disk_never_refuses_an_app_that_asks_for_less_or_edits_a_rule() {
+        let (setup, _dir) = ready();
+        let gib = GIB as u64;
+        // 6 GiB are in use and 5 GiB of the 100 are kept free, so 1 GiB may be asked for in all:
+        // what runs already does not fit.
+        let full = view(0, 100 * gib, 64 * gib, Some(6 * gib));
+        let running: HashMap<String, CacheSpec> = [("a", 4), ("b", 1), ("c", 1)]
+            .into_iter()
+            .map(|(id, n)| (id.to_owned(), cache_spec(&sized(n * GIB, 0)).unwrap()))
+            .collect();
+        let apps = [
+            // Asks for less: applied, though the sum is over what the host allows.
+            app("a", Some(sized(2 * GIB, 0))),
+            // Only a lifetime changes: applied.
+            app(
+                "b",
+                Some(CacheEntry {
+                    default_ttl_s: Some(60),
+                    ..sized(GIB, 0)
+                }),
+            ),
+            // Asks for more, and a new app asks for the first time: refused, and the old settings
+            // run on.
+            app("c", Some(sized(2 * GIB, 0))),
+            app("d", Some(sized(GIB, 0))),
+        ];
+        let planned = plan(&setup, &apps, &running, Some(&full));
+        let CachePlan::Apply(a) = &planned["a"] else {
+            panic!("{:?}", planned["a"]);
+        };
+        assert_eq!(a.disk_bytes, 2 << 30, "lowered, not refused");
+        let CachePlan::Apply(b) = &planned["b"] else {
+            panic!("{:?}", planned["b"]);
+        };
+        assert_eq!(b.default_ttl_s, 60, "the rule edit runs");
+        let CachePlan::Refuse { refusal, previous } = &planned["c"] else {
+            panic!("{:?}", planned["c"]);
+        };
+        assert_eq!(refusal.code, CacheRefusalCode::DiskTooSmall);
+        assert_eq!(refusal.detail, format!("{} {}", gib, 6 * gib));
+        assert_eq!(previous.as_ref().map(|s| s.disk_bytes), Some(gib));
+        let CachePlan::Refuse { previous, .. } = &planned["d"] else {
+            panic!("{:?}", planned["d"]);
+        };
+        assert_eq!(previous, &None);
+        // With nobody asking for more there is nothing to refuse, whatever the disk says.
+        let calm = plan(&setup, &apps[..2], &running, Some(&full));
+        assert!(calm.values().all(|p| matches!(p, CachePlan::Apply(_))));
+    }
+
+    #[test]
+    fn a_change_that_asks_for_more_memory_only_is_refused_for_memory() {
+        let (setup, _dir) = ready();
+        let gib = GIB as u64;
+        let host = view(100 * gib, 100 * gib, 8 * gib, Some(0));
+        let running = HashMap::from([
+            ("a".to_owned(), cache_spec(&sized(GIB, GIB)).unwrap()),
+            ("b".to_owned(), cache_spec(&sized(2 * GIB, GIB)).unwrap()),
+        ]);
+        // b lowers its disk and a raises its memory: 3 GiB of memory do not fit (2 GiB may).
+        let apps = [
+            app("a", Some(sized(GIB, 2 * GIB))),
+            app("b", Some(sized(GIB, GIB))),
+        ];
+        let planned = plan(&setup, &apps, &running, Some(&host));
+        let CachePlan::Refuse { refusal, previous } = &planned["a"] else {
+            panic!("{:?}", planned["a"]);
+        };
+        assert_eq!(refusal.code, CacheRefusalCode::MemoryTooSmall);
+        assert_eq!(previous.as_ref().map(|s| s.memory_bytes), Some(gib));
+        assert!(matches!(planned["b"], CachePlan::Apply(_)));
     }
 
     #[test]

@@ -38,6 +38,6 @@ pub(crate) async fn forward_fcgi(
             out.add(&k, &v);
         }
     }
-    out.body = resp.body;
+    out.body = resp.body.into();
     Ok(out)
 }

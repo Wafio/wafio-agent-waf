@@ -23,10 +23,10 @@ async fn engine_site(edit: impl FnOnce(&mut wafio_proxy::AppSpec)) -> Site {
 #[tokio::test]
 async fn an_attack_on_a_cached_path_is_blocked_and_never_a_hit() {
     let s = engine_site(|_| {}).await;
-    one(s.addr, &get("/page")).await;
-    assert_eq!(x_cache(&one(s.addr, &get("/page")).await), "HIT");
+    fetch(s.addr, &get("/page")).await;
+    assert_eq!(x_cache(&fetch(s.addr, &get("/page")).await), "HIT");
     // The same URL, with an attack in a header: the verdict comes first.
-    let attack = one(s.addr, &with("/page", &[SQLI])).await;
+    let attack = fetch(s.addr, &with("/page", &[SQLI])).await;
     assert_eq!(attack.status, 403);
     assert_eq!(
         attack.header("x-cache"),
@@ -36,14 +36,14 @@ async fn an_attack_on_a_cached_path_is_blocked_and_never_a_hit() {
     assert_eq!(s.up.count(), 1);
     assert_eq!(common::s(&s.h.last_event().action), "block");
     // The copy was not touched.
-    assert_eq!(x_cache(&one(s.addr, &get("/page")).await), "HIT");
+    assert_eq!(x_cache(&fetch(s.addr, &get("/page")).await), "HIT");
 }
 
 #[tokio::test]
 async fn an_attack_never_makes_a_copy() {
     let s = engine_site(|_| {}).await;
     assert_eq!(
-        one(s.addr, &with("/page?id=wafio-test-sql", &[]))
+        fetch(s.addr, &with("/page?id=wafio-test-sql", &[]))
             .await
             .status,
         403
@@ -55,11 +55,11 @@ async fn an_attack_never_makes_a_copy() {
 #[tokio::test]
 async fn log_and_monitor_go_to_the_application_unread_and_unstored() {
     let s = engine_site(|_| {}).await;
-    one(s.addr, &get("/page")).await;
-    assert_eq!(x_cache(&one(s.addr, &get("/page")).await), "HIT");
+    fetch(s.addr, &get("/page")).await;
+    assert_eq!(x_cache(&fetch(s.addr, &get("/page")).await), "HIT");
     // A weak detection is a `log` verdict: allowed, and the cache is left out of it.
     for _ in 0..2 {
-        let r = one(s.addr, &with("/page", &[WEAK])).await;
+        let r = fetch(s.addr, &with("/page", &[WEAK])).await;
         assert_eq!((r.status, x_cache(&r)), (200, "BYPASS"));
         assert_eq!(common::s(&s.h.last_event().action), "log");
     }
@@ -71,12 +71,12 @@ async fn log_and_monitor_go_to_the_application_unread_and_unstored() {
     // A fresh path answered to a log verdict is not stored either.
     for _ in 0..2 {
         assert_eq!(
-            x_cache(&one(s.addr, &with("/fresh", &[WEAK])).await),
+            x_cache(&fetch(s.addr, &with("/fresh", &[WEAK])).await),
             "BYPASS"
         );
     }
     assert_eq!(
-        x_cache(&one(s.addr, &get("/fresh")).await),
+        x_cache(&fetch(s.addr, &get("/fresh")).await),
         "MISS",
         "no copy was made"
     );
@@ -89,12 +89,12 @@ async fn log_and_monitor_go_to_the_application_unread_and_unstored() {
     a.mode = "monitor".into();
     let (h, addr) = serve_with(&host, a);
     assert!(host.wait_writable(Duration::from_secs(10)));
-    one(addr, &get("/page")).await;
+    fetch(addr, &get("/page")).await;
     for _ in 0..2 {
-        let r = one(addr, &with("/page", &[SQLI])).await;
+        let r = fetch(addr, &with("/page", &[SQLI])).await;
         assert_eq!((r.status, x_cache(&r)), (200, "BYPASS"));
         assert_eq!(common::s(&h.last_event().action), "monitor");
     }
     assert_eq!(up.count(), 3);
-    assert_eq!(x_cache(&one(addr, &get("/page")).await), "HIT");
+    assert_eq!(x_cache(&fetch(addr, &get("/page")).await), "HIT");
 }

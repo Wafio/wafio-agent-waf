@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::request::InboundRequest;
 use crate::response::OutboundResponse;
 use crate::static_files::{Asked, asked, parse_http_date};
@@ -130,7 +132,7 @@ fn whole_or_part(req: &InboundRequest, loaded: Arc<Loaded>) -> OutboundResponse 
     match asked {
         Asked::Ignored => {
             let mut r = OutboundResponse::from_stored(head.status, &head.reason, &head.lines);
-            r.body = body_of(loaded);
+            r.body = body_of(loaded).into();
             r
         }
         Asked::Unsatisfiable => {
@@ -151,7 +153,7 @@ fn whole_or_part(req: &InboundRequest, loaded: Arc<Loaded>) -> OutboundResponse 
                 format!("bytes {start}-{}/{size}", start + len - 1).as_bytes(),
             );
             let (from, to) = (start as usize, (start + len) as usize);
-            r.body = loaded.body[from..to].to_vec();
+            r.body = Bytes::copy_from_slice(&loaded.body[from..to]);
             r
         }
     }
@@ -219,7 +221,7 @@ mod tests {
     #[test]
     fn a_copy_is_sent_as_stored_with_the_age_it_has_reached() {
         let r = answer(&request("GET", ""), &copy(200, &[]), 1010);
-        assert_eq!((r.status, r.body.as_slice()), (200, BODY));
+        assert_eq!((r.status, &r.body[..]), (200, BODY));
         assert_eq!(r.peek(b"Age"), Some(&b"15"[..]), "5 given plus 10 here");
         assert_eq!(r.peek(b"Cache-Control"), Some(&b"public, max-age=600"[..]));
         assert_eq!(r.peek(b"Content-Type"), Some(&b"text/plain"[..]));
@@ -312,14 +314,14 @@ mod tests {
             answer(&request("GET", &format!("Range: {range}\r\n")), copy, 1000)
         };
         let r = get("bytes=2-4", &copy(200, &[]));
-        assert_eq!((r.status, r.body.as_slice()), (206, &b"234"[..]));
+        assert_eq!((r.status, &r.body[..]), (206, &b"234"[..]));
         assert_eq!(r.peek(b"Content-Range"), Some(&b"bytes 2-4/10"[..]));
         let w = wire(&r, false);
         assert!(w.starts_with("HTTP/1.1 206 Partial Content\r\n"), "{w}");
         assert!(w.contains("Content-Length: 3\r\n"), "{w}");
-        assert_eq!(get("bytes=7-", &copy(200, &[])).body, b"789");
-        assert_eq!(get("bytes=-3", &copy(200, &[])).body, b"789");
-        assert_eq!(get("bytes=8-99", &copy(200, &[])).body, b"89");
+        assert_eq!(&get("bytes=7-", &copy(200, &[])).body[..], b"789");
+        assert_eq!(&get("bytes=-3", &copy(200, &[])).body[..], b"789");
+        assert_eq!(&get("bytes=8-99", &copy(200, &[])).body[..], b"89");
         // Past the end: 416, no body. Several ranges, a unit that is not bytes and a form that
         // does not parse get the whole copy.
         let unsat = get("bytes=10-", &copy(200, &[]));
@@ -327,7 +329,7 @@ mod tests {
         assert_eq!(unsat.peek(b"Content-Range"), Some(&b"bytes */10"[..]));
         for ignored in ["bytes=0-1,3-4", "items=0-1", "bytes=x-y", "bytes=4-2"] {
             let r = get(ignored, &copy(200, &[]));
-            assert_eq!((r.status, r.body.as_slice()), (200, BODY), "{ignored}");
+            assert_eq!((r.status, &r.body[..]), (200, BODY), "{ignored}");
         }
         // Not an identity copy, not a 200, not a GET: the range is ignored.
         let gzip = copy(200, &[("Content-Encoding", "gzip")]);

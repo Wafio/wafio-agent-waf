@@ -580,7 +580,7 @@ mod tests {
         );
         let _offered = book.offer_http01("shop.example.com", "tok-1", "tok-1.thumb");
         let r = table.answer(b"GET", &parts("shop.example.com:80", path));
-        assert_eq!((r.status, r.body.as_slice()), (200, &b"tok-1.thumb"[..]));
+        assert_eq!((r.status, &r.body[..]), (200, &b"tok-1.thumb"[..]));
         // Only the name that is being validated, only GET, only that token.
         assert_eq!(
             table
@@ -763,7 +763,7 @@ mod tests {
                         answered += 1;
                         assert!(exact && host.starts_with(NAME), "answered {context}");
                         assert_eq!(response.status, 200, "{context}");
-                        assert_eq!(response.body, b"abc-DEF_123.thumb", "{context}");
+                        assert_eq!(&response.body[..], b"abc-DEF_123.thumb", "{context}");
                     }
                     None => assert!(!(exact && named), "not answered {context}"),
                 }
