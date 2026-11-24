@@ -108,7 +108,7 @@ scripts/ci-local.sh
 ```
 
 In order: agent-material check (`scripts/check-ai.sh`), secret scan (`gitleaks`), proto copy check
-(`scripts/sync-proto.sh --check`), notices (`scripts/gen-notices.py`), advisories, the test certificates,
+(`scripts/test-sync-proto.sh`, then `scripts/sync-proto.sh --check`), notices (`scripts/gen-notices.py`), advisories, the test certificates,
 `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay -- -D warnings`,
 `cargo test --locked --workspace --features wafio-waf-agent/test-tls,wafio-waf-agent/test-cache-delay` and the certificate orders against Pebble (below). In a copy of the tree without `.git` the gate skips the agent-material check
 and scans the files for secrets instead of the history; run `scripts/check-ai.sh` in the checkout then.
@@ -854,6 +854,17 @@ The only C code in the binary is the TLS provider (`ring`) and the allocator (`m
 `tonic-prost-build`, so no `protoc` is needed. A protocol change starts in wafio-cp-backend; then run
 `scripts/sync-proto.sh <tag>` here. `scripts/sync-proto.sh --check` is part of the gate.
 
+`crates/proxy/tests/data/` holds copies of the files of wafio-cp-backend `test/frontend-fixtures` that the tests read, and
+`proto/SOURCE` records the sha256 of each. `--check` compares the sha256 values always, and the files with those of the checkout
+when one sits next to this repository (`WAFIO_CP_BACKEND` names another place); the gate host has no checkout, so run it once in a
+shell next to the checkouts too. `scripts/sync-proto.sh <tag>` copies them again. `scripts/test-sync-proto.sh` tests the script.
+
+`CertificateInstall` carries a private key, and prost ignores the proto's `debug_redact`. So `build.rs` leaves out the
+derived `Debug` of that message and `crates/proto/src/lib.rs` writes one that prints the ids, the leaf digest and the
+two byte lengths, which makes the `Debug` of `ServerMessage` safe too. The same file gives the message a `Drop` that
+zeroes `key_pem`, so a key does not stay in freed memory however the message ends: installed, refused, drained from a
+closing stream or dropped by a panic. This is best effort: tonic keeps its own decode buffer.
+
 ## Release
 
 The release bundle is made by wafio-release `scripts/release.sh <version> --waf-agent <binary>`, which takes the
@@ -890,7 +901,7 @@ crates/
                              bounded LRU, malware hashes, byte-level text helpers (UTF-8, URL, HTML, patterns, transforms)
   proto                      generated gRPC client and server
 proto/                       vendored protocol file and its SOURCE
-scripts/                     ci-local.sh  build-dist.sh  gen-test-certs.sh  gen-notices.py  sync-proto.sh  check-ai.sh  advisories.py  advisories.allow  test_advisories.py  test_gen_notices.py  pebble.sh  acme-gate.sh  test-acme-gate.sh
+scripts/                     ci-local.sh  build-dist.sh  gen-test-certs.sh  gen-notices.py  sync-proto.sh  check-ai.sh  advisories.py  advisories.allow  test_advisories.py  test_gen_notices.py  pebble.sh  acme-gate.sh  test-acme-gate.sh  test-sync-proto.sh
 scripts/notices/             notices.json and the licence texts that gen-notices.py puts into NOTICES.txt
 tools/core-gen               Go generators for the bytetext Unicode and HTML entity tables
 ```

@@ -3,3 +3,4 @@ repo: Wafio/wafio-cp-backend
 path: shared/proto/agent/v1/agent_control.proto
 tag: shared/v0.4.0
 sha256: 0d42f14d62f2acff92e5e11a3e4095b013a742d5aad2dafb941da02e325cbf63
+fixture: trace-keep-names.json 182d698408e0b7ef392f48518aeade99dbf9b54a1caf734e589d72648d00290c
