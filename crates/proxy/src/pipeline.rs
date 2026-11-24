@@ -31,6 +31,7 @@ use wafio_bytetext::strings::trim_whitespace;
 use wafio_domain::ip_address::IpAddress;
 use wafio_domain::{AnalysisResult, IncomingRequest};
 
+use crate::cache::{self, Label, Plan};
 use crate::compress;
 use crate::config::{AppAnalysisSetup, Route, Target};
 use crate::decision::{
@@ -516,6 +517,7 @@ pub(crate) async fn handle(
 
     let field_rules = rules_for_request_path(&exec, &req.forward_path, &req.method);
     let weight = body.len();
+    let body_read = weight > 0;
     let det = crate::run_detection_async(weight, || {
         detect(route, &req, body, &field_rules, &remote, &peer)
     })
@@ -684,16 +686,40 @@ pub(crate) async fn handle(
         return answer(r);
     }
 
+    // The response cache, after the verdict: only an `allow` reads or fills it. A fresh copy is
+    // the answer, with the response header rules of the app applied as they are to every answer.
+    let cache_plan = cache::plan(route, &req, &v.action, body_read, &peer);
+    if let Plan::Lookup(ask) = &cache_plan
+        && let Some(mut hit) = cache::lookup(shared, route, ask, &req).await
+    {
+        if matches!(route.target, Target::Http(_)) {
+            crate::upstream::apply_response_header_rules(route, &mut hit);
+        }
+        cache::tag(&mut hit, Label::Hit);
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, hit.status);
+        return answer(hit);
+    }
+
     // The app's folder of files answers `GET` and `HEAD` for a file it holds, after the verdict
     // like everything that reaches the application. A request that asks for an upgrade is the
-    // application's.
+    // application's. What the folder sends is not from the cache.
     if let Some(folder) = &route.static_files
         && !req.has_upgrade()
-        && let Some(done) = crate::static_files::serve(shared, route, folder, &req).await
+        && let Some(mut done) = crate::static_files::serve(shared, route, folder, &req).await
     {
-        let status = match &done {
-            Done::Respond(r) => r.status,
-            Done::File(f) => f.head.status,
+        let status = match &mut done {
+            Done::Respond(r) => {
+                if cache_plan.label().is_some() {
+                    cache::tag(r, Label::Bypass);
+                }
+                r.status
+            }
+            Done::File(f) => {
+                if cache_plan.label().is_some() {
+                    cache::tag(&mut f.head, Label::Bypass);
+                }
+                f.head.status
+            }
             Done::Stream(s) => s.head.status,
             Done::Upgrade(_) => 101,
         };
@@ -726,10 +752,20 @@ pub(crate) async fn handle(
             // spelling after ours, so a client could name its own address.
             // Over TLS the scheme is ours to state too: PHP derives `HTTPS` and the port from it.
             let over_tls = req.tls.is_some();
-            hm.retain(|k, _| match cgi_header_param(k).as_slice() {
-                b"HTTP_X_REAL_IP" | b"HTTP_X_FORWARDED_FOR" => false,
-                b"HTTP_X_FORWARDED_PROTO" => !over_tls,
-                _ => true,
+            // With the cache on, what an untrusted peer says in the headers that are not part of
+            // the key is not sent on, and the scheme is the connection's: PHP would answer by it.
+            let drop_unkeyed = cache::drops_unkeyed_inputs(route, &peer);
+            hm.retain(|k, _| {
+                if drop_unkeyed
+                    && (crate::cache::unkeyed_input(k) || crate::cache::forwarded_host_or_proto(k))
+                {
+                    return false;
+                }
+                match cgi_header_param(k).as_slice() {
+                    b"HTTP_X_REAL_IP" | b"HTTP_X_FORWARDED_FOR" => false,
+                    b"HTTP_X_FORWARDED_PROTO" => !over_tls,
+                    _ => true,
+                }
             });
             if over_tls {
                 hm.insert(b"X-Forwarded-Proto".to_vec(), vec![b"https".to_vec()]);
@@ -772,6 +808,10 @@ pub(crate) async fn handle(
                 crate::upstream::forward_http(shared, route, t, head, &fbody, !rewrites)
                     .await
                     .map(|f| match f {
+                        // An answer that may be kept gets the header rules after its copy is
+                        // made, so the copy holds what the application said and a change to the
+                        // rules reaches it at once. A path that rewrites the body is never kept.
+                        Forwarded::Whole(r) if cache_plan.fills() => Forwarded::Whole(r),
                         Forwarded::Whole(mut r) => {
                             crate::upstream::apply_response_rules(
                                 route,
@@ -794,14 +834,35 @@ pub(crate) async fn handle(
         Ok(Forwarded::Whole(mut resp)) => {
             if let Some(spec) = &route.compression {
                 let stats = shared.edge.app(&route.app_id);
-                compress::apply(&stats, spec, &req, &mut resp).await;
+                compress::apply(&stats, spec, &req, &route.session, &mut resp).await;
+            }
+            if cache_plan.fills() {
+                if let Plan::Lookup(ask) = &cache_plan {
+                    cache::fill(shared, route, ask, &req, &resp).await;
+                }
+                if matches!(route.target, Target::Http(_)) {
+                    crate::upstream::apply_response_header_rules(route, &mut resp);
+                }
+            }
+            cache::drop_copies(shared, route, &req, &peer, resp.status).await;
+            if let Some(label) = cache_plan.label() {
+                cache::tag(&mut resp, label);
             }
             emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, resp.status);
             answer(resp)
         }
-        Ok(Forwarded::Stream(s)) => {
+        Ok(Forwarded::Stream(mut s)) => {
             if route.compression.is_some() {
-                compress::note_streamed(&shared.edge.app(&route.app_id), &req, &s.head);
+                compress::note_streamed(
+                    &shared.edge.app(&route.app_id),
+                    &req,
+                    &route.session,
+                    &s.head,
+                );
+            }
+            cache::drop_copies(shared, route, &req, &peer, s.head.status).await;
+            if let Some(label) = cache_plan.label() {
+                cache::tag(&mut s.head, label);
             }
             emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, s.head.status);
             Ok(Done::Stream(s))
@@ -813,11 +874,11 @@ pub(crate) async fn handle(
                 route.upstream
             );
             emit_upstream_error_event(sink, &route.app_id, mode, &areq, latency);
-            answer(OutboundResponse::with(
-                502,
-                "application/json",
-                UPSTREAM_UNAVAILABLE,
-            ))
+            let mut resp = OutboundResponse::with(502, "application/json", UPSTREAM_UNAVAILABLE);
+            if let Some(label) = cache_plan.label() {
+                cache::tag(&mut resp, label);
+            }
+            answer(resp)
         }
     }
 }
@@ -855,6 +916,8 @@ mod tests {
             }),
             compression: None,
             static_files: None,
+            cache: None,
+            session_cookies: Vec::new(),
         })
         .unwrap()
     }

@@ -12,6 +12,7 @@ use wafio_agent_pages::challenge_handler::CaptchaVerifier;
 use wafio_agent_pages::goodbot::VerifiedBotChecker;
 use wafio_agent_pages::iprep::ReputationChecker;
 
+use crate::cache::{CacheHost, CacheLimits, valid_app_id};
 use crate::cert_store::CertBook;
 use crate::config::{AppSpec, Route, TlsSite, build_route};
 use crate::decision::DecisionSink;
@@ -43,6 +44,9 @@ pub struct ProxyOptions {
     /// Blocking threads that the folders of static files may use at once (twice the workers, at
     /// least 8, unless set). A request that finds none free for 100 ms goes to the application.
     pub disk_slots: usize,
+    /// The cache directory the apps with a response cache keep their copies in; `None` = no app
+    /// has a cache, whatever its bundle says.
+    pub cache: Option<Arc<CacheHost>>,
 }
 
 impl ProxyOptions {
@@ -57,6 +61,7 @@ impl ProxyOptions {
             tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
             connection_limit: CONNECTION_LIMIT,
             disk_slots: DiskGate::default_slots(),
+            cache: None,
         }
     }
 }
@@ -73,8 +78,10 @@ pub(crate) struct Shared {
     pub book: Arc<CertBook>,
     /// What the edge parts of each app count.
     pub edge: EdgeStats,
-    /// The blocking threads the folders of static files share.
+    /// The blocking threads the folders of static files and the cache share.
     pub disk: DiskGate,
+    /// The directory of the response caches.
+    pub cache: Option<Arc<CacheHost>>,
 }
 
 pub struct Proxy {
@@ -102,6 +109,7 @@ impl Proxy {
             book: Arc::default(),
             edge: EdgeStats::default(),
             disk: DiskGate::new(opts.disk_slots, DISK_DEADLINE),
+            cache: opts.cache,
         });
         Proxy {
             shared: shared.clone(),
@@ -130,10 +138,13 @@ impl Proxy {
         let mut https: BTreeMap<String, Vec<(Arc<Route>, TlsSite)>> = BTreeMap::new();
         let mut redirects: BTreeMap<String, HashMap<String, RedirectTarget>> = BTreeMap::new();
         for app in &apps {
-            let route = build_route(app).map_err(|e| {
+            let mut route = build_route(app).map_err(|e| {
                 tracing::warn!("[waf-agent] {e}");
                 "invalid app route in WAF bundle".to_string()
             })?;
+            if let (Some(host), Some(cache)) = (&self.shared.cache, route.cache.as_mut()) {
+                cache.app = host.app(&app.app_id);
+            }
             let route = Arc::new(route);
             proxy_cfgs.push(route.proxy_config.clone());
             if let Some(site) = &app.tls {
@@ -199,6 +210,16 @@ impl Proxy {
             serves: Serves::Redirect(hosts),
         }));
         self.manager.apply(specs)?;
+        if let Some(host) = &self.shared.cache {
+            let limits: Vec<CacheLimits> = apps
+                .iter()
+                .filter_map(|a| {
+                    let spec = a.cache.as_ref()?;
+                    valid_app_id(&a.app_id).then(|| spec.limits(&a.app_id))
+                })
+                .collect();
+            host.commit(&limits);
+        }
         wafio_agent_io::ip_jail_guard::install_trusted_proxy_configs(proxy_cfgs);
         self.shared
             .edge

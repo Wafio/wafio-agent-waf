@@ -16,7 +16,7 @@ use crate::metrics::{
 };
 use crate::request::InboundRequest;
 use crate::response::OutboundResponse;
-use crate::signed_in::is_signed_in;
+use crate::signed_in::{SessionNames, is_signed_in};
 
 /// An answer over this size is not compressed.
 pub(crate) const MAX_BODY: usize = 8 << 20;
@@ -42,7 +42,7 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
-    fn token(self) -> &'static [u8] {
+    pub(crate) fn token(self) -> &'static [u8] {
         match self {
             Encoding::Gzip => b"gzip",
             Encoding::Brotli => b"br",
@@ -112,7 +112,7 @@ fn weight(param: &[u8]) -> Option<u32> {
 }
 
 /// The media type of a `Content-Type` value: lower case, no parameters.
-fn media_type(content_type: &[u8]) -> Vec<u8> {
+pub(crate) fn media_type(content_type: &[u8]) -> Vec<u8> {
     let end = content_type
         .iter()
         .position(|&c| c == b';')
@@ -165,17 +165,27 @@ fn lists(resp: &OutboundResponse, name: &[u8], want: &[u8]) -> bool {
 /// of its own, no range, no `no-transform`, not HTML or JSON for a signed-in visitor (BREACH: a
 /// secret beside reflected input could be guessed from the size), and an encoding the visitor
 /// takes.
-fn encoding_for(req: &InboundRequest, resp: &OutboundResponse, media: &[u8]) -> Option<Encoding> {
+fn encoding_for(
+    req: &InboundRequest,
+    session: &SessionNames,
+    resp: &OutboundResponse,
+    media: &[u8],
+) -> Option<Encoding> {
     let encoded = resp.peek(b"Content-Encoding").is_some_and(|e| {
         !e.trim_ascii().is_empty() && !e.trim_ascii().eq_ignore_ascii_case(b"identity")
     });
     if encoded
         || resp.values(b"Content-Range").next().is_some()
         || lists(resp, b"Cache-Control", b"no-transform")
-        || (html_or_json(media) && is_signed_in(req))
+        || (html_or_json(media) && is_signed_in(req, session))
     {
         return None;
     }
+    requested_encoding(req)
+}
+
+/// The encoding the visitor takes, from every `Accept-Encoding` line of the request.
+pub(crate) fn requested_encoding(req: &InboundRequest) -> Option<Encoding> {
     let accept: Vec<u8> = req
         .lines
         .iter()
@@ -225,9 +235,10 @@ pub(crate) async fn apply(
     stats: &AppEdgeStats,
     spec: &CompressionSpec,
     req: &InboundRequest,
+    session: &SessionNames,
     resp: &mut OutboundResponse,
 ) {
-    apply_with(&SLOTS, stats, spec, req, resp).await;
+    apply_with(&SLOTS, stats, spec, req, session, resp).await;
 }
 
 async fn apply_with(
@@ -235,6 +246,7 @@ async fn apply_with(
     stats: &AppEdgeStats,
     spec: &CompressionSpec,
     req: &InboundRequest,
+    session: &SessionNames,
     resp: &mut OutboundResponse,
 ) {
     let len = resp.body.len();
@@ -248,13 +260,13 @@ async fn apply_with(
         return;
     }
     if len > MAX_BODY {
-        if encoding_for(req, resp, &media).is_some() {
+        if encoding_for(req, session, resp, &media).is_some() {
             count_compression_skipped(SKIP_TOO_LARGE);
         }
         return;
     }
     add_vary(resp);
-    let Some(encoding) = encoding_for(req, resp, &media) else {
+    let Some(encoding) = encoding_for(req, session, resp, &media) else {
         return;
     };
     let packed = if len <= INLINE_MAX {
@@ -303,12 +315,17 @@ async fn apply_with(
 }
 
 /// Counts an answer that came in pieces and would have been compressed had it come whole.
-pub(crate) fn note_streamed(stats: &AppEdgeStats, req: &InboundRequest, head: &OutboundResponse) {
+pub(crate) fn note_streamed(
+    stats: &AppEdgeStats,
+    req: &InboundRequest,
+    session: &SessionNames,
+    head: &OutboundResponse,
+) {
     let media = media_type(head.content_type());
     if !req.has_upgrade()
         && has_body(req, head)
         && listed(&media)
-        && encoding_for(req, head, &media).is_some()
+        && encoding_for(req, session, head, &media).is_some()
     {
         stats.compression_streamed(now_seconds());
         count_compression_skipped(SKIP_STREAMED);
@@ -554,7 +571,15 @@ mod tests {
         slots: usize,
     ) -> (OutboundResponse, AppEdgeStats) {
         let stats = AppEdgeStats::default();
-        apply_with(&Semaphore::new(slots), &stats, &spec, req, &mut resp).await;
+        apply_with(
+            &Semaphore::new(slots),
+            &stats,
+            &spec,
+            req,
+            &SessionNames::default(),
+            &mut resp,
+        )
+        .await;
         (resp, stats)
     }
 
@@ -715,6 +740,46 @@ mod tests {
         );
     }
 
+    /// The names an app gives count whether or not it has a cache: BREACH does not wait for the
+    /// cache to be on.
+    #[tokio::test]
+    async fn the_session_cookie_names_of_the_app_count_for_a_page_that_is_not_compressed() {
+        let names = SessionNames::new(["MyAuth"]);
+        let compressed = |req: InboundRequest, names: SessionNames| async move {
+            let mut resp = html(5000);
+            apply_with(
+                &Semaphore::new(1),
+                &AppEdgeStats::default(),
+                &SPEC,
+                &req,
+                &names,
+                &mut resp,
+            )
+            .await;
+            resp.peek(b"Content-Encoding").is_some()
+        };
+        let own = request("Cookie: myauth=token\r\n");
+        assert!(
+            compressed(own.clone(), SessionNames::default()).await,
+            "a name the agent does not know and the app did not give is not seen"
+        );
+        assert!(!compressed(own, names.clone()).await);
+        assert!(compressed(request("Cookie: myauth2=token\r\n"), names.clone()).await);
+        assert!(!compressed(request("Cookie: PHPSESSID=1\r\n"), names.clone()).await);
+        // A streamed answer is counted under the same test.
+        let stats = AppEdgeStats::default();
+        let head = html(0);
+        note_streamed(&stats, &request("Cookie: myauth=token\r\n"), &names, &head);
+        assert_eq!(stats.compression_counters(now()).skipped_streamed, 0);
+        note_streamed(
+            &stats,
+            &request("Cookie: myauth=token\r\n"),
+            &SessionNames::default(),
+            &head,
+        );
+        assert_eq!(stats.compression_counters(now()).skipped_streamed, 1);
+    }
+
     #[tokio::test]
     async fn a_signed_in_request_gets_neither_html_nor_json_compressed_and_the_rest_is() {
         let signed = request("Cookie: PHPSESSID=1\r\n");
@@ -790,6 +855,7 @@ mod tests {
                 &AppEdgeStats::default(),
                 &spec,
                 &request(""),
+                &SessionNames::default(),
                 &mut resp,
             )
             .await;
@@ -853,7 +919,7 @@ mod tests {
     fn a_streamed_answer_is_counted_only_when_it_would_have_been_compressed() {
         let stats = AppEdgeStats::default();
         let count = |req: &InboundRequest, head: OutboundResponse| {
-            note_streamed(&stats, req, &head);
+            note_streamed(&stats, req, &SessionNames::default(), &head);
             stats.compression_counters(now()).skipped_streamed
         };
         let taking = request("");

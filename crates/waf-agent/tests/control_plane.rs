@@ -227,12 +227,23 @@ fn agent_command(dir: &Path, cp: &str, notify: &Path) -> Command {
         .env("RUNTIME_DIRECTORY", dir)
         // A key directory of its own: the fixed one may belong to an agent installed on this host.
         .env("WAFIO_TEST_TLS_DIR", dir.join("tls"))
+        // The same for the response cache directory, which the unit makes for a real agent.
+        .env("WAFIO_TEST_CACHE_DIR", cache_dir(dir))
         // A library installed on this host must not give the agent an engine: name one that does not exist.
         .env("WAFIO_ENGINE_LIB", dir.join("no-engine.so"))
         .stderr(Stdio::from(
             std::fs::File::create(dir.join("agent.log")).unwrap(),
         ));
     cmd
+}
+
+/// A cache directory of the agent's user and nobody else's, as the unit makes it.
+fn cache_dir(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+    cache
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -308,7 +319,7 @@ async fn agent_talks_to_the_control_plane() {
     std::fs::write(site.join("static.txt"), "from the folder").unwrap();
     let root = serde_json::json!(site.to_str().unwrap());
     let bundle = format!(
-        r#"{{"agent_id":"cf4","project_id":"p","generation":1,"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block","proxy_config":{{"strip_path_prefix":"/shop"}},"compression":{{"enabled":true,"min_bytes":2}},"static_files":{{"enabled":true,"root":{root},"missing":"app","max_age_s":60}},"rules_json":{{"path_exceptions":[{{"path":"/shop/search","block":{{}}}}]}}}}]}}"#
+        r#"{{"agent_id":"cf4","project_id":"p","generation":1,"apps":[{{"app_id":"web","listen_host":"127.0.0.1","listen_port":{listen},"upstream":"http://127.0.0.1:{up}","mode":"block","proxy_config":{{"strip_path_prefix":"/shop"}},"compression":{{"enabled":true,"min_bytes":2}},"static_files":{{"enabled":true,"root":{root},"missing":"app","max_age_s":60}},"cache":{{"enabled":true,"disk_bytes":33554432,"memory_bytes":0,"rules":[{{"prefix":"/shop/kept","action":"cache","ttl_s":60,"signed_in":false}}]}},"rules_json":{{"path_exceptions":[{{"path":"/shop/search","block":{{}}}}]}}}}]}}"#
     );
     let bu = BundleUpdate {
         command_id: "b1".into(),
@@ -350,7 +361,8 @@ async fn agent_talks_to_the_control_plane() {
         [
             ("redirects", "applied", ""),
             ("compression", "applied", ""),
-            ("static_files", "applied", "")
+            ("static_files", "applied", ""),
+            ("cache", "applied", "")
         ]
     );
     assert_eq!(edge.compression, Some(EdgeCompressionCounters::default()));
@@ -381,6 +393,31 @@ async fn agent_talks_to_the_control_plane() {
         "{file}"
     );
     assert!(file.contains("Cache-Control: max-age=60\r\n"), "{file}");
+
+    // The cache: a path under a rule is kept after the first answer and sent again, and the
+    // answers say so. Nothing is stored until the agent has cleaned its directory, a moment after
+    // the bundle, so the second answer is waited for.
+    let first = tokio::task::spawn_blocking(move || get(listen, "/shop/kept", ""))
+        .await
+        .unwrap();
+    assert!(
+        first.starts_with("HTTP/1.1 200") && first.contains("X-Cache: MISS\r\n"),
+        "{first}"
+    );
+    let mut hit = String::new();
+    for _ in 0..50 {
+        hit = tokio::task::spawn_blocking(move || get(listen, "/shop/kept", ""))
+            .await
+            .unwrap();
+        if hit.contains("X-Cache: HIT\r\n") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        hit.starts_with("HTTP/1.1 200") && hit.contains("X-Cache: HIT\r\n") && hit.ends_with("ok"),
+        "{hit}"
+    );
 
     // A blocked request (the path of the app is blocked by a rule; this agent has no engine): the decision reaches
     // the control plane with credentials redacted.

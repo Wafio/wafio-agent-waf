@@ -17,11 +17,12 @@ use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
 use wafio_proxy::cert_store::{BookChange, BookEntry, CertBook};
 use wafio_proxy::{
-    AppAnalysisSetup, AppSpec, CompressionCounters, CompressionSpec, StaticRefusal, StaticSpec,
-    TlsSite,
+    AppAnalysisSetup, AppSpec, CacheRefusal, CacheSpec, CompressionCounters, CompressionSpec,
+    StaticRefusal, StaticSpec, TlsSite,
 };
 
 use crate::bundle::{Bundle, BundleApp, CompressionEntry, UnblockEntry, decode_bundle};
+use crate::cache::{CachePlan, CacheSetup};
 use crate::executor::{BaseExecutor, Stores, executor_for_rules};
 use crate::ready::Ready;
 use crate::tls::acme::placeholder;
@@ -97,6 +98,9 @@ struct State {
     /// The folder each app serves static files from, as the proxy runs it. A bundle whose folder
     /// the agent refuses leaves the one in this map serving.
     static_files: HashMap<String, StaticSpec>,
+    /// The settings of each app's response cache, as the proxy runs them. A bundle whose settings
+    /// the agent refuses leaves the ones in this map running.
+    cache: HashMap<String, CacheSpec>,
 }
 
 /// The edge parts an app has on.
@@ -107,6 +111,9 @@ struct AppEdge {
     compression: bool,
     /// What became of the app's static files; `None` when the bundle has them off.
     static_files: Option<StaticState>,
+    /// What became of the app's response cache; `None` when the bundle has it off (and the cache
+    /// directory is usable).
+    cache: Option<CacheState>,
 }
 
 /// What the agent did with the static files of an app that has them on.
@@ -117,6 +124,19 @@ enum StaticState {
     /// earlier bundle serves on, false when the part is off.
     Refused {
         refusal: StaticRefusal,
+        running_previous: bool,
+    },
+}
+
+/// What the agent did with the response cache of an app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CacheState {
+    Applied,
+    /// The agent did not apply the settings; `running_previous` is true when the settings of an
+    /// earlier bundle run on, false when the cache is off. Every app has this when the cache
+    /// directory cannot be used.
+    Refused {
+        refusal: CacheRefusal,
         running_previous: bool,
     },
 }
@@ -136,6 +156,9 @@ pub struct Agent {
     orders: orders::Orders,
     /// What the agent counts of its certificates.
     tls_metrics: Arc<TlsMetrics>,
+    /// The cache directory, when the agent has been told about one: without it no app has a cache
+    /// and none is reported.
+    cache: Option<CacheSetup>,
 }
 
 fn apply_error(s: &str) -> BundleError {
@@ -168,6 +191,38 @@ impl Agent {
             statuses: None,
             orders: orders::Orders::default(),
             tls_metrics: Arc::default(),
+            cache: None,
+        }
+    }
+
+    /// The response cache of the apps is kept in this directory, or stays off with the refusal's
+    /// reason for every app when the directory cannot be used.
+    pub fn with_cache(mut self, setup: CacheSetup) -> Agent {
+        self.cache = Some(setup);
+        self
+    }
+
+    /// Whether this process waits for the lock of the cache directory, which the process it
+    /// replaces holds.
+    pub fn waits_for_cache(&self) -> bool {
+        matches!(&self.cache, Some(CacheSetup::Ready(host)) if !host.holds_lock())
+    }
+
+    /// Takes the cache directory lock if the process that held it let go; the index is read again
+    /// and the directory cleaned before anything is stored. Blocks. Returns whether there is
+    /// nothing left to wait for, as [`Agent::take_over_keys`] does.
+    pub fn take_over_cache(&self) -> bool {
+        match &self.cache {
+            Some(CacheSetup::Ready(host)) if !self.lock().closed => host.take_over(),
+            _ => true,
+        }
+    }
+
+    /// Lets go of the cache directory lock for the process that takes over. Call it with
+    /// `release_keys`, after `close`.
+    pub fn release_cache(&self) {
+        if let Some(CacheSetup::Ready(host)) = &self.cache {
+            host.release();
         }
     }
 
@@ -368,6 +423,8 @@ impl Agent {
         // The folders are looked at on the disk before the apply lock is taken: a slow disk must
         // not hold up the certificates and the statuses that wait for it.
         let mut folders = check_static_files(&b.apps);
+        // What the host has for a cache is read here too, for the same reason.
+        let host_view = crate::cache::host_view(self.cache.as_ref(), &b.apps);
         // One apply at a time; the proxy call happens under it too.
         let mut st = self.lock();
         st.refusal = None;
@@ -418,6 +475,12 @@ impl Agent {
         let mut specs: Vec<AppSpec> = Vec::new();
         let mut edge: HashMap<String, AppEdge> = HashMap::new();
         let mut running: HashMap<String, StaticSpec> = HashMap::new();
+        let mut caches = self
+            .cache
+            .as_ref()
+            .map(|setup| crate::cache::plan(setup, &b.apps, &st.cache, host_view.as_ref()))
+            .unwrap_or_default();
+        let mut running_cache: HashMap<String, CacheSpec> = HashMap::new();
         let mut addresses: HashSet<String> = HashSet::new();
         let mut unbindable = false;
         let mut with_scripts = 0u64;
@@ -478,12 +541,29 @@ impl Agent {
                     )
                 }
             };
+            // Settings of the cache that do not pass, or do not fit the host, are no reason to refuse
+            // the bundle either: the app keeps the ones it ran with, and the control plane is told.
+            let (cache, cache_state) = match caches.remove(&app.app_id) {
+                None => (None, None),
+                Some(CachePlan::Apply(spec)) => (Some(spec), Some(CacheState::Applied)),
+                Some(CachePlan::Refuse { refusal, previous }) => {
+                    let running_previous = previous.is_some();
+                    (
+                        previous,
+                        Some(CacheState::Refused {
+                            refusal,
+                            running_previous,
+                        }),
+                    )
+                }
+            };
             let spec = app_spec(
                 app,
                 exec,
                 tls.get(&app.app_id)
                     .map(|applied| tls_site(&app.app_id, applied, &book)),
                 folder,
+                cache,
             );
             // The route is built here, so a bad route fails before later apps are built.
             let route = match wafio_proxy::config::build_route(&spec) {
@@ -499,10 +579,14 @@ impl Agent {
                     redirects: route.redirects(),
                     compression: spec.compression.is_some(),
                     static_files: static_state,
+                    cache: cache_state,
                 },
             );
             if let Some(folder) = &spec.static_files {
                 running.insert(app.app_id.clone(), folder.clone());
+            }
+            if let Some(cache) = &spec.cache {
+                running_cache.insert(app.app_id.clone(), cache.clone());
             }
             // An app with an HTTPS site opens no listener at its bundle address, so that address
             // is neither checked for a duplicate nor for a port that cannot be bound.
@@ -536,6 +620,7 @@ impl Agent {
         st.agent_id = b.agent_id.clone();
         st.edge = edge;
         st.static_files = running;
+        st.cache = running_cache;
         if let Some(keys) = st.tls.as_mut() {
             keys.commit(tls);
         }
@@ -663,7 +748,13 @@ impl Agent {
         };
         let mut apps: Vec<_> = edge
             .into_iter()
-            .filter(|(_, e)| every_app || e.redirects || e.compression || e.static_files.is_some())
+            .filter(|(_, e)| {
+                every_app
+                    || e.redirects
+                    || e.compression
+                    || e.static_files.is_some()
+                    || e.cache.is_some()
+            })
             .collect();
         apps.sort_by(|a, b| a.0.cmp(&b.0));
         apps.into_iter()
@@ -699,6 +790,20 @@ impl Agent {
                         running_previous: *running_previous,
                     }),
                 }
+                match &e.cache {
+                    None => {}
+                    Some(CacheState::Applied) => features.push(applied("cache")),
+                    Some(CacheState::Refused {
+                        refusal,
+                        running_previous,
+                    }) => features.push(EdgeFeatureState {
+                        feature: "cache".into(),
+                        state: "refused".into(),
+                        code: refusal.code.as_str().into(),
+                        detail: refusal.detail.clone(),
+                        running_previous: *running_previous,
+                    }),
+                }
                 EdgeStatus {
                     app_id,
                     generation,
@@ -711,8 +816,8 @@ impl Agent {
             .collect()
     }
 
-    /// Answers a cache purge. This build has no response cache, so a purge for an app of the
-    /// bundle is for an app with no cache.
+    /// Answers a cache purge. This build does not purge yet, so a purge for an app of the bundle
+    /// is answered as one for an app with no cache.
     pub fn purge_cache(&self, purge: &CachePurge) -> Result<(), PurgeCode> {
         let address_ok = purge.url.starts_with('/')
             || purge
@@ -801,6 +906,7 @@ fn app_spec(
     executor: Arc<AppAnalysisSetup>,
     tls: Option<TlsSite>,
     static_files: Option<StaticSpec>,
+    cache: Option<CacheSpec>,
 ) -> AppSpec {
     AppSpec {
         app_id: app.app_id.clone(),
@@ -818,6 +924,8 @@ fn app_spec(
         tls,
         compression: compression_spec(app.compression.as_ref()),
         static_files,
+        cache,
+        session_cookies: app.session_cookies.clone(),
     }
 }
 

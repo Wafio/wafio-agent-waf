@@ -346,6 +346,8 @@ pub fn app(id: &str, port: u16, upstream: &str) -> AppSpec {
         tls: None,
         compression: None,
         static_files: None,
+        cache: None,
+        session_cookies: Vec::new(),
     }
 }
 

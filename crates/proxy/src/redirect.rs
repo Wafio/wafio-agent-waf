@@ -158,6 +158,8 @@ mod tests {
             tls,
             compression: None,
             static_files: None,
+            cache: None,
+            session_cookies: Vec::new(),
         })
         .unwrap()
     }
@@ -433,6 +435,8 @@ mod tests {
                 tls: None,
                 compression: None,
                 static_files: None,
+                cache: None,
+                session_cookies: Vec::new(),
             };
             let e = build_route(&spec).err().expect(bad);
             assert!(e.contains("strip_path_prefix"), "{bad}: {e}");

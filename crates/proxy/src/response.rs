@@ -150,6 +150,69 @@ impl OutboundResponse {
         matches!(self.declared_length, Some((-1, _)))
     }
 
+    /// An answer as it was stored: status, status message and header lines (the specials among
+    /// them go through [`OutboundResponse::add`]). Nothing of the connection is kept, so it is
+    /// sent as built here: the length is the body's.
+    pub(crate) fn from_stored(
+        status: u16,
+        reason: &[u8],
+        lines: &[(Vec<u8>, Vec<u8>)],
+    ) -> OutboundResponse {
+        let mut r = OutboundResponse::new(status).with_reason(Some(reason));
+        for (name, value) in lines {
+            r.add(name, value);
+        }
+        r
+    }
+
+    /// The status message this answer was given by its upstream; empty when it has none.
+    pub(crate) fn reason(&self) -> &[u8] {
+        self.reason.as_deref().unwrap_or_default()
+    }
+
+    /// The header lines to store with the answer: what the upstream said, without what belongs to
+    /// the connection (`Connection` and the headers it names, `Keep-Alive`, `Proxy-*`, `TE`,
+    /// `Trailer`, `Upgrade`), the length it sent and what is made again for each answer: `Date`,
+    /// `Age`, `X-Cache`. `None` when the answer carries a cookie, which is never stored.
+    pub(crate) fn stored_lines(&self) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if !self.cookies.is_empty() {
+            return None;
+        }
+        let named: Vec<Vec<u8>> = self
+            .values(b"Connection")
+            .flat_map(|v| v.split(|&c| c == b','))
+            .map(|n| n.trim_ascii().to_ascii_lowercase())
+            .collect();
+        let own = |name: &[u8]| {
+            matches!(
+                name.to_ascii_lowercase().as_slice(),
+                b"connection"
+                    | b"keep-alive"
+                    | b"proxy-authenticate"
+                    | b"proxy-authorization"
+                    | b"te"
+                    | b"trailer"
+                    | b"transfer-encoding"
+                    | b"upgrade"
+                    | b"date"
+                    | b"age"
+                    | b"x-cache"
+            ) || named.contains(&name.to_ascii_lowercase())
+        };
+        let mut lines = Vec::new();
+        if let Some(server) = &self.server {
+            lines.push((b"Server".to_vec(), server.clone()));
+        }
+        if let Some(ct) = &self.content_type {
+            lines.push((b"Content-Type".to_vec(), ct.clone()));
+        }
+        if let Some(ce) = &self.content_encoding {
+            lines.push((b"Content-Encoding".to_vec(), ce.clone()));
+        }
+        lines.extend(self.header_lines.iter().filter(|(n, _)| !own(n)).cloned());
+        Some(lines)
+    }
+
     /// A challenge-handler page.
     pub fn from_page(p: PageResponse) -> OutboundResponse {
         let mut r = OutboundResponse::new(p.status);
@@ -489,6 +552,73 @@ pub async fn write(s: &mut ServerSession, r: OutboundResponse) -> pingora::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stored_answer_comes_back_with_its_message_and_its_lines_and_sheds_what_belongs_to_the_connection()
+     {
+        let upstream = |headers: &[(&'static str, &'static str)]| {
+            let mut r = OutboundResponse::from_upstream(
+                404,
+                false,
+                headers.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())),
+            )
+            .with_reason(Some("Gone Missing"));
+            r.body = b"nothing here".to_vec();
+            r
+        };
+        let r = upstream(&[
+            ("Content-Type", "text/plain"),
+            ("Content-Length", "12"),
+            ("Server", "origin"),
+            ("Content-Encoding", "gzip"),
+            ("Connection", "keep-alive, X-Hop"),
+            ("X-Hop", "1"),
+            ("Keep-Alive", "timeout=5"),
+            ("Proxy-Authenticate", "Basic"),
+            ("TE", "trailers"),
+            ("Trailer", "X-End"),
+            ("Upgrade", "h2c"),
+            ("Date", "Mon, 02 Jan 2006 15:04:05 GMT"),
+            ("Age", "9"),
+            ("X-Cache", "HIT"),
+            ("X-Kept", "a"),
+            ("X-Kept", "b"),
+        ]);
+        assert_eq!(r.reason(), b"Gone Missing");
+        let lines = r.stored_lines().unwrap();
+        let names: Vec<&[u8]> = lines.iter().map(|(n, _)| n.as_slice()).collect();
+        assert_eq!(
+            names,
+            [
+                &b"Server"[..],
+                b"Content-Type",
+                b"Content-Encoding",
+                b"X-Kept",
+                b"X-Kept"
+            ]
+        );
+        let back = OutboundResponse::from_stored(404, r.reason(), &lines);
+        assert_eq!(back.status, 404);
+        assert_eq!(back.peek(b"Server"), Some(&b"origin"[..]));
+        assert_eq!(back.peek(b"Content-Encoding"), Some(&b"gzip"[..]));
+        assert_eq!(
+            back.values(b"X-Kept").collect::<Vec<_>>(),
+            [&b"a"[..], b"b"]
+        );
+        assert!(!back.close && back.peek(b"Connection").is_none());
+        // Sent with the length of what it holds and the message it had.
+        let mut sent = back.clone();
+        sent.body = b"x".to_vec();
+        let w = String::from_utf8(sent.wire(false, false, false, 0)).unwrap();
+        assert!(
+            w.starts_with("HTTP/1.1 404 Gone Missing\r\n") && w.contains("Content-Length: 1\r\n"),
+            "{w}"
+        );
+        // An answer with a cookie is never stored; one with no message gives none back.
+        let with_cookie = upstream(&[("Set-Cookie", "a=1")]);
+        assert!(with_cookie.stored_lines().is_none());
+        assert_eq!(OutboundResponse::new(200).reason(), b"");
+    }
 
     #[test]
     fn http_date_format() {

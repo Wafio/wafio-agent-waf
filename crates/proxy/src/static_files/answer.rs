@@ -42,7 +42,7 @@ pub(super) enum Plan {
 /// A date that is one of the two the validators use. Only the form HTTP servers write (`Sun, 06
 /// Nov 1994 08:49:37 GMT`) is read: any other form is no date, and a header that holds one is
 /// left out of the decision.
-pub(super) fn parse_http_date(value: &[u8]) -> Option<u64> {
+pub(crate) fn parse_http_date(value: &[u8]) -> Option<u64> {
     const MONTHS: [&[u8]; 12] = [
         b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
         b"Dec",
@@ -112,7 +112,7 @@ fn still_the_same(value: &[u8], meta: &Meta) -> bool {
 
 /// What a `Range` header asks of a file of `size` bytes.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Asked {
+pub(crate) enum Asked {
     /// Not a range this server answers: no `bytes` unit, several ranges, a form that does not
     /// parse, or an end before its start. The whole file is sent.
     Ignored,
@@ -136,7 +136,7 @@ fn digits(text: &[u8]) -> Option<u64> {
     std::str::from_utf8(text).ok()?.parse().ok()
 }
 
-pub(super) fn asked(value: &[u8], size: u64) -> Asked {
+pub(crate) fn asked(value: &[u8], size: u64) -> Asked {
     let Some((unit, ranges)) = split_at_byte(value.trim_ascii(), b'=') else {
         return Asked::Ignored;
     };

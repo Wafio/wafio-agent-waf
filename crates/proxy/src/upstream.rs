@@ -228,8 +228,35 @@ pub(crate) fn upstream_request(
     ] {
         u.header_lines.push((name.to_vec(), value));
     }
+    // With the cache on, the answer is kept for every request that has the same key, so what the
+    // application may answer differently for must be in the key or not reach it: the headers a
+    // front-end writes beyond the three this agent writes itself are sent on only from a proxy the
+    // route trusts (and are keyed then), and a line of the client's for a header this agent writes
+    // does not stay beside it.
+    let cache_on = route.cache_active().is_some();
+    let untrusted = cache_on && !crate::cache::trusts(route, peer);
+    if untrusted {
+        let names: Vec<Vec<u8>> = u
+            .header_lines
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| crate::cache::unkeyed_input(n))
+            .cloned()
+            .collect();
+        for name in names {
+            u.del(&name);
+        }
+    }
+    if cache_on {
+        u.del(b"X-Forwarded-Host");
+        u.del(b"X-Forwarded-Proto");
+    }
     u.set(b"X-Forwarded-Host", &req.host);
-    let proto = req.peek("X-Forwarded-Proto");
+    let proto = if untrusted {
+        &[][..]
+    } else {
+        req.peek("X-Forwarded-Proto")
+    };
     u.set(
         b"X-Forwarded-Proto",
         if req.tls.is_some() {

@@ -35,6 +35,7 @@ use crate::pipeline::Done;
 use crate::proxy::Shared;
 use crate::request::{InboundRequest, push_escaped_path, push_forward_query};
 use crate::response::{OutboundResponse, http_date};
+pub(crate) use answer::{Asked, asked, parse_http_date};
 use answer::{Conditions, Meta, Plan};
 pub(crate) use gate::{DISK_DEADLINE, DiskGate, LOOKUP_WAIT};
 use walk::Found;
@@ -581,7 +582,7 @@ pub(crate) async fn serve(
             response.body = bytes;
             if let (Some(spec), 200) = (&route.compression, response.status) {
                 let stats = shared.edge.app(&route.app_id);
-                crate::compress::apply(&stats, spec, req, &mut response).await;
+                crate::compress::apply(&stats, spec, req, &route.session, &mut response).await;
             }
             crate::metrics::count_static(response.status, response.body.len() as u64);
             Some(Done::Respond(response))

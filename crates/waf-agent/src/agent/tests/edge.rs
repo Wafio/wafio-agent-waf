@@ -868,3 +868,318 @@ fn the_static_files_cases_of_the_control_plane_get_the_same_answer() {
         assert_eq!(invalid, refused, "{name}: {got:?}");
     }
 }
+
+// The response cache.
+
+use crate::cache::CacheSetup;
+use wafio_proxy::{CacheHost, CacheRefusal, CacheRefusalCode, CacheSpec};
+
+/// An agent whose cache directory is `dir`.
+fn agent_with_cache(dir: &Folder) -> (Arc<Agent>, Arc<FakeProxy>) {
+    let stores = Stores::new();
+    let base = startup_executor(&stores, "", None).unwrap();
+    let proxy = Arc::new(FakeProxy::default());
+    let host = CacheHost::open(&dir.0, my_uid()).unwrap();
+    let agent = Agent::new(
+        base,
+        stores,
+        proxy.clone(),
+        Arc::new(VerifiedBotChecker::new()),
+        Arc::new(Ready::new(ReadyActions::default())),
+    )
+    .with_cache(CacheSetup::Ready(host));
+    (Arc::new(agent), proxy)
+}
+
+fn cache_part(disk: u64) -> String {
+    format!(
+        r#","cache":{{"enabled":true,"disk_bytes":{disk},"memory_bytes":0,"rules":[{{"prefix":"/blog/","action":"cache","ttl_s":60,"signed_in":false}}],"session_cookies":["Sid"]}}"#
+    )
+}
+
+/// The `cache` feature of an app's status: state, code, detail, `running_previous`.
+fn cache_feature(s: &EdgeStatus) -> Option<(String, String, String, bool)> {
+    s.features.iter().find(|f| f.feature == "cache").map(|f| {
+        (
+            f.state.clone(),
+            f.code.clone(),
+            f.detail.clone(),
+            f.running_previous,
+        )
+    })
+}
+
+fn running_cache(proxy: &FakeProxy) -> Vec<Option<CacheSpec>> {
+    proxy.cache.lock().unwrap().last().unwrap().clone()
+}
+
+#[test]
+fn a_bundle_with_a_cache_gives_the_proxy_its_settings_and_the_control_plane_an_applied_status() {
+    let dir = Folder::new("cache-applied");
+    let (a, proxy) = agent_with_cache(&dir);
+    apply(
+        &a,
+        &bundle_of(&[
+            app_with("c1", 18080, &cache_part(32 << 20)),
+            app_with("c2", 18081, r#","cache":{"enabled":false}"#),
+            app_with("c3", 18082, ""),
+        ]),
+        4,
+    )
+    .unwrap();
+    let sent = running_cache(&proxy);
+    let spec = sent[0].clone().unwrap();
+    assert_eq!(
+        (spec.disk_bytes, spec.memory_bytes, spec.default_ttl_s),
+        (32 << 20, 0, 3600)
+    );
+    assert_eq!(spec.session_cookies, ["Sid"]);
+    assert_eq!(spec.rules.len(), 1);
+    assert!(sent[1].is_none() && sent[2].is_none());
+
+    let statuses = a.edge_statuses(false);
+    assert_eq!(
+        statuses.len(),
+        1,
+        "an app with no part on is not in the refresh"
+    );
+    assert_eq!(features(&statuses[0]), [("cache", "applied")]);
+    assert_eq!(
+        cache_feature(&statuses[0]),
+        Some(("applied".into(), String::new(), String::new(), false))
+    );
+    assert!(statuses[0].cache.is_none(), "no counters in this build");
+    // After a bundle every app is named; the ones with the cache off have no features.
+    let every = a.edge_statuses(true);
+    assert_eq!(every.len(), 3);
+    assert!(every[1].features.is_empty() && every[2].features.is_empty());
+}
+
+#[test]
+fn the_session_cookie_names_of_an_app_reach_the_proxy_with_the_cache_on_or_off() {
+    let (a, proxy, _ready) = agent();
+    apply(
+        &a,
+        &bundle_of(&[
+            app_with("p1", 18080, r#","session_cookies":["MyAuth","sb-token"]"#),
+            app_with("p2", 18081, ""),
+        ]),
+        1,
+    )
+    .unwrap();
+    let sent = proxy.session.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        sent,
+        vec![vec!["MyAuth".to_owned(), "sb-token".to_owned()], Vec::new()]
+    );
+    assert!(running_cache(&proxy).iter().all(Option::is_none));
+}
+
+#[test]
+fn an_agent_with_no_cache_directory_ignores_the_cache_and_does_not_report_it() {
+    let (a, proxy, _ready) = agent();
+    apply(
+        &a,
+        &bundle_of(&[app_with("c1", 18080, &cache_part(32 << 20))]),
+        1,
+    )
+    .unwrap();
+    assert!(running_cache(&proxy)[0].is_none());
+    assert!(a.edge_statuses(false).is_empty());
+}
+
+#[test]
+fn settings_that_do_not_pass_leave_the_bundle_in_and_the_earlier_settings_run_on() {
+    let dir = Folder::new("cache-invalid");
+    let (a, proxy) = agent_with_cache(&dir);
+    apply(
+        &a,
+        &bundle_of(&[app_with("c1", 18080, &cache_part(32 << 20))]),
+        1,
+    )
+    .unwrap();
+    let before = running_cache(&proxy)[0].clone().unwrap();
+    // A disk size under the smallest, and a rule whose action is none of the two.
+    for (generation, part) in [
+        (2, r#","cache":{"enabled":true,"disk_bytes":1000}"#),
+        (
+            3,
+            r#","cache":{"enabled":true,"rules":[{"prefix":"/a","action":"keep","ttl_s":5}]}"#,
+        ),
+    ] {
+        apply(&a, &bundle_of(&[app_with("c1", 18080, part)]), generation).unwrap();
+        assert_eq!(a.generation().0, generation);
+        assert_eq!(
+            running_cache(&proxy)[0],
+            Some(before.clone()),
+            "the old settings run on"
+        );
+        let s = a.edge_statuses(false);
+        let (state, code, detail, previous) = cache_feature(&s[0]).unwrap();
+        assert_eq!(
+            (state.as_str(), code.as_str(), previous),
+            ("refused", "invalid", true)
+        );
+        assert!(
+            detail == "disk_bytes" || detail == "rules.action",
+            "{detail}"
+        );
+    }
+    // Switched off: nothing runs and nothing is said. Refused with nothing before: off, said.
+    apply(&a, &bundle_of(&[app_with("c1", 18080, "")]), 4).unwrap();
+    assert!(running_cache(&proxy)[0].is_none());
+    assert!(a.edge_statuses(false).is_empty());
+    apply(
+        &a,
+        &bundle_of(&[app_with(
+            "c1",
+            18080,
+            r#","cache":{"enabled":true,"memory_bytes":-1}"#,
+        )]),
+        5,
+    )
+    .unwrap();
+    assert!(running_cache(&proxy)[0].is_none());
+    let (state, code, detail, previous) = cache_feature(&a.edge_statuses(false)[0]).unwrap();
+    assert_eq!(
+        (state.as_str(), code.as_str(), detail.as_str(), previous),
+        ("refused", "invalid", "memory_bytes", false)
+    );
+}
+
+/// A host cannot give a hundred apps a terabyte each: nothing that changed is applied, and an app
+/// that ran with smaller settings keeps them.
+#[test]
+fn settings_that_ask_for_more_than_the_host_has_are_refused_and_none_is_reduced() {
+    let dir = Folder::new("cache-host");
+    let (a, proxy) = agent_with_cache(&dir);
+    apply(
+        &a,
+        &bundle_of(&[app_with("c1", 18080, &cache_part(32 << 20))]),
+        1,
+    )
+    .unwrap();
+    let before = running_cache(&proxy)[0].clone().unwrap();
+    let huge = cache_part(1 << 40);
+    let mut apps = vec![app_with("c1", 18080, &huge)];
+    apps.extend((0..199).map(|i| app_with(&format!("x{i}"), 18100 + i, &huge)));
+    apply(&a, &bundle_of(&apps), 2).unwrap();
+    let sent = running_cache(&proxy);
+    assert_eq!(sent[0], Some(before), "c1 keeps what it ran with");
+    assert!(
+        sent[1..].iter().all(Option::is_none),
+        "the others never ran"
+    );
+    let statuses = a.edge_statuses(false);
+    assert_eq!(statuses.len(), 200);
+    let (state, code, detail, previous) = cache_feature(&statuses[0]).unwrap();
+    assert_eq!(
+        (state.as_str(), code.as_str(), previous),
+        ("refused", "disk_too_small", true)
+    );
+    let (free, asked) = detail.split_once(' ').expect("two numbers");
+    for number in [free, asked] {
+        assert!(
+            (1..=15).contains(&number.len()) && number.bytes().all(|c| c.is_ascii_digit()),
+            "{detail}"
+        );
+    }
+    let (_, _, _, previous) =
+        cache_feature(statuses.iter().find(|s| s.app_id == "x7").unwrap()).unwrap();
+    assert!(!previous);
+
+    // Memory: a hundred apps of 4 GiB.
+    let mem = |n: u64| {
+        format!(
+            r#","cache":{{"enabled":true,"disk_bytes":16777216,"max_object_bytes":1024,"memory_bytes":{n}}}"#
+        )
+    };
+    let apps: Vec<String> = (0..300)
+        .map(|i| app_with(&format!("m{i}"), 19000 + i, &mem(4 << 30)))
+        .collect();
+    apply(&a, &bundle_of(&apps), 3).unwrap();
+    let (_, code, detail, _) = cache_feature(&a.edge_statuses(false)[0]).unwrap();
+    assert_eq!(code, "memory_too_small");
+    assert!(detail.parse::<u64>().is_ok_and(|n| n > 0), "{detail}");
+
+    // The same settings again are not asked of the host again: a host that has less free space
+    // than they need must not stop an app that runs them from running on.
+    let small = bundle_of(&[app_with("c1", 18080, &cache_part(32 << 20))]);
+    apply(&a, &small, 4).unwrap();
+    apply(&a, &small, 5).unwrap();
+    assert_eq!(
+        cache_feature(&a.edge_statuses(false)[0]).unwrap().0,
+        "applied"
+    );
+}
+
+#[test]
+fn a_cache_directory_that_cannot_be_used_is_reported_for_every_app_with_the_cache_on_or_off() {
+    let stores = Stores::new();
+    let base = startup_executor(&stores, "", None).unwrap();
+    let proxy = Arc::new(FakeProxy::default());
+    let refusal = CacheRefusal {
+        code: CacheRefusalCode::DirUnusable,
+        detail: "/var/cache/wafio-waf: cannot stat (NotFound)".into(),
+    };
+    let a = Agent::new(
+        base,
+        stores,
+        proxy.clone(),
+        Arc::new(VerifiedBotChecker::new()),
+        Arc::new(Ready::new(ReadyActions::default())),
+    )
+    .with_cache(CacheSetup::Unusable(refusal.clone()));
+    apply(
+        &a,
+        &bundle_of(&[
+            app_with("c1", 18080, &cache_part(32 << 20)),
+            app_with("c2", 18081, ""),
+        ]),
+        1,
+    )
+    .unwrap();
+    assert!(
+        running_cache(&proxy).iter().all(Option::is_none),
+        "the cache stays off"
+    );
+    // Both the refresh and the report after a bundle name every app, each minute too.
+    for every_app in [false, true] {
+        let statuses = a.edge_statuses(every_app);
+        assert_eq!(statuses.len(), 2, "{every_app}");
+        for s in &statuses {
+            assert_eq!(
+                cache_feature(s),
+                Some((
+                    "refused".into(),
+                    "cache_dir_unusable".into(),
+                    refusal.detail.clone(),
+                    false
+                )),
+                "{}",
+                s.app_id
+            );
+        }
+    }
+}
+
+#[test]
+fn an_agent_that_waits_for_the_cache_lock_takes_over_when_the_holder_lets_go() {
+    let dir = Folder::new("cache-lock");
+    let (first, _) = agent_with_cache(&dir);
+    assert!(!first.waits_for_cache(), "the first process holds the lock");
+    let (second, _) = agent_with_cache(&dir);
+    assert!(second.waits_for_cache());
+    assert!(!second.take_over_cache());
+    first.release_cache();
+    assert!(second.take_over_cache());
+    assert!(!second.waits_for_cache());
+    // An agent that is closing leaves the lock to its successor.
+    let (third, _) = agent_with_cache(&dir);
+    third.close();
+    assert!(
+        third.take_over_cache(),
+        "nothing to wait for, and nothing taken"
+    );
+    assert!(third.waits_for_cache());
+}

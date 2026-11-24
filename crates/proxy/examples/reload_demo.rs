@@ -58,6 +58,8 @@ async fn run() -> std::io::Result<()> {
         tls: None,
         compression: None,
         static_files: None,
+        cache: None,
+        session_cookies: Vec::new(),
     };
     proxy.apply(vec![app]).map_err(std::io::Error::other)?;
     upgrade::notify_ready();

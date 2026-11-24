@@ -1,0 +1,984 @@
+//! The cache directory and the apps' stores in it.
+//!
+//! `<dir>/<app id>/<2 hex>/<64 hex>` holds the files of an app (`format`), `<dir>/<app id>/tmp/`
+//! the ones being written, `<dir>/cache.lock` the lock that makes one process the writer. Only the
+//! holder of the lock stores, evicts and deletes; a reload's successor that does not hold it serves
+//! what it reads. Every process builds the in-memory index (`index`) from the headers of the files
+//! at start, in the background, and nothing is stored until that is done and, for the holder, the
+//! clean that follows it. All of this blocks and runs under `spawn_blocking`.
+
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
+use tokio::sync::Semaphore;
+
+use super::control::vary_names;
+use super::format::{self, Loaded, ReadError, TMP_DIR, Times};
+use super::host::{CacheRefusal, CacheRefusalCode, HostFacts, check_dir};
+use super::index::{Found, Index, MAX_ENTRIES};
+use super::key::{FileId, PrimaryId, from_hex, primary_id};
+
+/// What may be read from disk or written to it at once, in bytes of files.
+pub(crate) const IN_FLIGHT_MAX: usize = 256 << 20;
+const LOCK_FILE: &str = "cache.lock";
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub(crate) fn now() -> u64 {
+    u64::try_from(crate::decision::now_unix()).unwrap_or(0)
+}
+
+/// Whether `id` can name the directory of an app: 1 to 64 of letters, digits, `-` and `_`.
+pub fn valid_app_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// What the stores of all the apps share.
+pub(crate) struct HostState {
+    holder: AtomicBool,
+    ready: AtomicBool,
+    cleaned: AtomicBool,
+    pub budget: Arc<Semaphore>,
+}
+
+/// An answer to put on disk.
+pub(crate) struct Store {
+    pub id: FileId,
+    pub primary: PrimaryId,
+    pub key: Vec<u8>,
+    pub primary_len: usize,
+    pub names: Vec<Vec<u8>>,
+    pub head: Vec<u8>,
+    pub body: Vec<u8>,
+    pub times: Times,
+}
+
+/// Why an answer was not put on disk.
+#[derive(Debug)]
+pub(crate) enum Skip {
+    /// This process is not the writer yet, or any more.
+    NotWriter,
+    Disk(io::Error),
+}
+
+/// One app's files and index.
+pub(crate) struct AppCache {
+    pub id: String,
+    dir: PathBuf,
+    host: Arc<HostState>,
+    index: Mutex<Index>,
+    /// `stale_if_error_s` of the settings in force: the window kept past an answer's life when
+    /// the answer names none of its own.
+    stale_s: AtomicU32,
+}
+
+impl AppCache {
+    fn new(id: &str, root: &Path, host: Arc<HostState>) -> AppCache {
+        AppCache {
+            id: id.to_owned(),
+            dir: root.join(id),
+            host,
+            index: Mutex::new(Index::default()),
+            stale_s: AtomicU32::new(0),
+        }
+    }
+
+    pub fn index(&self) -> MutexGuard<'_, Index> {
+        lock(&self.index)
+    }
+
+    /// Whether this process may write now: it holds the lock, the index is built and the clean
+    /// after the lock was taken is done.
+    pub fn can_store(&self) -> bool {
+        self.host.holder.load(Ordering::Acquire)
+            && self.host.ready.load(Ordering::Acquire)
+            && self.host.cleaned.load(Ordering::Acquire)
+    }
+
+    pub fn budget(&self) -> &Arc<Semaphore> {
+        &self.host.budget
+    }
+
+    /// Reads and checks the file of an entry. A file that is not what the index says (a size, a
+    /// check sum or a key that differs, a link in its place) is removed, from the index and from
+    /// the disk, and is reported as `Corrupt`; one that is gone is dropped from the index.
+    pub fn read(&self, found: &Found) -> Result<Loaded, ReadError> {
+        let path = format::path_of(&self.dir, &found.id);
+        let read = format::read(&path, found.size, &found.key);
+        match &read {
+            Err(ReadError::Corrupt) => {
+                self.index().remove(&found.id);
+                if self.host.holder.load(Ordering::Acquire) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Err(ReadError::Missing) => {
+                self.index().remove(&found.id);
+            }
+            _ => {}
+        }
+        read
+    }
+
+    /// Puts an answer on disk and in the index; what the limits push out is deleted.
+    pub fn store(&self, s: Store) -> Result<(), Skip> {
+        if !self.can_store() {
+            return Err(Skip::NotWriter);
+        }
+        let size = format::write(
+            &self.dir,
+            &s.id,
+            s.primary_len,
+            &s.key,
+            &s.head,
+            &s.body,
+            s.times,
+        )
+        .map_err(Skip::Disk)?;
+        let gone = self.index().insert(s.id, s.primary, s.names, size, s.times);
+        self.delete_files(&gone);
+        Ok(())
+    }
+
+    /// Removes the files of entries that are no longer in the index, when this process may delete.
+    pub fn delete_files(&self, ids: &[FileId]) {
+        if self.host.holder.load(Ordering::Acquire) {
+            for id in ids {
+                format::remove(&self.dir, id);
+            }
+        }
+    }
+
+    /// Drops every entry of these primary keys now, and deletes their files.
+    pub fn drop_primaries(&self, primaries: &[PrimaryId]) -> Vec<FileId> {
+        self.index().drop_primaries(primaries)
+    }
+
+    /// Entries, bytes on disk and bytes in memory.
+    pub fn usage(&self) -> (usize, u64, u64) {
+        let ix = self.index();
+        (ix.len(), ix.disk_bytes(), ix.memory_bytes())
+    }
+}
+
+/// The settings of an app the store needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheLimits {
+    pub app_id: String,
+    pub disk_bytes: u64,
+    pub memory_bytes: u64,
+    pub stale_if_error_s: u32,
+}
+
+/// An entry the scan found.
+struct Scanned {
+    id: FileId,
+    primary: PrimaryId,
+    names: Vec<Vec<u8>>,
+    size: u64,
+    times: Times,
+}
+
+#[derive(Default)]
+struct Scan {
+    apps: HashMap<String, Vec<Scanned>>,
+    /// What is in the directory and is not an answer: the temporary files, names that are not the
+    /// agent's, files that fail their header. Removed by the holder.
+    junk: Vec<PathBuf>,
+}
+
+fn is_shard(name: &str) -> bool {
+    name.len() == 2 && name.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn scan(root: &Path) -> Scan {
+    let mut out = Scan::default();
+    let Ok(apps) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for app in apps.flatten() {
+        let path = app.path();
+        let (name, kind) = (app.file_name(), app.file_type());
+        let Some(name) = name.to_str().map(str::to_owned) else {
+            out.junk.push(path);
+            continue;
+        };
+        if name == LOCK_FILE && kind.as_ref().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if !valid_app_id(&name) || !kind.is_ok_and(|t| t.is_dir()) {
+            out.junk.push(path);
+            continue;
+        }
+        let entries = scan_app(&path, &mut out.junk);
+        out.apps.insert(name, entries);
+    }
+    out
+}
+
+fn scan_app(dir: &Path, junk: &mut Vec<PathBuf>) -> Vec<Scanned> {
+    let mut found = Vec::new();
+    let Ok(children) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for child in children.flatten() {
+        let path = child.path();
+        let name = child.file_name().to_str().map(str::to_owned);
+        let is_dir = child.file_type().is_ok_and(|t| t.is_dir());
+        match name {
+            Some(n) if n == TMP_DIR && is_dir => {
+                if let Ok(files) = std::fs::read_dir(&path) {
+                    junk.extend(files.flatten().map(|f| f.path()));
+                }
+            }
+            Some(n) if is_shard(&n) && is_dir => scan_shard(&n, &path, &mut found, junk),
+            _ => junk.push(path),
+        }
+    }
+    found
+}
+
+fn scan_shard(shard: &str, dir: &Path, found: &mut Vec<Scanned>, junk: &mut Vec<PathBuf>) {
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for file in files.flatten() {
+        let path = file.path();
+        let id = file
+            .file_name()
+            .to_str()
+            .filter(|n| n.starts_with(shard))
+            .and_then(from_hex);
+        let (Some(id), true) = (id, file.file_type().is_ok_and(|t| t.is_file())) else {
+            junk.push(path);
+            continue;
+        };
+        let summary = match format::read_summary(&path) {
+            Ok(s) => s,
+            Err(ReadError::Corrupt) => {
+                junk.push(path);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        // The name is the hash of the key the file holds, and the key holds its primary part.
+        let names = vary_names(
+            summary
+                .head
+                .lines
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case(b"vary"))
+                .map(|(_, v)| v.as_slice()),
+        );
+        let (true, Ok(names)) = (
+            super::key::file_id(&summary.key, b"") == id
+                && summary.primary_len <= summary.key.len(),
+            names,
+        ) else {
+            junk.push(path);
+            continue;
+        };
+        if found.len() >= MAX_ENTRIES {
+            junk.push(path);
+            continue;
+        }
+        found.push(Scanned {
+            id,
+            primary: primary_id(&summary.key[..summary.primary_len]),
+            names,
+            size: summary.size,
+            times: summary.times,
+        });
+    }
+}
+
+/// The cache directory and the stores of the apps in it. One for the process.
+pub struct CacheHost {
+    dir: PathBuf,
+    state: Arc<HostState>,
+    lock: Mutex<Option<Flock<std::fs::File>>>,
+    apps: Mutex<HashMap<String, Arc<AppCache>>>,
+    /// The apps with the cache on in the newest bundle; `None` before the first.
+    live: Mutex<Option<HashSet<String>>>,
+    junk: Mutex<Vec<PathBuf>>,
+    maintaining: Mutex<()>,
+    /// Whether the last lock attempt failed for a reason other than another holder, so it is said
+    /// once.
+    complained: AtomicBool,
+}
+
+impl CacheHost {
+    /// Opens the directory the unit made: checks it (`CacheRefusalCode::DirUnusable` says why not),
+    /// tries to take the lock and starts building the index from what is on disk. The index is
+    /// built on the runtime's blocking pool when there is a runtime, else here.
+    pub fn open(dir: &Path, uid: u32) -> Result<Arc<CacheHost>, CacheRefusal> {
+        check_dir(dir, uid).map_err(|why| CacheRefusal::new(CacheRefusalCode::DirUnusable, why))?;
+        let host = Arc::new(CacheHost {
+            dir: dir.to_owned(),
+            state: Arc::new(HostState {
+                holder: AtomicBool::new(false),
+                ready: AtomicBool::new(false),
+                cleaned: AtomicBool::new(false),
+                budget: Arc::new(Semaphore::new(IN_FLIGHT_MAX)),
+            }),
+            lock: Mutex::new(None),
+            apps: Mutex::new(HashMap::new()),
+            live: Mutex::new(None),
+            junk: Mutex::new(Vec::new()),
+            maintaining: Mutex::new(()),
+            complained: AtomicBool::new(false),
+        });
+        host.try_lock();
+        let worker = host.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || worker.rescan());
+            }
+            Err(_) => worker.rescan(),
+        }
+        Ok(host)
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Whether this process is the one that writes.
+    pub fn holds_lock(&self) -> bool {
+        self.state.holder.load(Ordering::Acquire)
+    }
+
+    /// Whether the index is built from the disk.
+    pub fn is_ready(&self) -> bool {
+        self.state.ready.load(Ordering::Acquire)
+    }
+
+    /// Whether answers are being stored: the lock is held, the index is built and the clean is
+    /// done. That needs a bundle: the clean waits for the first one.
+    pub fn is_writable(&self) -> bool {
+        self.state.holder.load(Ordering::Acquire)
+            && self.state.ready.load(Ordering::Acquire)
+            && self.state.cleaned.load(Ordering::Acquire)
+    }
+
+    fn try_lock(&self) -> bool {
+        let mut held = lock(&self.lock);
+        if held.is_some() {
+            return true;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(self.dir.join(LOCK_FILE));
+        let file = match file {
+            Ok(f) => f,
+            Err(e) => {
+                self.complain(format_args!("cannot open ({})", e.kind()));
+                return false;
+            }
+        };
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(l) => {
+                *held = Some(l);
+                self.state.holder.store(true, Ordering::Release);
+                true
+            }
+            Err((_, Errno::EAGAIN)) => false,
+            Err((_, e)) => {
+                self.complain(format_args!("{e}"));
+                false
+            }
+        }
+    }
+
+    fn complain(&self, what: std::fmt::Arguments<'_>) {
+        if !self.complained.swap(true, Ordering::Relaxed) {
+            tracing::warn!("[cache] cache directory lock: {what}");
+        }
+    }
+
+    /// Takes the lock if the process that held it let go. The files are read again first, as what
+    /// the old process stored after this one started counts, then cleaned, before anything is
+    /// stored. Blocks. Returns whether this process is the writer.
+    pub fn take_over(self: &Arc<Self>) -> bool {
+        if self.holds_lock() {
+            return true;
+        }
+        if !self.try_lock() {
+            return false;
+        }
+        self.state.ready.store(false, Ordering::Release);
+        self.state.cleaned.store(false, Ordering::Release);
+        self.rescan();
+        true
+    }
+
+    /// Lets go of the lock, for the process that takes over. Nothing is stored or deleted after.
+    pub fn release(&self) {
+        self.state.holder.store(false, Ordering::Release);
+        self.state.cleaned.store(false, Ordering::Release);
+        *lock(&self.lock) = None;
+    }
+
+    /// The store of an app, made when it is not there. `None` for an id that cannot name a
+    /// directory.
+    pub(crate) fn app(&self, id: &str) -> Option<Arc<AppCache>> {
+        if !valid_app_id(id) {
+            return None;
+        }
+        let mut apps = lock(&self.apps);
+        Some(
+            apps.entry(id.to_owned())
+                .or_insert_with(|| Arc::new(AppCache::new(id, &self.dir, self.state.clone())))
+                .clone(),
+        )
+    }
+
+    /// Builds every app's index from the disk and replaces what the stores hold, then cleans.
+    fn rescan(&self) {
+        let scanned = scan(&self.dir);
+        let mut doomed: Vec<(Arc<AppCache>, Vec<FileId>)> = Vec::new();
+        let names: HashSet<String> = scanned.apps.keys().cloned().collect();
+        for (name, entries) in scanned.apps {
+            let Some(app) = self.app(&name) else { continue };
+            let mut gone = Vec::new();
+            {
+                let mut ix = app.index();
+                ix.clear();
+                for e in entries {
+                    gone.extend(ix.insert(e.id, e.primary, e.names, e.size, e.times));
+                }
+            }
+            doomed.push((app, gone));
+        }
+        for app in lock(&self.apps).values() {
+            if !names.contains(&app.id) {
+                app.index().clear();
+            }
+        }
+        *lock(&self.junk) = scanned.junk;
+        self.state.ready.store(true, Ordering::Release);
+        for (app, gone) in doomed {
+            app.delete_files(&gone);
+        }
+        self.maintain();
+    }
+
+    /// Applies the settings of the apps that have the cache on: their limits, and the apps that
+    /// have it off or are gone are forgotten. Deletes what the new limits push out, when this
+    /// process is the writer, then cleans in the background.
+    pub fn commit(self: &Arc<Self>, apps: &[CacheLimits]) {
+        let live: HashSet<String> = apps.iter().map(|a| a.app_id.clone()).collect();
+        for limits in apps {
+            let Some(app) = self.app(&limits.app_id) else {
+                continue;
+            };
+            app.stale_s
+                .store(limits.stale_if_error_s, Ordering::Relaxed);
+            let gone = app
+                .index()
+                .set_limits(limits.disk_bytes, limits.memory_bytes);
+            app.delete_files(&gone);
+        }
+        lock(&self.apps).retain(|id, _| live.contains(id));
+        *lock(&self.live) = Some(live);
+        let worker = self.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || worker.maintain());
+            }
+            Err(_) => worker.maintain(),
+        }
+    }
+
+    /// The clean of the writer: the temporary files and unknown names the scan found, the
+    /// directories of apps that do not have the cache on, the answers past their stale window.
+    /// It waits for the first bundle (which says which apps are live), and ends with the writer
+    /// allowed to store.
+    fn maintain(&self) {
+        let _one = lock(&self.maintaining);
+        if !self.holds_lock() || !self.is_ready() {
+            return;
+        }
+        let Some(live) = lock(&self.live).clone() else {
+            return;
+        };
+        for path in std::mem::take(&mut *lock(&self.junk)) {
+            remove_path(&path);
+        }
+        if let Ok(children) = std::fs::read_dir(&self.dir) {
+            for child in children.flatten() {
+                let name = child.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if valid_app_id(name)
+                    && !live.contains(name)
+                    && child.file_type().is_ok_and(|t| t.is_dir())
+                {
+                    remove_path(&child.path());
+                }
+            }
+        }
+        let apps: Vec<Arc<AppCache>> = lock(&self.apps)
+            .values()
+            .filter(|a| live.contains(&a.id))
+            .cloned()
+            .collect();
+        let now = now();
+        for app in apps {
+            let stale = u64::from(app.stale_s.load(Ordering::Relaxed));
+            let mut gone = Vec::new();
+            {
+                let mut ix = app.index();
+                for id in ix.past_window(now, stale) {
+                    ix.remove(&id);
+                    gone.push(id);
+                }
+            }
+            app.delete_files(&gone);
+        }
+        self.state.cleaned.store(true, Ordering::Release);
+    }
+
+    /// Waits up to `wait` for the index to be built, and returns what the cache holds on disk, in
+    /// bytes; `None` when the index is not built by then.
+    pub fn disk_in_use(&self, wait: Duration) -> Option<u64> {
+        let until = Instant::now() + wait;
+        while !self.is_ready() {
+            if Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Some(
+            lock(&self.apps)
+                .values()
+                .map(|a| a.usage().1)
+                .fold(0u64, u64::saturating_add),
+        )
+    }
+
+    /// What the host has for the cache directory.
+    pub fn host_facts(&self) -> io::Result<HostFacts> {
+        HostFacts::read(&self.dir)
+    }
+
+    /// Entries, bytes on disk and bytes in memory of an app; `None` for one the store does not
+    /// know.
+    #[doc(hidden)]
+    pub fn usage(&self, app_id: &str) -> Option<(usize, u64, u64)> {
+        lock(&self.apps).get(app_id).map(|a| a.usage())
+    }
+
+    /// Waits until answers are stored, for a test.
+    #[doc(hidden)]
+    pub fn wait_writable(&self, wait: Duration) -> bool {
+        let until = Instant::now() + wait;
+        while !self.is_writable() {
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+}
+
+fn remove_path(path: &Path) {
+    // `symlink_metadata`: a link is removed itself, never followed.
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::format::StoredHead;
+    use crate::cache::key::{file_id, hex};
+    use std::sync::atomic::AtomicU64;
+
+    pub(crate) struct Dir(pub PathBuf);
+
+    impl Dir {
+        pub fn new() -> Dir {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "wafio-cache-store-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Dir(dir.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn uid() -> u32 {
+        nix::unistd::geteuid().as_raw()
+    }
+
+    const FRESH: Times = Times {
+        stored_at: 1,
+        fresh_until: u64::MAX / 2,
+        initial_age: 0,
+        stale_window: 0,
+    };
+
+    fn head() -> Vec<u8> {
+        StoredHead {
+            status: 200,
+            http10: false,
+            reason: b"OK".to_vec(),
+            lines: vec![(b"Content-Type".to_vec(), b"text/plain".to_vec())],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// An answer under the primary key `name`.
+    fn answer(name: &str, body: &[u8], times: Times) -> Store {
+        let key = name.as_bytes().to_vec();
+        Store {
+            id: file_id(&key, b""),
+            primary: primary_id(&key),
+            primary_len: key.len(),
+            key,
+            names: Vec::new(),
+            head: head(),
+            body: body.to_vec(),
+            times,
+        }
+    }
+
+    fn limits(app: &str, disk: u64) -> CacheLimits {
+        CacheLimits {
+            app_id: app.into(),
+            disk_bytes: disk,
+            memory_bytes: 1 << 20,
+            stale_if_error_s: 0,
+        }
+    }
+
+    /// A host in a fresh directory with the apps live, writable.
+    fn writable(dir: &Dir, apps: &[CacheLimits]) -> Arc<CacheHost> {
+        let host = CacheHost::open(&dir.0, uid()).unwrap();
+        host.commit(apps);
+        assert!(host.wait_writable(Duration::from_secs(5)));
+        host
+    }
+
+    #[test]
+    fn app_ids_that_can_name_a_directory() {
+        for ok in ["a", "shop", "7f3a-91_b", &"a".repeat(64)] {
+            assert!(valid_app_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "..",
+            "a/b",
+            "a.b",
+            ".hidden",
+            "a b",
+            "é",
+            "tmp\0",
+            &"a".repeat(65),
+        ] {
+            assert!(!valid_app_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stored_answer_is_read_back_and_survives_a_restart() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        app.store(answer("one", b"hello", FRESH)).unwrap();
+        let (found, fresh) = app
+            .index()
+            .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
+            .unwrap();
+        assert!(fresh);
+        let loaded = app.read(&found).unwrap();
+        assert_eq!(loaded.body, b"hello");
+        assert_eq!(host.usage("shop").unwrap().0, 1);
+        host.release();
+        drop(app);
+        drop(host);
+        // Another process: the same directory, the same index, hits without a store.
+        let again = CacheHost::open(&dir.0, uid()).unwrap();
+        again.commit(&[limits("shop", 1 << 20)]);
+        assert!(again.is_ready() && again.wait_writable(Duration::from_secs(5)));
+        let app = again.app("shop").unwrap();
+        let (found, _) = app
+            .index()
+            .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
+            .unwrap();
+        assert_eq!(app.read(&found).unwrap().body, b"hello");
+    }
+
+    #[test]
+    fn only_one_process_writes_and_the_successor_takes_over_when_the_lock_is_free() {
+        let dir = Dir::new();
+        let first = CacheHost::open(&dir.0, uid()).unwrap();
+        first.commit(&[limits("shop", 1 << 20)]);
+        assert!(first.wait_writable(Duration::from_secs(5)));
+        let second = CacheHost::open(&dir.0, uid()).unwrap();
+        second.commit(&[limits("shop", 1 << 20)]);
+        assert!(!second.holds_lock());
+        assert!(second.is_ready(), "a reader builds its index too");
+        let (a, b) = (first.app("shop").unwrap(), second.app("shop").unwrap());
+        a.store(answer("one", b"1", FRESH)).unwrap();
+        // The reader stores, evicts and deletes nothing.
+        assert!(matches!(
+            b.store(answer("two", b"2", FRESH)),
+            Err(Skip::NotWriter)
+        ));
+        assert!(!format::path_of(&dir.0.join("shop"), &answer("two", b"", FRESH).id).exists());
+        assert!(!second.take_over(), "the lock is held");
+        // The first lets go; the second reads what the first stored after the second started.
+        first.release();
+        assert!(second.take_over());
+        assert!(second.is_writable());
+        let found = b
+            .index()
+            .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10);
+        assert!(found.is_some(), "a file stored after the start counts");
+        assert!(matches!(
+            a.store(answer("three", b"3", FRESH)),
+            Err(Skip::NotWriter)
+        ));
+        b.store(answer("two", b"2", FRESH)).unwrap();
+    }
+
+    #[test]
+    fn the_clean_removes_temporary_files_unknown_names_and_the_directories_of_apps_that_are_off() {
+        let dir = Dir::new();
+        {
+            let host = writable(&dir, &[limits("keep", 1 << 20), limits("gone", 1 << 20)]);
+            host.app("keep")
+                .unwrap()
+                .store(answer("a", b"x", FRESH))
+                .unwrap();
+            host.app("gone")
+                .unwrap()
+                .store(answer("a", b"x", FRESH))
+                .unwrap();
+            host.release();
+        }
+        let keep = dir.0.join("keep");
+        let id = hex(&answer("a", b"", FRESH).id);
+        std::fs::write(keep.join("tmp").join("1234-0"), b"torn").unwrap();
+        std::fs::write(keep.join("notes.txt"), b"x").unwrap();
+        std::fs::create_dir(keep.join("zz")).unwrap();
+        std::fs::write(keep.join(&id[..2]).join("short"), b"x").unwrap();
+        std::fs::write(dir.0.join("stray"), b"x").unwrap();
+        std::fs::create_dir(dir.0.join("not a valid id")).unwrap();
+        std::os::unix::fs::symlink("/", dir.0.join("link")).unwrap();
+        let host = CacheHost::open(&dir.0, uid()).unwrap();
+        // Before the first bundle nothing is cleaned, and nothing is stored.
+        assert!(!host.wait_writable(Duration::from_millis(200)));
+        assert!(dir.0.join("stray").exists() && dir.0.join("gone").exists());
+        host.commit(&[limits("keep", 1 << 20)]);
+        assert!(host.wait_writable(Duration::from_secs(5)));
+        let names = |p: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(p)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&dir.0), ["cache.lock", "keep"], "the rest is gone");
+        let mut want = vec!["tmp".to_string(), id[..2].to_string()];
+        want.sort();
+        assert_eq!(names(&keep), want);
+        assert!(names(&keep.join("tmp")).is_empty());
+        assert_eq!(
+            names(&keep.join(&id[..2])),
+            std::slice::from_ref(&id),
+            "the answer stays alone in its folder"
+        );
+        // What the clean kept is still served.
+        let app = host.app("keep").unwrap();
+        assert!(
+            app.index()
+                .find(&primary_id(b"a"), b"a", |_| Vec::new(), 10)
+                .is_some()
+        );
+        // The link was removed, not followed: the root of the file system is as it was.
+        assert!(Path::new("/etc").exists());
+    }
+
+    #[test]
+    fn a_reader_cleans_nothing() {
+        let dir = Dir::new();
+        let writer = CacheHost::open(&dir.0, uid()).unwrap();
+        let reader = CacheHost::open(&dir.0, uid()).unwrap();
+        std::fs::write(dir.0.join("stray"), b"x").unwrap();
+        reader.commit(&[limits("shop", 1 << 20)]);
+        assert!(!reader.holds_lock());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(dir.0.join("stray").exists(), "the reader deleted nothing");
+        drop(writer);
+    }
+
+    #[test]
+    fn what_is_past_its_stale_window_goes_at_the_clean_and_the_quota_is_kept() {
+        let dir = Dir::new();
+        {
+            let host = writable(&dir, &[limits("shop", 1 << 20)]);
+            let app = host.app("shop").unwrap();
+            let old = Times {
+                stored_at: 1,
+                fresh_until: 10,
+                initial_age: 0,
+                stale_window: 0,
+            };
+            app.store(answer("old", b"x", old)).unwrap();
+            app.store(answer("new", b"x", FRESH)).unwrap();
+            host.release();
+        }
+        // The old one is past its life and the setting's window: gone at the clean.
+        let host = CacheHost::open(&dir.0, uid()).unwrap();
+        host.commit(&[limits("shop", 1 << 20)]);
+        assert!(host.wait_writable(Duration::from_secs(5)));
+        let app = host.app("shop").unwrap();
+        assert_eq!(app.usage().0, 1);
+        assert!(!format::path_of(&dir.0.join("shop"), &answer("old", b"", FRESH).id).exists());
+        // A smaller quota evicts, and the files of what it evicts go.
+        for n in 0..10 {
+            app.store(answer(&format!("k{n}"), &[0u8; 1000], FRESH))
+                .unwrap();
+        }
+        host.commit(&[limits("shop", 3000)]);
+        let (entries, disk, _) = app.usage();
+        assert!(disk <= 3000 && entries <= 3, "{entries} {disk}");
+        let on_disk: usize = std::fs::read_dir(dir.0.join("shop"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name() != "tmp")
+            .map(|shard| std::fs::read_dir(shard.path()).unwrap().count())
+            .sum();
+        assert_eq!(on_disk, entries, "no file outlives its entry");
+    }
+
+    #[test]
+    fn a_file_that_fails_its_check_is_dropped_deleted_and_never_served() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        app.store(answer("one", b"a body of some length", FRESH))
+            .unwrap();
+        let path = format::path_of(&dir.0.join("shop"), &answer("one", b"", FRESH).id);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let (found, _) = app
+            .index()
+            .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
+            .unwrap();
+        assert_eq!(app.read(&found).err(), Some(ReadError::Corrupt));
+        assert!(!path.exists(), "the corrupt file is deleted");
+        assert!(
+            app.index()
+                .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
+                .is_none()
+        );
+        // A file that is gone is dropped from the index quietly.
+        app.store(answer("two", b"x", FRESH)).unwrap();
+        let (found, _) = app
+            .index()
+            .find(&primary_id(b"two"), b"two", |_| Vec::new(), 10)
+            .unwrap();
+        std::fs::remove_file(format::path_of(&dir.0.join("shop"), &found.id)).unwrap();
+        assert_eq!(app.read(&found).err(), Some(ReadError::Missing));
+        assert_eq!(app.usage().0, 0);
+    }
+
+    #[test]
+    fn a_scan_ignores_a_file_that_is_not_the_one_its_name_says() {
+        let dir = Dir::new();
+        {
+            let host = writable(&dir, &[limits("shop", 1 << 20)]);
+            let app = host.app("shop").unwrap();
+            app.store(answer("one", b"x", FRESH)).unwrap();
+            app.store(answer("two", b"y", FRESH)).unwrap();
+            host.release();
+        }
+        // The files of two keys swapped between their names.
+        let shop = dir.0.join("shop");
+        let (one, two) = (
+            format::path_of(&shop, &answer("one", b"", FRESH).id),
+            format::path_of(&shop, &answer("two", b"", FRESH).id),
+        );
+        let tmp = shop.join("swap");
+        std::fs::rename(&one, &tmp).unwrap();
+        std::fs::rename(&two, &one).unwrap();
+        std::fs::rename(&tmp, &two).unwrap();
+        let host = CacheHost::open(&dir.0, uid()).unwrap();
+        host.commit(&[limits("shop", 1 << 20)]);
+        assert!(host.wait_writable(Duration::from_secs(5)));
+        assert_eq!(host.usage("shop").unwrap().0, 0, "neither is believed");
+    }
+
+    #[test]
+    fn the_disk_in_use_waits_for_the_index_and_adds_up_the_apps() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("a", 1 << 20), limits("b", 1 << 20)]);
+        host.app("a")
+            .unwrap()
+            .store(answer("x", &[0; 100], FRESH))
+            .unwrap();
+        host.app("b")
+            .unwrap()
+            .store(answer("x", &[0; 200], FRESH))
+            .unwrap();
+        let used = host.disk_in_use(Duration::from_secs(1)).unwrap();
+        assert!((300..1000).contains(&used), "{used}");
+        assert!(host.host_facts().unwrap().fs_bytes > 0);
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_used_is_refused_with_the_reason() {
+        let err = CacheHost::open(Path::new("/no/such/dir"), uid())
+            .err()
+            .unwrap();
+        assert_eq!(err.code, CacheRefusalCode::DirUnusable);
+        let dir = Dir::new();
+        let err = CacheHost::open(&dir.0, uid().wrapping_add(1))
+            .err()
+            .unwrap();
+        assert!(err.detail.contains("owned by user"), "{}", err.detail);
+    }
+}
