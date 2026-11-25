@@ -24,8 +24,11 @@ pub(crate) enum Bucket {
 }
 
 impl Bucket {
-    pub fn of(req: &InboundRequest) -> Bucket {
-        match crate::compress::requested_encoding(req) {
+    /// The bucket of a visitor. `brotli` says the agent can make brotli itself: with it off, a
+    /// visitor who takes gzip is in the gzip bucket whatever else its list holds, which an
+    /// application that has no brotli can answer in.
+    pub fn of(req: &InboundRequest, brotli: bool) -> Bucket {
+        match crate::compress::requested_encoding(req, brotli) {
             Some(crate::compress::Encoding::Brotli) => Bucket::Brotli,
             Some(crate::compress::Encoding::Gzip) => Bucket::Gzip,
             None => Bucket::Identity,
@@ -113,21 +116,30 @@ pub(crate) fn forwarded_host(name: &[u8]) -> bool {
     same_name(name, b"x-forwarded-host")
 }
 
-/// `X-Forwarded-Host` and `X-Forwarded-Proto`, which the agent writes itself where it can.
-pub(crate) fn forwarded_host_or_proto(name: &[u8]) -> bool {
-    forwarded_host(name) || same_name(name, b"x-forwarded-proto")
+/// `X-Forwarded-Proto`, in any spelling a CGI parameter folds into it.
+pub(crate) fn forwarded_proto(name: &[u8]) -> bool {
+    same_name(name, b"x-forwarded-proto")
 }
 
-/// The scheme of the request: HTTPS when the agent ended TLS, else what `X-Forwarded-Proto` of a
-/// trusted proxy says (the first value, `https` only), else HTTP.
-pub(crate) fn is_https(req: &InboundRequest, trusted: bool) -> bool {
-    req.tls.is_some()
-        || (trusted
-            && req
-                .peek("X-Forwarded-Proto")
-                .split(|&c| c == b',')
-                .next()
-                .is_some_and(|first| first.trim_ascii().eq_ignore_ascii_case(b"https")))
+/// `X-Forwarded-Host` and `X-Forwarded-Proto`, which the agent writes itself where it can.
+pub(crate) fn forwarded_host_or_proto(name: &[u8]) -> bool {
+    forwarded_host(name) || forwarded_proto(name)
+}
+
+/// Whether the first value of the request's `X-Forwarded-Proto` is `https`.
+pub(crate) fn forwarded_https(req: &InboundRequest) -> bool {
+    req.peek("X-Forwarded-Proto")
+        .split(|&c| c == b',')
+        .next()
+        .is_some_and(|first| first.trim_ascii().eq_ignore_ascii_case(b"https"))
+}
+
+/// The scheme of the request: HTTPS when the agent ended TLS, else when `X-Forwarded-Proto` says
+/// `https`, else HTTP. The word of any peer counts: with no proxy trusted, the application still
+/// learns from a front proxy that the visitor came over TLS, and a spoofed value only chooses one
+/// of the two keys that a real one chooses too.
+pub(crate) fn is_https(req: &InboundRequest) -> bool {
+    req.tls.is_some() || forwarded_https(req)
 }
 
 /// `host` without a port that is the scheme's own.
@@ -398,6 +410,7 @@ mod tests {
             "X_Forwarded_PROTO",
         ] {
             assert!(!forwarded_host(name.as_bytes()), "{name}");
+            assert!(forwarded_proto(name.as_bytes()), "{name}");
             assert!(forwarded_host_or_proto(name.as_bytes()), "{name}");
         }
         for name in [
@@ -409,26 +422,25 @@ mod tests {
             "",
         ] {
             assert!(!forwarded_host_or_proto(name.as_bytes()), "{name}");
+            assert!(!forwarded_proto(name.as_bytes()), "{name}");
         }
     }
 
     #[test]
-    fn the_scheme_is_tls_then_a_trusted_proxys_word_then_http() {
-        let plain = request("");
-        assert!(!is_https(&plain, false) && !is_https(&plain, true));
+    fn the_scheme_is_tls_then_the_first_forwarded_proto_that_says_https_then_http() {
+        assert!(!is_https(&request("")));
         let said = request("X-Forwarded-Proto: HTTPS, http\r\n");
-        assert!(is_https(&said, true), "a trusted proxy says https");
-        assert!(
-            !is_https(&said, false),
-            "an untrusted peer's word is not taken"
-        );
-        assert!(!is_https(&request("X-Forwarded-Proto: ftp\r\n"), true));
-        let mut tls = request("");
+        assert!(is_https(&said) && forwarded_https(&said));
+        assert!(!is_https(&request("X-Forwarded-Proto: http, https\r\n")));
+        assert!(!is_https(&request("X-Forwarded-Proto: ftp\r\n")));
+        assert!(!is_https(&request("X-Forwarded-Proto: \r\n")));
+        let mut tls = request("X-Forwarded-Proto: http\r\n");
         tls.tls = Some(std::sync::Arc::new(crate::request::TlsClient {
             server_name: "app.test".into(),
             ja4: None,
         }));
-        assert!(is_https(&tls, false));
+        assert!(is_https(&tls), "TLS ended here, whatever a header says");
+        assert!(!forwarded_https(&tls));
     }
 
     #[test]

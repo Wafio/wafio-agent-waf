@@ -1471,3 +1471,64 @@ async fn with_one_disk_slot_a_burst_for_a_file_over_64_kib_is_served_from_the_fo
     }
     assert_eq!(up.count(), 0, "the application was not asked");
 }
+
+/// The `resp_headers` rules of an app: two headers added, one the folder sets removed.
+const HEADER_RULES: &[u8] = br#"{"resp_headers":{"add":{"Content-Security-Policy":"default-src 'self'","X-Frame-Options":"DENY"},"remove":["X-Content-Type-Options"]}}"#;
+
+fn rules_applied(r: &ReplyParts, what: &str) {
+    assert_eq!(
+        r.header("content-security-policy"),
+        Some("default-src 'self'"),
+        "{what}"
+    );
+    assert_eq!(r.header("x-frame-options"), Some("DENY"), "{what}");
+    assert_eq!(
+        r.header("x-content-type-options"),
+        None,
+        "{what}: the rule that removes a header applies too"
+    );
+}
+
+#[tokio::test]
+async fn the_response_header_rules_apply_to_every_answer_the_folder_gives() {
+    let dir = Dir::new("rules");
+    dir.file("public/hello.txt", b"hello, folder");
+    dir.file("public/docs/index.html", b"docs");
+    dir.pattern("public/mid.bin", MID);
+    dir.pattern("public/big.bin", (3 << 20) + 5);
+    let up = upstream().await;
+    let mut a = folder_app(free_port(), &up, &dir.path("public"), "not_found", 0);
+    a.proxy_config = HEADER_RULES.to_vec();
+    let (_h, addr) = Harness::serve(vec![a]);
+    let mut c = Client::connect(addr).await.unwrap();
+    // A file read whole, one over 64 KiB, one sent from its descriptor, and a part of each kind.
+    for (path, extra, status) in [
+        ("/hello.txt", &[][..], 200),
+        ("/mid.bin", &[][..], 200),
+        ("/big.bin", &[][..], 200),
+        ("/hello.txt", &["Range: bytes=0-4"][..], 206),
+        ("/big.bin", &["Range: bytes=10-99"][..], 206),
+        ("/hello.txt", &["Range: bytes=900-"][..], 416),
+        (
+            "/hello.txt",
+            &["If-Modified-Since: Fri, 01 Jan 2100 00:00:00 GMT"][..],
+            304,
+        ),
+        ("/docs", &[][..], 308),
+        ("/nothing.txt", &[][..], 404),
+    ] {
+        let r = c.send(&with(path, extra)).await.unwrap();
+        assert_eq!(r.status, status, "{path} {extra:?}");
+        rules_applied(&r, &format!("{path} {extra:?}"));
+    }
+    let head = head_of(&mut c, "/hello.txt", &[]).await;
+    rules_applied(&head, "HEAD");
+    // The `405` the folder gives to a method that is not `GET` or `HEAD`.
+    let post = c
+        .send(&request("POST", "/hello.txt", &["Content-Length: 0"]))
+        .await
+        .unwrap();
+    assert_eq!(post.status, 405);
+    rules_applied(&post, "405");
+    assert_eq!(up.count(), 0, "the application was not asked");
+}

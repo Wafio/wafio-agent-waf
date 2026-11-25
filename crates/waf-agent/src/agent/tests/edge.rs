@@ -838,22 +838,26 @@ fn a_folder_check_that_gets_no_answer_from_the_disk_is_refused_within_one_deadli
 }
 
 /// The control plane's cases for `static_files`. It sends the part in its normal form, so a case
-/// that passes is run with its `result`; a case it refuses must be `invalid` here too. What the
-/// disk says about a folder that does not exist is another matter (`root_missing`) and is not
-/// what these cases are about.
+/// that passes is run with its `result` and must not be `invalid` here. A case it refuses is
+/// refused here too: as `invalid` for a value that is out of range or not valid text, and as
+/// `root_forbidden` for the folder that holds system or WAFio files, which it says in its own
+/// sentence. What the disk says about a folder that does not exist is another matter
+/// (`root_missing`) and is not what these cases are about.
 #[test]
 fn the_static_files_cases_of_the_control_plane_get_the_same_answer() {
-    for case in delivery_cases("static_files", 15) {
+    use wafio_proxy::RefusalCode::{Invalid, RootForbidden, RootUnreadable};
+    const FORBIDDEN_FOLDER: &str = "This folder holds system or WAFio files.";
+    for case in delivery_cases("static_files", 31) {
         let name = case["name"].as_str().unwrap();
-        let refused = case.get("message").is_some();
-        let from = if refused {
+        let refused = case.get("message").and_then(|m| m.as_str());
+        let from = if refused.is_some() {
             &case["in"]
         } else {
             &case["result"]
         };
         let root = match from["root"].as_str().unwrap() {
             // A part that is off carries no folder, and the agent never gets it.
-            "" if !refused => "/srv/x",
+            "" if refused.is_none() => "/srv/x",
             root => root,
         };
         let got = wafio_proxy::StaticSpec::check(
@@ -861,12 +865,19 @@ fn the_static_files_cases_of_the_control_plane_get_the_same_answer() {
             from["missing"].as_str().unwrap(),
             from["max_age_s"].as_i64().unwrap(),
         );
-        let invalid = got
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.code == wafio_proxy::RefusalCode::Invalid);
-        assert_eq!(invalid, refused, "{name}: {got:?}");
+        let code = got.as_ref().err().map(|e| e.code);
+        match refused {
+            Some(message) if message.starts_with(FORBIDDEN_FOLDER) => {
+                assert_eq!(code, Some(RootForbidden), "{name}: {got:?}")
+            }
+            Some(_) => assert_eq!(code, Some(Invalid), "{name}: {got:?}"),
+            None => assert_ne!(code, Some(Invalid), "{name}: {got:?}"),
+        }
     }
+    // A kept name under /home passes the control plane and is the agent's to refuse: the unit hides
+    // /home, which is what the agent says first.
+    let hidden = wafio_proxy::StaticSpec::check("/home/deploy/private/site", "app", 0);
+    assert_eq!(hidden.err().map(|e| e.code), Some(RootUnreadable));
 }
 
 // The response cache.

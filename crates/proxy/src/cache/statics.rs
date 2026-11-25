@@ -58,7 +58,7 @@ pub(crate) fn static_memory(
         app: app.clone(),
         // With compression off every visitor gets the file as it is.
         bucket: if route.compression.is_some() {
-            Bucket::of(req)
+            Bucket::of(req, true)
         } else {
             Bucket::Identity
         },

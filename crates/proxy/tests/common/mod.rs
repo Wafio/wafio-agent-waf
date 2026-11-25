@@ -407,6 +407,16 @@ pub struct Fake {
 /// Minimal FastCGI responder: echoes stdin and the request id, `X-Conn: <connection number>`. It
 /// never closes a connection itself, so `open` falls only when the agent closes one.
 pub async fn fake_fcgi() -> (SocketAddr, Fake) {
+    fake_fcgi_with(
+        "Status: 201 Created\r\nX-Conn: {id}\r\nContent-Type: text/plain\r\n\r\n",
+        b"",
+    )
+    .await
+}
+
+/// [`fake_fcgi`] that answers with the CGI head `head` (`{id}` is the connection number) and then
+/// what it read from stdin and `body`.
+pub async fn fake_fcgi_with(head: &'static str, body: &'static [u8]) -> (SocketAddr, Fake) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let f = Fake::default();
@@ -442,11 +452,9 @@ pub async fn fake_fcgi() -> (SocketAddr, Fake) {
                         }
                     }
                     f3.params.lock().unwrap().push(decode_params(&params));
-                    let mut out = format!(
-                        "Status: 201 Created\r\nX-Conn: {id}\r\nContent-Type: text/plain\r\n\r\n"
-                    )
-                    .into_bytes();
+                    let mut out = head.replace("{id}", &id.to_string()).into_bytes();
                     out.extend_from_slice(&stdin);
+                    out.extend_from_slice(body);
                     let mut w = Vec::new();
                     for chunk in out.chunks(65535) {
                         w.extend_from_slice(&[

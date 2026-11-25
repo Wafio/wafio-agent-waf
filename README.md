@@ -817,6 +817,9 @@ rest of the bundle applies without it.
   and one that is cut short ends the connection, which is how the client learns the body is incomplete. The memory held for a
   download is one read buffer, so it does not follow the size of the file.
   A `HEAD` answer reads nothing, and says nothing of an encoding (a `GET` for the same file may be compressed).
+- The response header rules of the app (`resp_headers`) apply to every answer the folder gives: the file, a part of it, `304`, `308`,
+  `404`, `405`, `416` and `503`, and the files kept in memory (those are made without the rules, so a change to them is in the next
+  answer).
 - A decision event for the answer carries the verdict action and the status of the answer. A request that is blocked, or that a
   per-path rule blocks, is never answered from the folder.
 - Metrics: `wafio_waf_static_responses{status}` (`200`, `206`, `304`, `308`, `404`, `405`, `416`, `503`; a `404`, `405` or `503` is
@@ -841,8 +844,10 @@ window of its own. `disk_bytes` is 16 MiB to 1 TiB, `memory_bytes` 0 to 4 GiB,
 `max_object_bytes` 1 KiB to 64 MiB and no more than `disk_bytes`. `session_cookies` has up to 20 names of up to 64 characters
 without spaces, commas, semicolons or `=`. `rules` has up to 50 rules; a prefix starts with `/`, has at most 256 bytes and no space, `?`
 or `#`, and the longest prefix that matches the path decides. A `cache` rule keeps for `ttl_s` (1 second to 365 days) an answer that
-does not give its own lifetime, and with `signed_in` also for a signed-in visitor; a `bypass` rule sends the path to the application
-unread and unstored. The top-level `session_cookies` of the app entry holds more names of session cookies; it joins the list of
+does not give its own lifetime. With `signed_in` it also reads and fills copies for a signed-in visitor, and keeps the answer to a request
+with a cookie that is not on the session list although the answer does not say it is for everyone: a rule shares what it keeps between all
+visitors of its paths, so only a path that shows the same page to everyone should have it. A `bypass` rule sends the path to the
+application unread and unstored. The top-level `session_cookies` of the app entry holds more names of session cookies; it joins the list of
 `cache` and is read for compression too, with the cache off. A setting out of its range is refused with the code `invalid` and the name of
 the setting; the app keeps the settings it ran with.
 
@@ -873,15 +878,16 @@ on a full disk. An apply whose cache holds an index that is not built within thr
 static files and the application. A request with a `log` or `monitor` verdict, an `Upgrade`, a method other than `GET` and `HEAD`, a body, a
 length above 0 or `Transfer-Encoding` on a `GET`, `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (also with `_` for `-`, which
 a CGI parameter makes the same header), a path under a
-`bypass` rule, a path with `;` under any rule (`..;` is `..` to some servers), or a path that the app's `response_decrypt_aes` or
-`response_field_rules` rewrite goes to the application as it is, unread and unstored. Every answer of that path carries `X-Cache`: `HIT` (from
-a fresh copy), `STALE` (from a copy past its life, see below), `MISS` (asked the application, whether or not the answer was kept; a
-copy that the application confirmed with `304` is a `MISS` too, because it was asked), `BYPASS`; a file of the static folder is
-`BYPASS`. An answer from the block page, the main host redirect, the path-prefix 404 and a challenge has none.
+`bypass` rule, a path with `;` under any rule (`..;` is `..` to some servers), a path that the app's `response_decrypt_aes` or
+`response_field_rules` rewrite, or a visitor who is signed in (see "Signed in") goes to the application as it is, unread and unstored. Every
+answer of that path carries `X-Cache`: `HIT` (from a fresh copy), `STALE` (from a copy past its life, see below), `MISS` (asked the
+application, whether or not the answer was kept; a copy that the application confirmed with `304` is a `MISS` too, because it was asked),
+`BYPASS`. A file of the static folder carries `BYPASS` too, but no counter has it: it is neither answered from the cache nor passed on. An
+answer from the block page, the main host redirect, the path-prefix 404 and a challenge has none.
 
-**Key.** The scheme (HTTPS when the agent ended TLS, else the `X-Forwarded-Proto` of a proxy the app trusts, else HTTP), the host in lower case
+**Key.** The scheme (HTTPS when the agent ended TLS, else when the first value of the `X-Forwarded-Proto` of the peer is `https`, else HTTP), the host in lower case
 without the scheme's own port, the request target the application gets, byte for byte (`?a=1&b=2` and `?b=2&a=1` are two keys), and the encoding
-bucket (`br`, `gzip` or identity, from `Accept-Encoding` by the weights of "Compression"). The copy's own `Vary` names, up to four of at most 256
+bucket (`br`, `gzip` or identity, from `Accept-Encoding` by the weights of "Compression"; `br` only with compression on). The copy's own `Vary` names, up to four of at most 256
 bytes, add the values of those request headers (`Accept-Encoding` is the bucket); an answer that varies by `*`, `Cookie` or `Authorization`,
 or by more than that, is not kept. The SHA-256 of the whole key names the file and the file holds the key, which is compared when it is read.
 
@@ -889,26 +895,36 @@ or by more than that, is not kept. The SHA-256 of the whole key names the file a
 (`-For`, `-Host`, `-Proto`), `X-Original-*`, `X-Host`, `X-Rewrite-URL`, `Forwarded`, `Front-End-Https` and `X-Url-Scheme` is not sent to the
 application (HTTP and FastCGI), unless the peer is a proxy the route trusts (`trust_forwarded` and `trusted_proxies`): then they are sent
 and are part of the key, and a request with more than 256 bytes of them is not cached. A line of the client's for `X-Forwarded-Host` or
-`X-Forwarded-Proto`, in any spelling (`_` for `-` too), does not stay beside the agent's, and the scheme the application is told is the
-connection's. The host is always the agent's word: a FastCGI application is sent `X-Forwarded-Host` with the host of the request and never
-the client's or a proxy's, because the key does not hold what a proxy says there.
+`X-Forwarded-Proto`, in any spelling (`_` for `-` too), does not stay beside the agent's. The host is always the agent's word: a FastCGI
+application is sent `X-Forwarded-Host` with the host of the request and never the client's or a proxy's, because the key does not hold
+what a proxy says there. The scheme is the word of any peer, trusted or not, so that an application behind a proxy that ends TLS keeps
+being told so when the cache is turned on and no proxy is trusted: an untrusted peer's value is sent as the key reads it, `https` for a
+first value of `https` and otherwise `http` (nothing, for FastCGI), so a value of any other form cannot make a third kind of answer, and a
+spoofed `https` only chooses the key that real ones choose.
 
 **Signed in.** A request is signed in when it carries `Authorization`, the userinfo of an absolute-form target, or a cookie whose name,
 in any case, holds `sess` (`PHPSESSID`, `laravel_session`, `ASP.NET_SessionId`), starts with `wordpress_logged_in_`, `wp-postpass_`,
 `remember_web_`, `remember-me` or `.AspNetCore.`, is `JSESSIONID` or `connect.sid`, or is one of the names the app gave. Compression uses
-the same test. A signed-in request is answered from a copy when there is one, and makes none unless a rule with `signed_in` covers its path.
+the same test. A signed-in request is never answered from a copy and never makes one: it goes to the application with `X-Cache: BYPASS`, and
+counts as `bypass`. Only a `cache` rule with `signed_in` covers it: the request then reads and fills copies under that rule, as any
+visitor's does. A file of the static folder is the same for every visitor and is sent to a signed-in one as to any other.
 
 **What is kept.** An answer to a `GET` with no `Range`, with a status of 200, 203, 300, 301, 308, 404 or 410 and a lifetime: `s-maxage`, else
 `max-age`, else `Expires` minus `Date`, else the `ttl_s` of the rule, else `default_ttl_s` for a file type, at most 365 days (a 404 or 410 needs
 one of the first four, never the default). The request's own `Cache-Control` is ignored; the `Age` the application gave counts against the
 lifetime. Never kept: `Set-Cookie`, `private`, `no-store` and `no-cache` (with or without a field list), a `Cache-Control` that does not
 parse, more than 64 directives or a line over 4 KiB, a `Vary` as above, a body over `max_object_bytes`, a head over 64 KiB, an answer in
-an encoding other than the request's bucket (an application that compresses by itself with a coding the bucket does not name, such as
-zstd, is passed on and not kept), an answer sent in pieces without a length, an answer to a request with a cookie unless it says `public`
-or `s-maxage`, is of a file type or a rule covers the path, and an answer to a signed-in request without a rule for them. The stored head is
+an encoding other than the request's bucket (see below), an answer sent in pieces without a length, and an answer to a request with a cookie that
+is not on the session list unless the answer says `public` or has `s-maxage` or is of a file type; a rule alone does not allow it, as the cookie may
+hold a login the agent cannot see, and only a rule with `signed_in` does. A request that may fill goes to the application with `Accept-Encoding` set to
+the one coding of its bucket (`br` or `gzip`), or `identity`, in place of the visitor's list, so an application that compresses by itself answers in it.
+With compression on, the bucket of a visitor who takes brotli is `br` (`gzip, deflate, br, zstd` is that bucket) and the agent makes `br` or `gzip`
+of an answer that comes plain. With compression off the agent makes nothing, and `br` is no bucket, as many applications that compress by themselves
+have gzip and no brotli: a visitor who takes gzip is in the `gzip` bucket, whatever else its list names, one who takes only brotli in the identity
+bucket, and the application's own gzip answer is the copy. An application that answers in another coding anyway is passed on and not kept (it has no counter). The stored head is
 what the application said without the headers of the connection (`Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`,
 `Upgrade`), `Date`, `Age` and `X-Cache`, with compression's changes: compression runs before the copy is made, so each bucket has its own copy.
-The response header rules (`resp_headers`) run on every answer as it is sent, copies included, so a change to them reaches stored
+The response header rules (`resp_headers`) run on every answer as it is sent, FastCGI pages and copies included, so a change to them reaches stored
 copies at once. The copy is written behind the answer: the visitor does not wait for the disk.
 
 **A copy that is fresh** is sent with `Age` (the age the application gave plus the time here). `HEAD` is answered from the copy of a `GET`.
@@ -918,18 +934,21 @@ does not parse give the whole copy), and `If-Range` keeps the range only for the
 with a `Range` is looked up and never makes a copy. A 2xx or 3xx answer to `POST`, `PUT`, `PATCH` or `DELETE` ends the copies of the same
 URL, in every encoding and variant, before the answer goes on.
 
-**One fetch at a time.** A request that may fill (a `GET` with no `Range` from a visitor who is not signed in, or one a rule opens to the
-signed in) and finds no copy takes the lock of its key; every other request for that key waits for it up to 5 seconds and looks again, so
+**One fetch at a time.** A request that may fill (a `GET` with no `Range`) and finds no copy takes the lock of its key; every other request for that key waits for it up to 5 seconds and looks again, so
 100 requests for a page that has no copy make one request to the application. The key is the primary key (scheme, host, target, bucket), as the
-`Vary` names are not known before an answer. A request waits too when it cannot fill itself (a signed-in visitor, a `HEAD`, a `Range`), and is
-answered from the copy that comes in. The lock is taken once the folder of static files has not answered the request, so files do not queue.
-When the fetch ends with no copy made, every waiter is woken at once and goes to the application in parallel, and the key is marked as not kept
-for 30 seconds (the `max-age` of an answer that is `private` or `no-store`, at most 10 minutes), so the next requests take no lock. The marks
+`Vary` names are not known before an answer. A request waits too when it cannot fill itself (a `HEAD` or a `Range`), and is
+answered from the copy that comes in. A visitor who is signed in does not wait: the application is theirs. The lock is taken once the folder of static files has not answered the request, so files do not queue.
+When the fetch ends with no copy made, every waiter is woken at once and the key is marked as not kept
+for 30 seconds (the `max-age` of an answer that is `private` or `no-store`, at most 10 minutes), so the next requests take no lock, and the
+waiters go to the application in parallel. The marks
 are for an answer with no lifetime, a `Set-Cookie`, `private`, `no-store` or `no-cache`, a `Vary` that cannot be kept, an unparsed
 `Cache-Control`, a status that is not kept (not a 5xx, which may pass, and not a `304` or `412`, which answer a condition and say nothing of the
 page), an answer over `max_object_bytes`, an encoding the bucket does not name, and one sent in pieces. A refusal that depends on the visitor (a
-request with a cookie that gets an answer that is not marked public) does not mark. A process that cannot store (a reload's successor) takes no
-lock. A purge clears the marks.
+request with a cookie that gets an answer that is not marked public) does not mark: it says nothing of the page, which another visitor may
+get a copy of. The waiters of such a fetch are woken, one of them takes the lock in its place and the others wait for it once more (up to 5
+seconds again), so one visitor with a cookie that leads does not release the queue. If that second fetch ends with no copy too, the rest go
+on in parallel. A wait that ran out is not repeated. A process that cannot store (a
+reload's successor) takes no lock. A purge clears the marks.
 
 **A copy that is past its life** is read and used in this order. Within the `stale-while-revalidate` of its answer it is sent at once as `STALE`
 and one request in the background (the lock again, so one at a time) fetches the page and makes the copy fresh; only a request that may fill
@@ -937,7 +956,9 @@ starts it. Past that, a request that may fill and finds a copy with an `ETag` or
 with `If-None-Match` and `If-Modified-Since` of the copy in place of the visitor's own conditions, and a `304` renews the copy with the headers
 it carries (not `Content-Type`, `Content-Encoding`, `Content-Length`, `Content-Range`, `Transfer-Encoding` or `Vary`) and its new lifetime; it is the
 answer, as `MISS`. A `200` is a new answer and replaces the copy as any other. A `304` that sets a cookie, or whose new headers say the answer is
-not to be kept, removes the copy; the visitor still gets the answer with the cookie. A request that may fill goes to the application with none of the
+not to be kept, removes the copy; the visitor still gets the answer with the cookie. A `304` that is refused only for the cookie of the request
+(not on the session list, and the answer is not marked public) leaves the copy as it is, neither renewed nor removed: the cookie says nothing
+of the page, and the next visitor without it confirms the copy. A request that may fill goes to the application with none of the
 visitor's own `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since` and `If-Range`: the application is asked for the page to keep,
 and a `304` or `412` for the visitor's condition would be no page. The answer is then held against the visitor's `If-None-Match` and
 `If-Modified-Since` as a copy's is: `304` when the visitor holds that page, else the whole page. A request that cannot fill goes on as it is, with no question of the cache's and with its own conditions. When the
@@ -1002,9 +1023,10 @@ the apps that have a part on again, with fresh counters; it does not repeat the 
 and the agent sends the sum of the buckets still inside the hour, not a total since start. An app that leaves the bundle gets no
 status.
 
-The cache of an app that runs (`applied`, or `refused` with `running_previous`) also carries `EdgeCacheCounters`: `requests` (every answer that
-carried an `X-Cache`), `hits_memory`, `hits_disk`, `misses`, `bypass`, `stale`, `stored`, `skipped_no_lifetime`, `skipped_private` (an answer that was
-private or a signed-in visitor's), `skipped_too_large`, `skipped_streamed`, `skipped_disk_full`, `evictions` and `corrupt`, all over the last hour, and the
+The cache of an app that runs (`applied`, or `refused` with `running_previous`) also carries `EdgeCacheCounters`: `requests` (every answer of the cache or the
+application that carried an `X-Cache`, not a file of the static folder), `hits_memory`, `hits_disk`, `misses`, `bypass` (a request that was not looked up: a body, another
+method, a `log` or `monitor` verdict, a path under a `bypass` rule or a signed-in visitor), `stale`, `stored`, `skipped_no_lifetime`, `skipped_private` (an answer that was
+private, or that went to a visitor with a cookie and was not marked public), `skipped_too_large`, `skipped_streamed`, `skipped_disk_full`, `evictions` and `corrupt`, all over the last hour, and the
 gauges `disk_bytes`, `memory_bytes` and `objects`. When the cache directory cannot be used every app gets `cache` `refused` `cache_dir_unusable`,
 whether its cache is on or off; the agent sends the Hello feature `edge_cache` all the same.
 

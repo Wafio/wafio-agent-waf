@@ -52,8 +52,9 @@ impl Encoding {
 
 /// What the visitor takes: brotli when its weight is the highest (a tie goes to brotli) and above
 /// 0, else gzip when its weight is above 0, else nothing. `*` is the weight of a coding the list
-/// does not name. A weight that does not parse counts as 0.
-pub(crate) fn negotiate(accept: &[u8]) -> Option<Encoding> {
+/// does not name. A weight that does not parse counts as 0. With `brotli_allowed` false brotli is
+/// left out: gzip when its weight is above 0, else nothing.
+pub(crate) fn negotiate(accept: &[u8], brotli_allowed: bool) -> Option<Encoding> {
     let accept = &accept[..accept.len().min(ACCEPT_ENCODING_BYTES)];
     let (mut brotli, mut gzip, mut star) = (None, None, None);
     for token in accept.split(|&c| c == b',').take(ACCEPT_ENCODING_TOKENS) {
@@ -68,7 +69,11 @@ pub(crate) fn negotiate(accept: &[u8]) -> Option<Encoding> {
             star = Some(q);
         }
     }
-    let brotli = brotli.or(star).unwrap_or(0);
+    let brotli = if brotli_allowed {
+        brotli.or(star).unwrap_or(0)
+    } else {
+        0
+    };
     let gzip = gzip.or(star).unwrap_or(0);
     if brotli > 0 && brotli >= gzip {
         Some(Encoding::Brotli)
@@ -181,11 +186,12 @@ fn encoding_for(
     {
         return None;
     }
-    requested_encoding(req)
+    requested_encoding(req, true)
 }
 
-/// The encoding the visitor takes, from every `Accept-Encoding` line of the request.
-pub(crate) fn requested_encoding(req: &InboundRequest) -> Option<Encoding> {
+/// The encoding the visitor takes, from every `Accept-Encoding` line of the request; `brotli` false
+/// leaves brotli out (see [`negotiate`]).
+pub(crate) fn requested_encoding(req: &InboundRequest, brotli: bool) -> Option<Encoding> {
     let accept: Vec<u8> = req
         .lines
         .iter()
@@ -193,7 +199,7 @@ pub(crate) fn requested_encoding(req: &InboundRequest) -> Option<Encoding> {
         .map(|(_, value)| value.as_slice())
         .collect::<Vec<_>>()
         .join(&b',');
-    negotiate(&accept)
+    negotiate(&accept, brotli)
 }
 
 /// `Vary: Accept-Encoding`, merged into what the answer already varies by (not into `*`).
@@ -380,7 +386,25 @@ mod tests {
             ("gzip; Q=0.5", Some(Gzip)),
             ("gzip;q = 0", None),
         ] {
-            assert_eq!(negotiate(accept.as_bytes()), want, "{accept:?}");
+            assert_eq!(negotiate(accept.as_bytes(), true), want, "{accept:?}");
+        }
+    }
+
+    #[test]
+    fn with_brotli_left_out_the_visitor_gets_gzip_when_it_takes_gzip_at_all() {
+        use Encoding::Gzip;
+        for (accept, want) in [
+            ("gzip, deflate, br, zstd", Some(Gzip)),
+            ("br;q=0.9, gzip;q=0.1", Some(Gzip)),
+            ("gzip", Some(Gzip)),
+            ("*", Some(Gzip)),
+            ("br", None),
+            ("br, gzip;q=0", None),
+            ("*;q=0, br", None),
+            ("identity", None),
+            ("", None),
+        ] {
+            assert_eq!(negotiate(accept.as_bytes(), false), want, "{accept:?}");
         }
     }
 
@@ -390,22 +414,28 @@ mod tests {
         let mut tokens: Vec<String> = (0..15).map(|i| format!("{padding}{i}")).collect();
         tokens.push("deflate".into());
         let sixteen = tokens.join(", ");
-        assert_eq!(negotiate(format!("{sixteen}, gzip").as_bytes()), None);
+        assert_eq!(negotiate(format!("{sixteen}, gzip").as_bytes(), true), None);
         assert_eq!(
-            negotiate(format!("{}, gzip", tokens[..15].join(", ")).as_bytes()),
+            negotiate(
+                format!("{}, gzip", tokens[..15].join(", ")).as_bytes(),
+                true
+            ),
             Some(Encoding::Gzip)
         );
         let blanks = " ".repeat(ACCEPT_ENCODING_BYTES);
-        assert_eq!(negotiate(format!("{blanks}gzip").as_bytes()), None);
+        assert_eq!(negotiate(format!("{blanks}gzip").as_bytes(), true), None);
         assert_eq!(
-            negotiate(format!("{}gzip", " ".repeat(ACCEPT_ENCODING_BYTES - 4)).as_bytes()),
+            negotiate(
+                format!("{}gzip", " ".repeat(ACCEPT_ENCODING_BYTES - 4)).as_bytes(),
+                true
+            ),
             Some(Encoding::Gzip)
         );
         // A token cut by the limit is read as far as it goes: `gzip;q=0.` is a weight of 0.
         let cut = format!("{}gzip;q=0.5", " ".repeat(ACCEPT_ENCODING_BYTES - 9));
-        assert_eq!(negotiate(cut.as_bytes()), None);
+        assert_eq!(negotiate(cut.as_bytes(), true), None);
         let name_cut = format!("{}gzip", " ".repeat(ACCEPT_ENCODING_BYTES - 2));
-        assert_eq!(negotiate(name_cut.as_bytes()), None);
+        assert_eq!(negotiate(name_cut.as_bytes(), true), None);
     }
 
     #[test]

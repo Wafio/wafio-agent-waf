@@ -4,4 +4,4 @@ path: shared/proto/agent/v1/agent_control.proto
 tag: shared/v0.4.0
 sha256: 0d42f14d62f2acff92e5e11a3e4095b013a742d5aad2dafb941da02e325cbf63
 fixture: trace-keep-names.json 182d698408e0b7ef392f48518aeade99dbf9b54a1caf734e589d72648d00290c
-fixture: delivery-checks.json 23ff02251b642c72aa92d27ca13b9281b7c49b8fe2c335251066f92678d8bb71
+fixture: delivery-checks.json ad54e08f8647e90597ce65fa0ad6f3a258c95c89f392932677404799ddeb75c2

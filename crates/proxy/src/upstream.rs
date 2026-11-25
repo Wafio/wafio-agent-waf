@@ -261,15 +261,20 @@ pub(crate) fn upstream_request(
         }
     }
     u.set(b"X-Forwarded-Host", &req.host);
-    let proto = if untrusted {
-        &[][..]
-    } else {
-        req.peek("X-Forwarded-Proto")
-    };
+    let proto = req.peek("X-Forwarded-Proto");
     u.set(
         b"X-Forwarded-Proto",
         if req.tls.is_some() {
             b"https"
+        } else if untrusted {
+            // The scheme as the key reads it, so that a value of any other form cannot make a
+            // third kind of answer: the application learns that a front proxy ended TLS, and
+            // nothing else a peer might write there.
+            if crate::cache::forwarded_https(req) {
+                b"https"
+            } else {
+                b"http"
+            }
         } else if proto.is_empty() {
             b"http"
         } else {
