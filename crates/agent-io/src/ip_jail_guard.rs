@@ -29,6 +29,9 @@ pub const JAIL_EXEMPT_TRUSTED_PROXY: &str = "trusted_proxy";
 /// The client address came from forwarded headers, not the TCP peer
 /// the XDP jail would act on.
 pub const JAIL_EXEMPT_FORWARDED: &str = "forwarded";
+/// The client address came from forwarded headers and the TCP peer is not this host, so
+/// a kernel block target cannot trust it.
+pub const JAIL_EXEMPT_FORWARDED_REMOTE_PEER: &str = "forwarded_remote_peer";
 
 static EXEMPTION_COUNTS: Mutex<BTreeMap<String, Arc<AtomicU64>>> = Mutex::new(BTreeMap::new());
 

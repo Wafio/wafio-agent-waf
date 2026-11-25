@@ -45,6 +45,16 @@ pub struct BlockPolicyConfig {
     pub block_duration_sec: i64,
     pub key_field: String,
     pub key_fields: Vec<String>,
+    /// Where a block window applies: "waf" (or empty) = this agent only, "kernel" = also the host
+    /// firewall (the host agent's XDP jail).
+    pub target: String,
+}
+
+impl BlockPolicyConfig {
+    /// The block window also reaches the host firewall.
+    pub fn targets_kernel(&self) -> bool {
+        self.target == "kernel"
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1366,6 +1376,7 @@ fn read_rule_map_json(data: &[u8]) -> Result<LoadResult, JsonDecodeError> {
                     "block_duration_sec",
                     "key_field",
                     "key_fields",
+                    "target",
                 ],
                 |d, i, v| {
                     match i {
@@ -1373,7 +1384,8 @@ fn read_rule_map_json(data: &[u8]) -> Result<LoadResult, JsonDecodeError> {
                         1 => json_decode::int(d, v, &mut b.block_after_n_blocks),
                         2 => json_decode::int(d, v, &mut b.block_duration_sec),
                         3 => json_decode::string(d, v, &mut b.key_field),
-                        _ => json_decode::strings(d, v, &mut b.key_fields)?,
+                        4 => json_decode::strings(d, v, &mut b.key_fields)?,
+                        _ => json_decode::string(d, v, &mut b.target),
                     }
                     Ok(())
                 },
@@ -1952,6 +1964,11 @@ fn validation_error(s: impl Into<String>) -> JsonDecodeError {
 fn check_load_result(r: &LoadResult, raw: &[u8]) -> Result<(), JsonDecodeError> {
     const MAX_BODY_BYTES: i64 = 1024 * 1024 * 1024;
     if let Some(bp) = &r.block_policy {
+        if !["", "waf", "kernel"].contains(&bp.target.as_str()) {
+            return Err(validation_error(
+                "block_policy.target must be waf or kernel",
+            ));
+        }
         if !(1..=999).contains(&bp.block_after_n_blocks) {
             return Err(validation_error(
                 "block_policy.block_after_n_blocks must be 1–999",
@@ -2638,6 +2655,49 @@ mod tests {
             ("a/..", "."),
         ] {
             assert_eq!(normalize_path(i.as_bytes()), w.as_bytes(), "{i}");
+        }
+    }
+
+    fn block_policy_target(target: &str) -> BlockPolicyConfig {
+        let doc = format!(r#"{{"block_policy":{{"enabled":true{target}}}}}"#);
+        load_rules_json(doc.as_bytes())
+            .unwrap()
+            .block_policy
+            .unwrap()
+    }
+
+    #[test]
+    fn block_policy_target_defaults_to_waf() {
+        for t in [
+            "",
+            r#","target":"""#,
+            r#","target":null"#,
+            r#","target":"waf""#,
+        ] {
+            let bp = block_policy_target(t);
+            assert!(!bp.targets_kernel(), "{t}");
+            assert!(
+                check_rules_json(format!(r#"{{"block_policy":{{"enabled":true{t}}}}}"#).as_bytes())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn block_policy_target_kernel_is_read() {
+        assert!(block_policy_target(r#","target":"kernel""#).targets_kernel());
+    }
+
+    #[test]
+    fn block_policy_target_other_values_are_refused() {
+        for t in ["Kernel", "host", "kernel ", "xdp"] {
+            let doc = format!(r#"{{"block_policy":{{"enabled":true,"target":"{t}"}}}}"#);
+            let e = check_rules_json(doc.as_bytes()).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("block_policy.target must be waf or kernel"),
+                "{t}: {e}"
+            );
         }
     }
 

@@ -320,6 +320,24 @@ fn detect(
         dreq.client_forwarded,
         remote,
     );
+    // A block window of a kernel-target policy also reaches the host firewall, in block mode only.
+    if verdict.action == "block"
+        && route.mode == "block"
+        && let Some(until) = verdict.block_until
+        && exec
+            .analyze
+            .block_policy
+            .as_ref()
+            .is_some_and(|bp| bp.enabled && bp.targets_kernel())
+    {
+        wafio_agent_io::ip_jail::report_kernel_block_to_jail(
+            exec.jail.as_deref(),
+            until,
+            dreq.client_forwarded,
+            peer.is_loopback(),
+            remote,
+        );
+    }
     Detection {
         body: dreq.content_scan_body.take().unwrap_or_default(),
         raw_ct,
