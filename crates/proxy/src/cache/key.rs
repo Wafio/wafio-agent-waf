@@ -24,8 +24,11 @@ pub(crate) enum Bucket {
 }
 
 impl Bucket {
-    pub fn of(req: &InboundRequest) -> Bucket {
-        match crate::compress::requested_encoding(req) {
+    /// The bucket of a visitor. `brotli` says the agent can make brotli itself: with it off, a
+    /// visitor who takes gzip is in the gzip bucket whatever else its list holds, which an
+    /// application that has no brotli can answer in.
+    pub fn of(req: &InboundRequest, brotli: bool) -> Bucket {
+        match crate::compress::requested_encoding(req, brotli) {
             Some(crate::compress::Encoding::Brotli) => Bucket::Brotli,
             Some(crate::compress::Encoding::Gzip) => Bucket::Gzip,
             None => Bucket::Identity,

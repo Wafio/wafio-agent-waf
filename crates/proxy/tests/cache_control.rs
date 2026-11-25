@@ -13,9 +13,11 @@ use std::time::{Duration, Instant};
 
 use cache_site::*;
 use common::*;
-use wafio_proxy::{CacheHost, CacheSpec, CompressionSpec, PurgeError, PurgeScope};
+use wafio_proxy::{CacheHost, CacheRule, CacheSpec, CompressionSpec, PurgeError, PurgeScope};
 
 const SECOND: Duration = Duration::from_millis(2100);
+/// Past a life of two seconds, whatever fraction of a second the copy was made at.
+const THREE_SECONDS: Duration = Duration::from_millis(3100);
 
 /// An answer the application numbers, with the `Cache-Control` of `control`.
 fn numbered(control: &'static str) -> impl Fn(&Seen) -> (Vec<u8>, bool) + Send + Sync + 'static {
@@ -283,17 +285,62 @@ async fn an_answer_that_is_not_kept_marks_its_key_but_an_error_of_the_applicatio
     }
 }
 
+/// A spec with one rule for every path, keeping an answer that says nothing of its life for ten
+/// minutes, for visitors who are not signed in.
+fn keeping_everything() -> CacheSpec {
+    CacheSpec {
+        rules: vec![CacheRule {
+            prefix: "/".into(),
+            bypass: false,
+            ttl_s: 600,
+            signed_in: false,
+        }],
+        ..spec()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lead_whose_answer_is_refused_for_its_cookie_hands_the_turn_to_one_waiter() {
+    let (up, _) = slow_upstream(Duration::from_millis(300), |seen| {
+        reply_to(seen, "200 OK", "Content-Type: text/html\r\n", b"the page")
+    })
+    .await;
+    let s = site(up, keeping_everything(), |_| {}).await;
+    let addr = s.addr;
+    // The visitor who leads carries an analytics cookie: the page is not marked public, so its
+    // answer is not kept, and the key is not marked because the refusal is about the visitor.
+    let lead =
+        tokio::spawn(async move { one(addr, &with("/p", &["Cookie: _ga=GA1.1.1.1"])).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waiters = burst(addr, 10, get("/p")).await;
+    assert_eq!(x_cache(&lead.await.unwrap()), "MISS");
+    assert_eq!(
+        s.up.count(),
+        2,
+        "the lead's request and the one of the waiter that took its place"
+    );
+    assert_eq!(labelled(&waiters, "MISS"), 1);
+    assert_eq!(
+        labelled(&waiters, "HIT"),
+        9,
+        "the others waited for its copy"
+    );
+    assert!(waiters.iter().all(|r| r.text() == "the page"));
+}
+
 // A copy that is past its life.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stale_copy_is_sent_at_once_and_one_fetch_in_the_background_makes_it_fresh() {
-    let s = numbering("public, max-age=1, stale-while-revalidate=60", spec()).await;
+    // A life of two seconds: the copy that the refresh makes stays fresh for at least one, whatever
+    // fraction of a second it was made at, so a busy host does not turn the last look into a miss.
+    let s = numbering("public, max-age=2, stale-while-revalidate=60", spec()).await;
     let first = fetch(s.addr, &get("/a")).await;
     assert_eq!(
         (x_cache(&first), first.text().as_str()),
         ("MISS", "answer 1")
     );
-    tokio::time::sleep(SECOND).await;
+    tokio::time::sleep(THREE_SECONDS).await;
     let replies = burst(s.addr, 5, get("/a")).await;
     assert!(
         replies
@@ -353,13 +400,15 @@ async fn a_request_that_cannot_fill_gets_a_stale_copy_and_starts_no_refresh() {
 async fn the_refresh_in_the_background_does_not_replay_the_conditions_of_the_visitor() {
     // The copy has no tag and no date, so there is nothing to ask about; the visitor's own
     // condition is not the cache's question.
-    let s = numbering("public, max-age=1, stale-while-revalidate=60", spec()).await;
+    let s = numbering("public, max-age=2, stale-while-revalidate=60", spec()).await;
     assert_eq!(x_cache(&fetch(s.addr, &get("/a")).await), "MISS");
-    tokio::time::sleep(SECOND).await;
+    tokio::time::sleep(THREE_SECONDS).await;
     let r = one(s.addr, &with("/a", &["If-None-Match: *"])).await;
     assert_eq!((r.status, x_cache(&r)), (304, "STALE"));
     assert!(until(|| s.up.count() >= 2).await, "the refresh was made");
     assert!(s.up.last().header("if-none-match").is_none());
+    // The copy is written after the answer of the refresh is read, which a busy host can delay.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     copies_written(s.addr).await;
     let fresh = fetch(s.addr, &get("/a")).await;
     assert_eq!(
@@ -448,7 +497,7 @@ async fn an_answer_that_changed_replaces_the_copy_and_a_last_modified_asks_too()
             reply_to(
                 seen,
                 "200 OK",
-                "Content-Type: text/html\r\nCache-Control: public, max-age=1\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n",
+                "Content-Type: text/html\r\nCache-Control: public, max-age=2\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n",
                 format!("version {i}").as_bytes(),
             ),
             false,
@@ -457,7 +506,7 @@ async fn an_answer_that_changed_replaces_the_copy_and_a_last_modified_asks_too()
     .await;
     let s = site(up, spec(), |_| {}).await;
     assert_eq!(fetch(s.addr, &get("/a")).await.text(), "version 1");
-    tokio::time::sleep(SECOND).await;
+    tokio::time::sleep(THREE_SECONDS).await;
     let r = fetch(s.addr, &get("/a")).await;
     assert_eq!((x_cache(&r), r.text().as_str()), ("MISS", "version 2"));
     let asked = s.up.last();
@@ -510,6 +559,100 @@ async fn a_cookie_on_the_304_reaches_the_visitor_and_leaves_no_copy() {
     assert_eq!(held.status, 304);
     assert_eq!(held.header("set-cookie"), Some("sid=renewed; Path=/"));
     assert!(answer_files(&s.dir.0).is_empty());
+}
+
+/// An application that gives a page an `ETag` and no word of its life (a rule gives it one), and
+/// says `304` to that tag, with `control` as the `Cache-Control` of both answers when it is not
+/// empty.
+async fn tagging(control: &'static str) -> TestUpstream {
+    raw_upstream(move |seen| {
+        let extra = if control.is_empty() {
+            String::new()
+        } else {
+            format!("Cache-Control: {control}\r\n")
+        };
+        if seen.header("if-none-match") == Some("\"v1\"") {
+            return (
+                format!("HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n{extra}\r\n").into_bytes(),
+                false,
+            );
+        }
+        (
+            reply_to(
+                seen,
+                "200 OK",
+                &format!("Content-Type: text/html\r\nETag: \"v1\"\r\n{extra}"),
+                b"page",
+            ),
+            false,
+        )
+    })
+    .await
+}
+
+fn two_second_rule() -> CacheSpec {
+    CacheSpec {
+        rules: vec![CacheRule {
+            prefix: "/".into(),
+            bypass: false,
+            ttl_s: 2,
+            signed_in: false,
+        }],
+        ..spec()
+    }
+}
+
+#[tokio::test]
+async fn a_304_to_a_visitor_with_a_cookie_leaves_the_copy_as_it_is() {
+    let s = site(tagging("").await, two_second_rule(), |_| {}).await;
+    assert_eq!(x_cache(&fetch(s.addr, &get("/a")).await), "MISS");
+    let files = answer_files(&s.dir.0);
+    assert_eq!(files.len(), 1);
+    tokio::time::sleep(THREE_SECONDS).await;
+    // The copy is past its life and a visitor with only an analytics cookie comes. The application
+    // confirms the copy, and the cookie keeps the answer from being renewed: the page is not
+    // marked public. The copy is not the visitor's, so it is not removed either.
+    let r = fetch(s.addr, &with("/a", &["Cookie: _ga=GA1.1.1.1"])).await;
+    assert_eq!(
+        (r.status, x_cache(&r), r.text().as_str()),
+        (200, "MISS", "page")
+    );
+    assert_eq!(s.up.count(), 2);
+    assert_eq!(answer_files(&s.dir.0), files, "the copy is still there");
+    // The next visitor with no cookie confirms it and renews it, which a removed copy could not.
+    let next = fetch(s.addr, &get("/a")).await;
+    assert_eq!(
+        (x_cache(&next), next.text().as_str()),
+        ("MISS", "page"),
+        "the application was asked"
+    );
+    assert_eq!(s.up.last().all("if-none-match"), ["\"v1\""]);
+    assert_eq!(s.up.count(), 3);
+    let hit = fetch(s.addr, &get("/a")).await;
+    assert_eq!((x_cache(&hit), s.up.count()), ("HIT", 3));
+    assert_eq!(answer_files(&s.dir.0), files);
+}
+
+#[tokio::test]
+async fn a_refresh_in_the_background_for_a_visitor_with_a_cookie_leaves_the_copy_too() {
+    let s = site(
+        tagging("max-age=1, stale-while-revalidate=60").await,
+        spec(),
+        |_| {},
+    )
+    .await;
+    assert_eq!(x_cache(&fetch(s.addr, &get("/a")).await), "MISS");
+    tokio::time::sleep(SECOND).await;
+    // The stale copy is sent at once and the page is asked about in the background.
+    let r = one(s.addr, &with("/a", &["Cookie: _ga=GA1.1.1.1"])).await;
+    assert_eq!((x_cache(&r), r.text().as_str()), ("STALE", "page"));
+    assert!(until(|| s.up.count() == 2).await, "the refresh asked");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The `304` was refused for the cookie, which leaves the copy as it was: still past its life,
+    // so the next visitor is sent it as stale again. A removed copy would be a miss.
+    let next = one(s.addr, &get("/a")).await;
+    assert_eq!((x_cache(&next), next.text().as_str()), ("STALE", "page"));
+    assert_eq!(answer_files(&s.dir.0).len(), 1);
 }
 
 #[tokio::test]

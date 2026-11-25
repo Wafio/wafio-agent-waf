@@ -44,6 +44,15 @@ struct Site {
 }
 
 fn site(spec: Option<CacheSpec>, proxy_config: &str, session: &[&str]) -> Site {
+    site_compressing(spec, proxy_config, session, None)
+}
+
+fn site_compressing(
+    spec: Option<CacheSpec>,
+    proxy_config: &str,
+    session: &[&str],
+    compression: Option<crate::config::CompressionSpec>,
+) -> Site {
     let dir = Dir::new();
     let host = CacheHost::open(&dir.0, nix::unistd::geteuid().as_raw()).unwrap();
     let mut route = build_route(&AppSpec {
@@ -60,7 +69,7 @@ fn site(spec: Option<CacheSpec>, proxy_config: &str, session: &[&str]) -> Site {
         maintenance: Vec::new(),
         analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
         tls: None,
-        compression: None,
+        compression,
         static_files: None,
         cache: spec,
         session_cookies: session.iter().map(|s| (*s).to_owned()).collect(),
@@ -548,6 +557,17 @@ fn decided(
     decide(settings, &ask(planned(&s, req)), req, resp, NOW)
 }
 
+/// [`decided`] for an app whose agent compresses, so that `br` is a bucket.
+fn decided_compressing(req: &InboundRequest, resp: &OutboundResponse) -> Result<Prepared, NotKept> {
+    let s = site_compressing(
+        Some(CacheSpec::default()),
+        "",
+        &[],
+        Some(crate::config::CompressionSpec { min_bytes: 100 }),
+    );
+    decide(&settings(), &ask(planned(&s, req)), req, resp, NOW)
+}
+
 fn kept(headers: &[(&str, &str)]) -> Result<Prepared, NotKept> {
     decided(&settings(), &get("/p", ""), &answer(200, headers, b"body"))
 }
@@ -805,7 +825,46 @@ fn an_answer_in_an_encoding_other_than_the_buckets_is_not_kept() {
         encoded("gzip", &get("/p", "")).err(),
         Some(NotKept::Encoding)
     );
-    assert!(encoded("br", &get("/p", "Accept-Encoding: br\r\n")).is_ok());
+    // Without compression of its own the agent asks for gzip at most, so no browser is in the `br`
+    // bucket and an answer in `br` is not the one it asked for.
+    assert_eq!(
+        encoded("br", &get("/p", "Accept-Encoding: gzip, br\r\n")).err(),
+        Some(NotKept::Encoding)
+    );
+    let brotli = get("/p", "Accept-Encoding: gzip, br\r\n");
+    let packed = answer(200, &[PUBLIC, ("Content-Encoding", "br")], b"x");
+    assert!(decided_compressing(&brotli, &packed).is_ok());
+    assert_eq!(
+        decided_compressing(&get("/p", "Accept-Encoding: gzip\r\n"), &packed).err(),
+        Some(NotKept::Encoding)
+    );
+}
+
+#[test]
+fn the_bucket_is_br_only_when_the_agent_compresses_and_gzip_when_the_visitor_takes_it() {
+    use key::Bucket::{Brotli, Gzip, Identity};
+    let off = site(Some(CacheSpec::default()), "", &[]);
+    let on = site_compressing(
+        Some(CacheSpec::default()),
+        "",
+        &[],
+        Some(crate::config::CompressionSpec { min_bytes: 100 }),
+    );
+    for (accept, without, with) in [
+        ("gzip, deflate, br, zstd", Gzip, Brotli),
+        ("br;q=0.9, gzip;q=0.1", Gzip, Brotli),
+        ("gzip", Gzip, Gzip),
+        ("br", Identity, Brotli),
+        ("br, gzip;q=0", Identity, Brotli),
+        ("zstd", Identity, Identity),
+        ("", Identity, Identity),
+    ] {
+        let req = get("/p", &format!("Accept-Encoding: {accept}\r\n"));
+        assert_eq!(ask(planned(&off, &req)).bucket, without, "off: {accept:?}");
+        assert_eq!(upstream_encoding(&off.route, &req), without.token());
+        assert_eq!(ask(planned(&on, &req)).bucket, with, "on: {accept:?}");
+        assert_eq!(upstream_encoding(&on.route, &req), with.token());
+    }
 }
 
 #[test]

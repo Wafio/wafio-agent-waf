@@ -814,9 +814,7 @@ pub(crate) async fn handle(
             match &cache_plan {
                 Plan::Lookup(ask) if cache_plan.fills() => {
                     cache::fill(shared, route, ask, &req, &resp, pending.take_guard());
-                    if matches!(route.target, Target::Http(_)) {
-                        crate::upstream::apply_response_header_rules(route, &mut resp);
-                    }
+                    crate::upstream::apply_response_header_rules(route, &mut resp);
                     // The visitor's own condition did not go to the application.
                     if let Some(held) = cache::if_held(&req, &resp) {
                         resp = held;
@@ -872,11 +870,9 @@ pub(crate) async fn handle(
 }
 
 /// An answer made from a stored copy: the response header rules of the app apply as they do to
-/// every answer of an HTTP upstream, then `X-Cache` says what the cache did.
+/// every answer, then `X-Cache` says what the cache did.
 fn from_copy(route: &Route, mut resp: OutboundResponse, label: Label) -> OutboundResponse {
-    if matches!(route.target, Target::Http(_)) {
-        crate::upstream::apply_response_header_rules(route, &mut resp);
-    }
+    crate::upstream::apply_response_header_rules(route, &mut resp);
     cache::tag(route, &mut resp, label);
     resp
 }
@@ -957,7 +953,7 @@ pub(crate) async fn send_upstream(
                 hm.retain(|k, _| cgi_header_param(k) != b"HTTP_ACCEPT_ENCODING");
                 hm.insert(
                     b"Accept-Encoding".to_vec(),
-                    vec![cache::upstream_encoding(req).to_vec()],
+                    vec![cache::upstream_encoding(route, req).to_vec()],
                 );
             }
             if let Some(v) = validator {
@@ -965,7 +961,12 @@ pub(crate) async fn send_upstream(
             }
             crate::fastcgi::forward_fcgi(pool, &req.method, &target, &req.host, remote, &hm, fbody)
                 .await
-                .map(Forwarded::Whole)
+                .map(|mut r| {
+                    if !keep_copy {
+                        crate::upstream::apply_response_header_rules(route, &mut r);
+                    }
+                    Forwarded::Whole(r)
+                })
                 .map_err(|e| ("fastcgi ", e))
         }
         Target::Http(t) => {
@@ -982,7 +983,7 @@ pub(crate) async fn send_upstream(
             .map_err(|e| ("", e.to_string()))?;
             if keep_copy {
                 // The value is one of three fixed tokens, which http never refuses.
-                let _ = head.insert_header("Accept-Encoding", cache::upstream_encoding(req));
+                let _ = head.insert_header("Accept-Encoding", cache::upstream_encoding(route, req));
             }
             if let Some(v) = validator {
                 v.apply_http(&mut head);

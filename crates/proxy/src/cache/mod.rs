@@ -369,12 +369,18 @@ pub(crate) fn drops_unkeyed_inputs(route: &Route, peer: &IpAddress) -> bool {
     route.cache_active().is_some() && !trusts(route, peer)
 }
 
+/// Whether the visitor's encoding bucket may be `br`: only when the agent compresses, as an
+/// application is asked for the coding of the bucket and many cannot answer in brotli.
+fn brotli_bucket(route: &Route) -> bool {
+    route.compression.is_some()
+}
+
 /// The `Accept-Encoding` an application is asked with when its answer may be kept: the one coding
 /// of the visitor's bucket, or `identity`. A visitor's own list names codings the copy is not made
 /// in (`gzip, deflate, br, zstd`), and an application that compresses by itself would answer in
 /// one the bucket does not name and have its answer refused.
-pub(crate) fn upstream_encoding(req: &InboundRequest) -> &'static [u8] {
-    Bucket::of(req).token()
+pub(crate) fn upstream_encoding(route: &Route, req: &InboundRequest) -> &'static [u8] {
+    Bucket::of(req, brotli_bucket(route)).token()
 }
 
 /// What the cache makes of `req`, after the verdict: `action` is the verdict, `body_read` whether
@@ -420,7 +426,7 @@ pub(crate) fn plan(
     } else {
         Vec::new()
     };
-    let bucket = Bucket::of(req);
+    let bucket = Bucket::of(req, brotli_bucket(route));
     let primary = primary_key(
         is_https(req),
         &req.host,
@@ -933,7 +939,9 @@ pub(crate) async fn enter(cx: &Ctx<'_>, ask: &Ask) -> Entered {
 /// The turn of a request for its key, before it asks the application: the one that may fill
 /// fetches, the others wait up to five seconds for it and look again, so one request at a time
 /// goes to the application for a key that has no copy. A copy that came in while a request waited
-/// is the answer.
+/// is the answer. A fetch that ends with no copy and no mark (its visitor had a cookie, which says
+/// nothing of the page) leaves one more turn: one of the waiters leads and the rest wait again,
+/// once, so the wait stays bounded.
 pub(crate) async fn take_turn(
     cx: &Ctx<'_>,
     ask: &Ask,
@@ -943,19 +951,29 @@ pub(crate) async fn take_turn(
     // Only the process that writes fetches for others: one that cannot store has nothing to give
     // those who wait.
     let lead = ask.fillable && app.can_store();
-    match app.fills().turn(ask.primary_id, lead, store::now()) {
-        Turn::Free => {}
-        // `enter` looked a moment ago and read the copy it found: no second read.
-        Turn::Lead(guard) => pending.guard = Some(guard),
-        Turn::Wait(rx) => {
-            fills::wait(rx).await;
-            match settle(cx, ask, app, false).await {
-                Settled::Answer(answer, label) => return Some((answer, label)),
-                Settled::Old(old) => pending.old = old.or(pending.old.take()),
+    let mut waited = false;
+    loop {
+        match app.fills().turn(ask.primary_id, lead, store::now()) {
+            Turn::Free => return None,
+            // `enter` looked a moment ago and read the copy it found: no second read.
+            Turn::Lead(guard) => {
+                pending.guard = Some(guard);
+                return None;
+            }
+            Turn::Wait(rx) => {
+                let ended = fills::wait(rx).await;
+                match settle(cx, ask, app, false).await {
+                    Settled::Answer(answer, label) => return Some((answer, label)),
+                    Settled::Old(old) => pending.old = old.or(pending.old.take()),
+                }
+                // A wait that ran out is not asked again: the application is slow, not refusing.
+                if waited || !ended {
+                    return None;
+                }
+                waited = true;
             }
         }
     }
-    None
 }
 
 /// The copy as the answer when the application cannot give one: it is down or timed out, or it
@@ -1008,6 +1026,8 @@ pub(crate) fn revalidated(
     match prepared {
         Ok(p) if app.can_store() => keep(cx.shared, app, ask.purge_gen, p, merged.body, guard),
         Ok(_) => {}
+        // A cookie of this visitor says nothing of the page: the copy stays as it is, not renewed.
+        Err(NotKept::Cookie) => {}
         // The new headers say it is not to be kept: it goes, and still answers this request.
         Err(_) => {
             app.forget(&old.id, old.copy.size, old.copy.times);

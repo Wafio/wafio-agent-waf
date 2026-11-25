@@ -912,6 +912,58 @@ async fn php_gets_the_same_treatment_of_front_end_headers() {
     assert!(params.contains_key("HTTP_X_REAL_IP"));
 }
 
+/// The `resp_headers` rules of an app: two headers added, one the application sets removed.
+const HEADER_RULES: &str = r#"{"resp_headers":{"add":{"Content-Security-Policy":"default-src 'self'","X-Frame-Options":"DENY"},"remove":["X-Up"]}}"#;
+
+fn has_the_header_rules(r: &ReplyParts, what: &str) {
+    assert_eq!(r.status, 200, "{what}");
+    assert_eq!(r.header("x-frame-options"), Some("DENY"), "{what}");
+    assert_eq!(
+        r.header("content-security-policy"),
+        Some("default-src 'self'"),
+        "{what}"
+    );
+    assert_eq!(r.header("x-up"), None, "{what}: removed by a rule");
+}
+
+#[tokio::test]
+async fn the_response_header_rules_reach_the_pages_of_php_sent_directly_made_and_from_a_copy() {
+    let (fcgi, _) = fake_fcgi_with(
+        "Status: 200 OK\r\nContent-Type: text/html\r\nCache-Control: public, max-age=600\r\nX-Up: 1\r\n\r\n",
+        b"a page of php",
+    )
+    .await;
+    // No cache: the answer is sent as the application made it, with the rules.
+    let (_h, addr) = Harness::serve(vec![fcgi_app(
+        free_port(),
+        format!("fcgi://{fcgi}"),
+        "/srv/www",
+        HEADER_RULES,
+    )]);
+    has_the_header_rules(&one(addr, &get("/index.php")).await, "no cache");
+    // A cache: the answer that makes the copy, and the copy itself, have them. The copy holds what
+    // PHP said, so `X-Up` is in the file and a rule hides it from the visitor.
+    let dir = Dir::new("fcgi-rules");
+    let host = CacheHost::open(&dir.0, uid()).unwrap();
+    let mut a = fcgi_app(
+        free_port(),
+        format!("fcgi://{fcgi}"),
+        "/srv/www",
+        HEADER_RULES,
+    );
+    a.cache = Some(spec());
+    let (_h, addr) = serve_with(&host, a);
+    let made = fetch(addr, &get("/index.php")).await;
+    assert_eq!(x_cache(&made), "MISS");
+    has_the_header_rules(&made, "the answer that made the copy");
+    let hit = fetch(addr, &get("/index.php")).await;
+    assert_eq!(
+        (x_cache(&hit), hit.text().as_str()),
+        ("HIT", "a page of php")
+    );
+    has_the_header_rules(&hit, "a copy");
+}
+
 /// What a front proxy may write in `X-Forwarded-Proto`: the lines, what the application is told
 /// when the cache is off or the peer is trusted (the line itself, nothing when there is none), and
 /// what it is told when the cache is on and the peer is not trusted (`https` for a first value of
@@ -1159,7 +1211,11 @@ async fn a_successful_post_put_patch_or_delete_drops_the_copies_of_the_url() {
 
 #[tokio::test]
 async fn a_post_drops_every_encoding_of_the_url() {
-    let s = site(counting("200 OK", PUBLIC).await, spec(), |_| {}).await;
+    // Brotli is a bucket of its own only when the agent compresses.
+    let s = site(counting("200 OK", PUBLIC).await, spec(), |a| {
+        a.compression = Some(CompressionSpec { min_bytes: 1000 })
+    })
+    .await;
     for encoding in ["gzip", "br", "identity"] {
         fetch(
             s.addr,
@@ -1365,10 +1421,15 @@ async fn compression_runs_before_the_copy_is_made_and_each_encoding_has_its_own(
     assert_eq!(s.up.count(), 3);
 }
 
-/// An application that compresses by itself: gzip for a client that says it takes gzip, the page
-/// as it is for any other.
+/// An application that compresses by itself, with gzip only: gzip for a client that says it takes
+/// gzip, the page as it is for any other. It may be kept for ten minutes.
 async fn gzipping_upstream() -> TestUpstream {
-    raw_upstream(|seen| {
+    gzipping_upstream_with("Cache-Control: public, max-age=600\r\n").await
+}
+
+/// [`gzipping_upstream`] with the cache headers `control`.
+async fn gzipping_upstream_with(control: &'static str) -> TestUpstream {
+    raw_upstream(move |seen| {
         let takes_gzip = seen
             .header("accept-encoding")
             .is_some_and(|a| a.contains("gzip"));
@@ -1380,8 +1441,7 @@ async fn gzipping_upstream() -> TestUpstream {
         } else {
             ("", page.into_bytes())
         };
-        let head =
-            format!("Content-Type: text/html\r\nCache-Control: public, max-age=600\r\n{extra}");
+        let head = format!("Content-Type: text/html\r\n{control}{extra}");
         (reply_to(seen, "200 OK", &head, &body), false)
     })
     .await
@@ -1406,8 +1466,10 @@ fn unpacked(r: &ReplyParts) -> Vec<u8> {
 
 #[tokio::test]
 async fn a_browser_gets_a_copy_when_the_application_compresses_by_itself() {
-    // A browser says `gzip, deflate, br, zstd` and is in the brotli bucket. The application is
-    // asked for the coding of the bucket, so a gzip answer is not made for a copy that holds br.
+    // A browser says `gzip, deflate, br, zstd`. The application is asked for the coding of its
+    // bucket, so a gzip answer is not made for a copy that holds br. The bucket is br when the
+    // agent compresses and gzip when it does not, as an application that compresses by itself
+    // often has no brotli: its own gzip is then the copy.
     const BROWSER: &str = "Accept-Encoding: gzip, deflate, br, zstd";
     let page = "a page that an application packs by itself. "
         .repeat(100)
@@ -1419,15 +1481,19 @@ async fn a_browser_gets_a_copy_when_the_application_compresses_by_itself() {
         .await;
         let first = fetch(s.addr, &with("/b", &[BROWSER])).await;
         assert_eq!(x_cache(&first), "MISS");
-        assert_eq!(s.up.last().all("accept-encoding"), ["br"]);
+        assert_eq!(
+            s.up.last().all("accept-encoding"),
+            [compression.map_or("gzip", |_| "br")]
+        );
         let hit = fetch(s.addr, &with("/b", &[BROWSER])).await;
         assert_eq!(x_cache(&hit), "HIT", "{compression:?}");
         assert_eq!(unpacked(&hit), page);
         assert_eq!(s.up.count(), 1);
-        // With compression on the copy holds what the agent made: brotli, as the browser asked.
+        // With compression on the copy holds what the agent made: brotli. With it off it holds
+        // what the application made: its gzip.
         assert_eq!(
             hit.header("content-encoding"),
-            compression.map(|_| "br"),
+            Some(compression.map_or("gzip", |_| "br")),
             "{compression:?}"
         );
     }
@@ -1435,43 +1501,43 @@ async fn a_browser_gets_a_copy_when_the_application_compresses_by_itself() {
 
 #[tokio::test]
 async fn the_application_is_asked_in_the_one_coding_of_the_bucket_or_in_identity() {
-    let s = site(gzipping_upstream().await, spec(), |_| {}).await;
-    for (i, (visitor, asked)) in [
-        ("gzip", "gzip"),
-        ("gzip;q=0.5, br;q=0.1", "gzip"),
-        ("br", "br"),
-        ("zstd", "identity"),
-        ("identity", "identity"),
-        ("gzip;q=0", "identity"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let r = fetch(
-            s.addr,
-            &with(
+    // The coding asked for, by what the visitor says: with compression off and on. Brotli is asked
+    // for only when the agent can make it.
+    let table = [
+        ("gzip", "gzip", "gzip"),
+        ("gzip;q=0.5, br;q=0.1", "gzip", "gzip"),
+        ("gzip, deflate, br, zstd", "gzip", "br"),
+        ("br", "identity", "br"),
+        ("zstd", "identity", "identity"),
+        ("identity", "identity", "identity"),
+        ("gzip;q=0", "identity", "identity"),
+    ];
+    for compression in [None, Some(CompressionSpec { min_bytes: 100 })] {
+        let s = site(gzipping_upstream().await, spec(), |a| {
+            a.compression = compression
+        })
+        .await;
+        for (i, (visitor, off, on)) in table.into_iter().enumerate() {
+            let asked = compression.map_or(off, |_| on);
+            let raw = with(
                 &format!("/e/{i}"),
                 &[&format!("Accept-Encoding: {visitor}")],
-            ),
-        )
-        .await;
-        assert_eq!(x_cache(&r), "MISS", "{visitor}");
-        assert_eq!(s.up.last().all("accept-encoding"), [asked], "{visitor}");
-        assert_eq!(
-            x_cache(
-                &fetch(
-                    s.addr,
-                    &with(
-                        &format!("/e/{i}"),
-                        &[&format!("Accept-Encoding: {visitor}")]
-                    )
-                )
-                .await
-            ),
-            "HIT",
-            "{visitor}"
-        );
+            );
+            let r = fetch(s.addr, &raw).await;
+            assert_eq!(x_cache(&r), "MISS", "{visitor} {compression:?}");
+            assert_eq!(
+                s.up.last().all("accept-encoding"),
+                [asked],
+                "{visitor} {compression:?}"
+            );
+            assert_eq!(
+                x_cache(&fetch(s.addr, &raw).await),
+                "HIT",
+                "{visitor} {compression:?}"
+            );
+        }
     }
+    let s = site(gzipping_upstream().await, spec(), |_| {}).await;
     // A request that cannot fill is asked as the visitor wrote it.
     one(
         s.addr,
@@ -1482,6 +1548,28 @@ async fn the_application_is_asked_in_the_one_coding_of_the_bucket_or_in_identity
     )
     .await;
     assert_eq!(s.up.last().all("accept-encoding"), ["gzip, br, zstd"]);
+}
+
+#[tokio::test]
+async fn with_compression_off_a_browser_still_gets_the_gzip_of_an_application_without_brotli() {
+    // A page with no lifetime is never kept, so each visit goes to the application. The browser
+    // takes brotli, which the application has not: it is asked for gzip, not for what it lacks.
+    const BROWSER: &str = "Accept-Encoding: gzip, deflate, br, zstd";
+    let page = "a page that an application packs by itself. "
+        .repeat(100)
+        .into_bytes();
+    let s = site(gzipping_upstream_with("").await, spec(), |_| {}).await;
+    for _ in 0..2 {
+        let r = fetch(s.addr, &with("/dynamic", &[BROWSER])).await;
+        assert_eq!(
+            (x_cache(&r), r.header("content-encoding")),
+            ("MISS", Some("gzip"))
+        );
+        assert_eq!(unpacked(&r), page);
+        assert_eq!(s.up.last().all("accept-encoding"), ["gzip"]);
+    }
+    assert_eq!(s.up.count(), 2);
+    assert!(answer_files(&s.dir.0).is_empty());
 }
 
 #[tokio::test]
