@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// How long a look or a read may take, and how long a read waits for a slot, before the disk is
 /// taken as not answering.
@@ -20,6 +20,9 @@ pub(crate) const LOOKUP_WAIT: Duration = Duration::from_millis(100);
 
 /// The fewest slots a gate has; more workers get two slots each.
 const MIN_SLOTS: usize = 8;
+
+/// One slot of a gate, held by the work that took it. Dropping it gives the slot back.
+pub(crate) type Slot = OwnedSemaphorePermit;
 
 #[derive(Clone)]
 pub(crate) struct DiskGate {
@@ -69,6 +72,17 @@ impl DiskGate {
         unavailable: fn(),
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
+        self.run_slot(wait, unavailable, move |_slot| work()).await
+    }
+
+    /// [`DiskGate::run_counting`] for work that is given its slot and may hand it back in its
+    /// result, to be used by [`DiskGate::run_held`] for a second step.
+    pub async fn run_slot<T: Send + 'static>(
+        &self,
+        wait: Duration,
+        unavailable: fn(),
+        work: impl FnOnce(Slot) -> T + Send + 'static,
+    ) -> Option<T> {
         let slot = tokio::time::timeout(wait, self.slots.clone().acquire_owned())
             .await
             .ok()
@@ -77,11 +91,31 @@ impl DiskGate {
             unavailable();
             return None;
         };
-        let job = tokio::task::spawn_blocking(move || {
+        self.spawn(unavailable, move || work(slot)).await
+    }
+
+    /// Runs `work` on a blocking thread on a slot that is already held, so that a file the first
+    /// step found is read on the slot that found it and the descriptor closes on a blocking thread:
+    /// no second wait, only the deadline. The slot goes back when `work` returns. As for
+    /// [`DiskGate::run`], `None` when the work did not return within the deadline or panicked.
+    pub async fn run_held<T: Send + 'static>(
+        &self,
+        slot: Slot,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        self.spawn(crate::metrics::count_static_unavailable, move || {
             let _slot = slot;
             work()
-        });
-        match tokio::time::timeout(self.deadline, job).await {
+        })
+        .await
+    }
+
+    async fn spawn<T: Send + 'static>(
+        &self,
+        unavailable: fn(),
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        match tokio::time::timeout(self.deadline, tokio::task::spawn_blocking(job)).await {
             Ok(Ok(out)) => Some(out),
             Ok(Err(_)) => {
                 crate::metrics::count_agent_panic();
@@ -205,6 +239,50 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(short.run(SHORT, || 4).await, None, "no slot came free");
         assert!(started.elapsed() >= SHORT, "it waited the deadline first");
+    }
+
+    /// A file the first step found is read on the slot that found it: with the gate full, the
+    /// second step still runs at once, and the slot is free again after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_step_runs_on_the_slot_of_the_first_and_gives_it_back() {
+        let gate = DiskGate::new(1, SHORT);
+        let slot = gate
+            .run_slot(NO_WAIT, || {}, |slot| slot)
+            .await
+            .expect("the slot was free");
+        assert_eq!(gate.run(NO_WAIT, || 1).await, None, "the gate is full");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            gate.run_held(slot, || 2).await,
+            Some(2),
+            "the second step needs no other slot"
+        );
+        assert!(started.elapsed() < SHORT, "and waits for none");
+        assert_eq!(gate.run(NO_WAIT, || 3).await, Some(3), "the slot is back");
+    }
+
+    /// A second step on a stuck disk is cut at the deadline, and its thread keeps the slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_step_that_does_not_return_keeps_the_slot_until_it_does() {
+        let gate = DiskGate::new(1, SHORT);
+        let slot = gate.run_slot(NO_WAIT, || {}, |slot| slot).await.unwrap();
+        let (release, stuck) = held();
+        assert_eq!(gate.run_held(slot, stuck).await, None);
+        assert_eq!(
+            gate.run(NO_WAIT, || 1).await,
+            None,
+            "the slot is still held"
+        );
+        release.send(()).unwrap();
+        let mut got = None;
+        for _ in 0..50 {
+            got = gate.run(NO_WAIT, || 2).await;
+            if got.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(got, Some(2), "the slot is given back when the job returns");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -39,8 +39,15 @@ fn bytes(outcome: Outcome) -> Option<Vec<u8>> {
     }
 }
 
+/// A slot of a gate of its own, for a lookup the test runs on its own thread.
+fn slot() -> Slot {
+    Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap()
+}
+
 fn served(folder: &StaticFolder, path: &str) -> Option<Vec<u8>> {
-    bytes(folder.lookup(path.as_bytes(), &Conditions::default(), false, None))
+    bytes(folder.lookup(path.as_bytes(), &Conditions::default(), false, None, slot()))
 }
 
 /// The folder text is checked before the disk is, so none of these needs to exist.
@@ -349,7 +356,7 @@ fn a_file_is_found_through_the_folder_and_a_name_outside_it_is_not() {
     assert_eq!(served(&f, "/index.html").unwrap(), b"home");
     assert_eq!(served(&f, "/css/site.css").unwrap(), b"body{}");
     assert!(matches!(
-        f.lookup(b"/css", &Conditions::default(), false, None),
+        f.lookup(b"/css", &Conditions::default(), false, None, slot()),
         Outcome::Missing
     ));
     for path in [
@@ -502,7 +509,7 @@ fn a_request_for_a_kept_name_makes_no_open_at_all() {
             let before = opens();
             assert!(
                 matches!(
-                    f.lookup(path.as_bytes(), &Conditions::default(), false, None),
+                    f.lookup(path.as_bytes(), &Conditions::default(), false, None, slot()),
                     Outcome::Missing
                 ),
                 "{path}"
@@ -591,13 +598,18 @@ fn a_file_is_read_whole_up_to_a_mebibyte_and_sent_from_its_descriptor_above() {
     sized(&s, "public/after.bin", LOOKUP_READ_MAX + 1);
     let f = folder(&s.path("public"));
     let c = Conditions::default();
-    let hit =
-        |path: &str, c: &Conditions, head: bool| match f.lookup(path.as_bytes(), c, head, None) {
-            Outcome::Hit(h) => h,
-            _ => panic!("{path}"),
-        };
+    let hit = |path: &str, c: &Conditions, head: bool| match f.lookup(
+        path.as_bytes(),
+        c,
+        head,
+        None,
+        slot(),
+    ) {
+        Outcome::Hit(h) => h,
+        _ => panic!("{path}"),
+    };
     let whole = |body: &Body| match body {
-        Body::Whole(_, len) => Some(*len as u64),
+        Body::Whole(_, len, _) => Some(*len as u64),
         _ => None,
     };
     assert_eq!(
