@@ -44,7 +44,7 @@ use fills::{FillGuard, Turn};
 use format::{Loaded, MAX_KEY, StoredHead, Times};
 use index::MEMORY_COPY_MAX;
 use key::{
-    Bucket, FileId, PrimaryId, file_id, is_https, keyed_inputs, primary_id, primary_key,
+    Bucket, FileId, PrimaryId, file_id, keyed_inputs, primary_id, primary_key,
     request_header_values, same_name, variant,
 };
 use stats::Count;
@@ -360,7 +360,7 @@ pub(crate) fn trusts(route: &Route, peer: &IpAddress) -> bool {
 }
 
 pub(crate) use key::{
-    forwarded_host, forwarded_host_or_proto, forwarded_https, forwarded_proto, unkeyed_input,
+    forwarded_host, forwarded_host_or_proto, forwarded_proto, is_https, unkeyed_input,
 };
 
 /// Whether the route has the cache on and the peer is not a proxy it trusts: what such a peer says
@@ -546,10 +546,10 @@ pub(crate) fn decide(
         return Err(NotKept::NoLifetime);
     }
     // A cookie that is not on the session list may still be a login the agent cannot see: only an
-    // answer that says it is for everyone, a file, or a rule that took that risk keeps it.
-    if ask.cookie
-        && !(cc.public || cc.s_maxage.is_some() || file_type(&media) || ask.rule_signed_in)
-    {
+    // answer that says it is for everyone, a file while the default lifetime is on, or a rule that
+    // took that risk keeps it.
+    let default_file = settings.default_ttl_s > 0 && file_type(&media);
+    if ask.cookie && !(cc.public || cc.s_maxage.is_some() || default_file || ask.rule_signed_in) {
         return Err(NotKept::Cookie);
     }
     let head = StoredHead {

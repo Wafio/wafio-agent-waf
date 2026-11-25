@@ -268,6 +268,35 @@ async fn response_decrypt_returns_plaintext_with_sniffed_type() {
 }
 
 #[tokio::test]
+async fn response_decrypt_runs_on_a_fastcgi_answer_too() {
+    let rule = RequestFieldRule {
+        field: "x".into(),
+        action: "encrypt_aes".into(),
+        cipher_key_hex: KEY.into(),
+        ..Default::default()
+    };
+    let mut enc = FieldRewriter::new(&rule);
+    let cipher: &'static [u8] = Box::leak(
+        enc.apply(b"<html><body>secret</body></html>")
+            .0
+            .into_boxed_slice(),
+    );
+    let (fcgi, _fake) =
+        fake_fcgi_with("Status: 200 OK\r\nContent-Type: text/plain\r\n\r\n", cipher).await;
+    let mut a = fcgi_app(free_port(), format!("fcgi://{fcgi}"), "/srv/www", "");
+    a.analysis = analysis_setup(&format!(
+        r#"{{"path_exceptions":[{{"path":"/files","match":"prefix","response_decrypt_aes":"{KEY}"}}]}}"#
+    ));
+    let (_h, proxy) = Harness::serve_with_fake_engine(vec![a]);
+    let resp = one(proxy, &get("/files/a.php")).await;
+    assert_eq!(resp.text(), "<html><body>secret</body></html>");
+    assert_eq!(
+        resp.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+}
+
+#[tokio::test]
 async fn l7_flood_limits_per_app() {
     let up = http_upstream().await;
     let port = free_port();

@@ -895,12 +895,13 @@ or by more than that, is not kept. The SHA-256 of the whole key names the file a
 (`-For`, `-Host`, `-Proto`), `X-Original-*`, `X-Host`, `X-Rewrite-URL`, `Forwarded`, `Front-End-Https` and `X-Url-Scheme` is not sent to the
 application (HTTP and FastCGI), unless the peer is a proxy the route trusts (`trust_forwarded` and `trusted_proxies`): then they are sent
 and are part of the key, and a request with more than 256 bytes of them is not cached. A line of the client's for `X-Forwarded-Host` or
-`X-Forwarded-Proto`, in any spelling (`_` for `-` too), does not stay beside the agent's. The host is always the agent's word: a FastCGI
+`X-Forwarded-Proto`, in any spelling (`_` for `-` too), does not stay beside the agent's (for `X-Forwarded-Proto`, with the cache off too). The host is always the agent's word: a FastCGI
 application is sent `X-Forwarded-Host` with the host of the request and never the client's or a proxy's, because the key does not hold
 what a proxy says there. The scheme is the word of any peer, trusted or not, so that an application behind a proxy that ends TLS keeps
-being told so when the cache is turned on and no proxy is trusted: an untrusted peer's value is sent as the key reads it, `https` for a
-first value of `https` and otherwise `http` (nothing, for FastCGI), so a value of any other form cannot make a third kind of answer, and a
-spoofed `https` only chooses the key that real ones choose.
+being told so when the cache is turned on and no proxy is trusted. The value is sent as the key reads it, from every peer and with the
+cache on or off, so the application hears the same either way: `https` over TLS or for a first value of `https`, otherwise `http`
+(nothing, for FastCGI). A value of any other form cannot make a third kind of answer, and a spoofed `https` only chooses the key that real
+ones choose.
 
 **Signed in.** A request is signed in when it carries `Authorization`, the userinfo of an absolute-form target, or a cookie whose name,
 in any case, holds `sess` (`PHPSESSID`, `laravel_session`, `ASP.NET_SessionId`), starts with `wordpress_logged_in_`, `wp-postpass_`,
@@ -915,7 +916,7 @@ one of the first four, never the default). The request's own `Cache-Control` is 
 lifetime. Never kept: `Set-Cookie`, `private`, `no-store` and `no-cache` (with or without a field list), a `Cache-Control` that does not
 parse, more than 64 directives or a line over 4 KiB, a `Vary` as above, a body over `max_object_bytes`, a head over 64 KiB, an answer in
 an encoding other than the request's bucket (see below), an answer sent in pieces without a length, and an answer to a request with a cookie that
-is not on the session list unless the answer says `public` or has `s-maxage` or is of a file type; a rule alone does not allow it, as the cookie may
+is not on the session list unless the answer says `public` or has `s-maxage` or is of a file type while `default_ttl_s` is not 0; a rule alone does not allow it, as the cookie may
 hold a login the agent cannot see, and only a rule with `signed_in` does. A request that may fill goes to the application with `Accept-Encoding` set to
 the one coding of its bucket (`br` or `gzip`), or `identity`, in place of the visitor's list, so an application that compresses by itself answers in it.
 With compression on, the bucket of a visitor who takes brotli is `br` (`gzip, deflate, br, zstd` is that bucket) and the agent makes `br` or `gzip`
@@ -925,7 +926,7 @@ bucket, and the application's own gzip answer is the copy. An application that a
 what the application said without the headers of the connection (`Connection` and what it names, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`,
 `Upgrade`), `Date`, `Age` and `X-Cache`, with compression's changes: compression runs before the copy is made, so each bucket has its own copy.
 The response header rules (`resp_headers`) run on every answer as it is sent, FastCGI pages and copies included, so a change to them reaches stored
-copies at once. The copy is written behind the answer: the visitor does not wait for the disk.
+copies at once. A path's `response_decrypt_aes` and `response_field_rules` run on HTTP and FastCGI answers alike; such a path is never cached. The copy is written behind the answer: the visitor does not wait for the disk.
 
 **A copy that is fresh** is sent with `Age` (the age the application gave plus the time here). `HEAD` is answered from the copy of a `GET`.
 `If-None-Match` (weak comparison, `*`), else `If-Modified-Since` against the copy's `Last-Modified`, gives `304` with the headers a `304`
