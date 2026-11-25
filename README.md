@@ -731,9 +731,10 @@ brotli, whichever the visitor's `Accept-Encoding` takes. `min_bytes` is 1024 whe
 outside that refuses the bundle. An absent or empty object turns compression off, and so does `enabled: false`. Compression applies
 to the answers the agent reads whole from an HTTP or FastCGI application.
 
-- The encoding: brotli (quality 4) when its weight is the highest and above 0, a tie going to brotli; else gzip (level 5) when its
-  weight is above 0; else none. `*` gives its weight to a coding the list does not name. The agent reads the first 1 KiB of the
-  header and its first 16 tokens, and a weight that does not parse counts as 0. The compressed form is kept only when it is smaller.
+- The encoding: brotli (quality 4) when its weight is the highest and above 0, a tie going to brotli; else gzip (level 5, written
+  by `miniz_oxide`) when its weight is above 0; else none. `*` gives its weight to a coding the list does not name. The agent reads
+  the first 1 KiB of the header and its first 16 tokens, and a weight that does not parse counts as 0. The compressed form is kept
+  only when it is smaller.
 - What is compressed: `text/*` except `text/event-stream`, JSON, JavaScript, XML, WebAssembly, any `+json` or `+xml` type,
   `image/svg+xml` and the fonts `font/ttf`, `font/otf` and `application/vnd.ms-fontobject`, when the answer has a body of at least
   `min_bytes` and at most 8 MiB. Not compressed: a streamed answer (no length up front, only counted), the agent's own pages, answers
@@ -1133,12 +1134,11 @@ received (`body_decompress_error`).
 `WAFIO_BODY_DECODE_BUDGET_BYTES` (default 64 MiB, 0 disables) caps the memory of decodes in flight; a body that does not
 fit is inspected as received (`body_decompress_budget`).
 
-The C code in the binary is the TLS provider (`ring`), the allocator (`mimalloc`) and zlib-ng. `pingora-core` switches the
-zlib-ng backend of `flate2` on, and `crates/proxy/src/compress.rs` uses it to encode gzip answers (see "Compression"), so zlib-ng
-compresses bytes that an application sent. It only compresses: the decoding of request and response bodies above is Rust. A
-pure Rust encoder (`miniz_oxide`) would remove it; the agent does not use one yet. `cargo tree` also lists `zstd-sys` under
-`pingora-core`; nothing calls it and the linker drops it. On a binary, `nm wafio-waf-agent-open | grep zng_` lists the zlib-ng
-deflate functions (`zng_deflate` and the ones it calls) and `nm wafio-waf-agent-open | grep ZSTD_` prints nothing.
+The C code in the binary is the TLS provider (`ring`) and the allocator (`mimalloc`). Gzip answers are encoded in Rust, by
+`miniz_oxide` with the CRC-32 of `crc32fast` (see "Compression"). `pingora-core` still switches the zlib-ng backend of `flate2`
+on, so `libz-ng-sys` is in `cargo tree`, but nothing in the agent calls it and the linker drops it: on a binary of the
+conformance profile, `nm wafio-waf-agent-open | grep zng_` prints nothing. `cargo tree` also lists `zstd-sys` under
+`pingora-core`; nothing calls it either, and `nm wafio-waf-agent-open | grep ZSTD_` prints nothing.
 
 ## Protocol file
 

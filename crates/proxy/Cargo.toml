@@ -18,7 +18,8 @@ wafio-bytetext.workspace = true
 base64 = { workspace = true }
 brotli.workspace = true
 bytes = { workspace = true }
-flate2.workspace = true
+crc32fast.workspace = true
+miniz_oxide.workspace = true
 pingora = { workspace = true }
 rustls-pki-types.workspace = true
 sd-notify = { workspace = true }
@@ -29,6 +30,8 @@ tracing = { workspace = true }
 memchr.workspace = true
 
 [dev-dependencies]
+# An independent decoder for the tests of the gzip the agent writes.
+flate2.workspace = true
 wafio-engine-fake.workspace = true
 # The agent's allocator, for the test that bounds the memory answers leave behind.
 mimalloc.workspace = true

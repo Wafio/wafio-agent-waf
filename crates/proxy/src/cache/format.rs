@@ -21,8 +21,6 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use flate2::Crc;
-
 use super::key::{FileId, hex};
 
 pub(crate) const HEADER_LEN: usize = 64;
@@ -164,14 +162,14 @@ pub(crate) fn file_len(key: &[u8], head: &[u8], body: &[u8]) -> u64 {
 }
 
 fn crc(header: &[u8; HEADER_LEN], rest: &[&[u8]]) -> u32 {
-    let mut crc = Crc::new();
+    let mut crc = crc32fast::Hasher::new();
     let mut zeroed = *header;
     zeroed[20..24].fill(0);
     crc.update(&zeroed);
     for part in rest {
         crc.update(part);
     }
-    crc.sum()
+    crc.finalize()
 }
 
 fn header(
