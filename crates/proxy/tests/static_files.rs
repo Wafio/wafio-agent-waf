@@ -1082,6 +1082,87 @@ async fn a_big_file_is_not_compressed_and_is_streamed_whole() {
     assert!(checks_out(&r.body, 0));
 }
 
+// Files of more than 64 KiB and up to 1 MiB: read whole after the lookup, from an offset for a range.
+
+/// A body of this many bytes, between the 64 KiB a lookup reads and the 1 MiB that is sent whole.
+const MID: u64 = 200 << 10;
+
+#[tokio::test]
+async fn a_file_over_64_kib_is_sent_whole_and_a_range_of_it_has_the_bytes_at_its_offset() {
+    let dir = Dir::new("mid");
+    dir.pattern("public/mid.bin", MID);
+    let s = site_of(dir, "not_found").await;
+    let mut c = Client::connect(s.addr).await.unwrap();
+    let r = c.send(&get("/mid.bin")).await.unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-length"), Some(MID.to_string().as_str()));
+    assert_eq!(r.body.len() as u64, MID);
+    assert!(checks_out(&r.body, 0));
+    // The spans on both sides of the 64 KiB line, from the start and from inside the file.
+    for (range, from, len) in [
+        ("bytes=0-65535", 0u64, 65_536u64),
+        ("bytes=0-65536", 0, 65_537),
+        ("bytes=1-65536", 1, 65_536),
+        ("bytes=1-65537", 1, 65_537),
+        ("bytes=70000-169999", 70_000, 100_000),
+        ("bytes=100000-", 100_000, MID - 100_000),
+        ("bytes=-100000", MID - 100_000, 100_000),
+    ] {
+        let r = c
+            .send(&get_with("/mid.bin", &format!("Range: {range}")))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 206, "{range}");
+        assert_eq!(r.body.len() as u64, len, "{range}");
+        assert!(checks_out(&r.body, from), "{range}");
+        let end = from + len - 1;
+        assert_eq!(
+            r.header("content-range"),
+            Some(format!("bytes {from}-{end}/{MID}").as_str()),
+            "{range}"
+        );
+    }
+    // The same connection serves the whole file again.
+    let again = c.send(&get("/mid.bin")).await.unwrap();
+    assert_eq!(again.body.len() as u64, MID);
+    assert!(checks_out(&again.body, 0));
+}
+
+#[tokio::test]
+async fn a_file_over_64_kib_is_compressed_whole_and_a_range_of_it_is_not() {
+    let dir = Dir::new("mid-css");
+    let body = css(4500);
+    assert!((64 << 10..=1 << 20).contains(&body.len()), "{}", body.len());
+    dir.file("public/mid.css", &body);
+    let up = upstream().await;
+    let mut a = folder_app(free_port(), &up, &dir.path("public"), "not_found", 0);
+    a.compression = Some(CompressionSpec { min_bytes: 1024 });
+    let (_h, addr) = Harness::serve(vec![a]);
+    let mut c = Client::connect(addr).await.unwrap();
+    for (accept, encoding) in [("gzip", "gzip"), ("br", "br")] {
+        let r = c
+            .send(&get_with("/mid.css", &format!("Accept-Encoding: {accept}")))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200, "{accept}");
+        assert_eq!(r.header("content-encoding"), Some(encoding), "{accept}");
+        assert!(decoded(&r) == body, "{accept}: the round trip");
+        assert!(r.body.len() < body.len() / 5, "{accept}");
+    }
+    let part = c
+        .send(&with(
+            "/mid.css",
+            &["Accept-Encoding: gzip", "Range: bytes=1000-99999"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!((part.status, part.header("content-encoding")), (206, None));
+    assert!(part.body == body[1000..100_000]);
+    let plain = c.send(&get("/mid.css")).await.unwrap();
+    assert_eq!(plain.header("content-encoding"), None);
+    assert!(plain.body == body);
+}
+
 // Big files.
 
 #[tokio::test]
@@ -1361,6 +1442,32 @@ async fn with_one_disk_slot_a_burst_on_a_healthy_disk_is_served_from_the_folder(
     for t in tasks {
         let (status, body) = t.await.unwrap();
         assert_eq!((status, body.as_slice()), (200, &b"hello, folder"[..]));
+    }
+    assert_eq!(up.count(), 0, "the application was not asked");
+}
+
+/// A file over 64 KiB is read on the slot of its lookup, so a request that found its file does not
+/// wait for a second slot behind the burst: with one slot every one still gets the file.
+#[tokio::test]
+async fn with_one_disk_slot_a_burst_for_a_file_over_64_kib_is_served_from_the_folder() {
+    let dir = Dir::new("one-slot-mid");
+    dir.pattern("public/mid.bin", MID);
+    let up = upstream().await;
+    let a = folder_app(free_port(), &up, &dir.path("public"), "", 0);
+    let (_h, addr) = limited(1, a);
+    let tasks: Vec<_> = (0..40)
+        .map(|_| {
+            tokio::spawn(async move {
+                let r = one(addr, &get("/mid.bin")).await;
+                (r.status, r.body)
+            })
+        })
+        .collect();
+    for t in tasks {
+        let (status, body) = t.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body.len() as u64, MID);
+        assert!(checks_out(&body, 0));
     }
     assert_eq!(up.count(), 0, "the application was not asked");
 }

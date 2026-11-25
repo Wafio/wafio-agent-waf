@@ -736,10 +736,14 @@ async fn load(cx: &Ctx<'_>, ask: &Ask, now: u64) -> Option<Copy> {
                 .try_acquire_many_owned(u32::try_from(size).ok()?)
                 .ok()?;
             let reader = app.clone();
+            // Made here, not on a disk thread: see `static_files::LOOKUP_READ_MAX`.
+            let body = Vec::with_capacity(usize::try_from(size).ok()?);
             let (read, permit) = cx
                 .shared
                 .disk
-                .run_counting(LOOKUP_WAIT, no_count, move || (reader.read(&found), permit))
+                .run_counting(LOOKUP_WAIT, no_count, move || {
+                    (reader.read(&found, body), permit)
+                })
                 .await?;
             (Arc::new(read.ok()?), false, Some(permit))
         }

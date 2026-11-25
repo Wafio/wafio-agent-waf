@@ -1161,6 +1161,40 @@ async fn a_static_file_is_kept_in_memory_by_the_file_and_the_encoding() {
 }
 
 #[tokio::test]
+async fn a_static_file_over_64_kib_is_read_once_and_then_served_from_memory() {
+    let size = 200usize << 10;
+    let dir = Dir::new("static-mid");
+    std::fs::create_dir_all(dir.0.join("public")).unwrap();
+    let file = dir.0.join("public/m.bin");
+    let first: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&file, &first).unwrap();
+    let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let root = dir.0.join("public").to_str().unwrap().to_owned();
+    let s = site(counting("200 OK", PUBLIC).await, spec(), |a| {
+        a.static_files = Some(wafio_proxy::StaticSpec::check(&root, "", 0).unwrap());
+    })
+    .await;
+    let read = one(s.addr, &get("/m.bin")).await;
+    assert_eq!(read.status, 200);
+    assert!(read.body == first, "the file as it was read");
+    let held = s.host.usage("shop").unwrap().2;
+    assert!(held >= size as u64, "the answer is in memory: {held}");
+    // Other bytes with the same size and time, as stat sees them, are the same key: the memory
+    // answers with what it kept.
+    std::fs::write(&file, vec![9u8; size]).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let again = one(s.addr, &get("/m.bin")).await;
+    assert_eq!(again.status, 200);
+    assert!(again.body == first, "from memory, not from the file");
+    assert_eq!(s.up.count(), 0, "the application was never asked");
+}
+
+#[tokio::test]
 async fn memory_zero_keeps_no_static_file_in_memory() {
     let dir = Dir::new("static-zero");
     std::fs::create_dir_all(dir.0.join("public")).unwrap();

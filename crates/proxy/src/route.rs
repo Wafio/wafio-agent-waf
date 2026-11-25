@@ -342,7 +342,12 @@ async fn relay_file(
         return None;
     }
     let (mut at, end) = (file.offset, file.offset + file.len);
-    let mut chunk = Vec::new();
+    // Made here, not on a disk thread: see `static_files::LOOKUP_READ_MAX`.
+    let mut chunk = Vec::with_capacity(
+        usize::try_from(file.len).map_or(crate::static_files::CHUNK, |n| {
+            n.min(crate::static_files::CHUNK)
+        }),
+    );
     while at < end {
         let want = usize::try_from(end - at).map_or(crate::static_files::CHUNK, |n| {
             n.min(crate::static_files::CHUNK)

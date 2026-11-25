@@ -3533,6 +3533,7 @@ dependencies = [
  "bytes",
  "flate2",
  "memchr",
+ "mimalloc",
  "nix",
  "pingora",
  "rustls-pki-types",

@@ -256,8 +256,14 @@ fn read_header(file: &mut File, size: u64) -> Result<(Layout, [u8; HEADER_LEN]),
 }
 
 /// Reads the whole file: the size is `expect_size` (what the index holds), the check sum holds and
-/// the key is `expect_key`.
-pub(crate) fn read(path: &Path, expect_size: u64, expect_key: &[u8]) -> Result<Loaded, ReadError> {
+/// the key is `expect_key`. The body goes into `body`, an empty buffer the caller made with room
+/// for the file, so that it is not made on the disk thread (see `static_files::LOOKUP_READ_MAX`).
+pub(crate) fn read(
+    path: &Path,
+    expect_size: u64,
+    expect_key: &[u8],
+    mut body: Vec<u8>,
+) -> Result<Loaded, ReadError> {
     let (mut file, size) = open_plain(path)?;
     if size != expect_size {
         return Err(ReadError::Corrupt);
@@ -269,7 +275,10 @@ pub(crate) fn read(path: &Path, expect_size: u64, expect_key: &[u8]) -> Result<L
     };
     let mut parts = vec![0u8; layout.key_len + layout.head_len];
     file.read_exact(&mut parts).map_err(eof)?;
-    let mut body = vec![0u8; usize::try_from(layout.body_len).map_err(|_| ReadError::Corrupt)?];
+    body.resize(
+        usize::try_from(layout.body_len).map_err(|_| ReadError::Corrupt)?,
+        0,
+    );
     file.read_exact(&mut body).map_err(eof)?;
     let (key, head) = parts.split_at(layout.key_len);
     if crc(&h, &[key, head, &body]) != layout.crc || key != expect_key {
@@ -489,8 +498,15 @@ pub(super) mod tests {
         let (id, size) = put(&s.0, b"the key", b"body bytes");
         let path = path_of(&s.0, &id);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
-        let loaded = read(&path, size, b"the key").unwrap();
+        let buf = Vec::with_capacity(usize::try_from(size).unwrap());
+        let at = buf.as_ptr();
+        let loaded = read(&path, size, b"the key", buf).unwrap();
         assert_eq!(loaded.body, b"body bytes");
+        assert_eq!(
+            loaded.body.as_ptr(),
+            at,
+            "the body is in the caller's buffer"
+        );
         assert_eq!(loaded.times, TIMES);
         assert_eq!(loaded.head, head());
         assert_eq!(loaded.size, size);
@@ -506,7 +522,7 @@ pub(super) mod tests {
         // An empty body is a file too.
         let (id, size) = put(&s.0, b"empty", b"");
         assert!(
-            read(&path_of(&s.0, &id), size, b"empty")
+            read(&path_of(&s.0, &id), size, b"empty", Vec::new())
                 .unwrap()
                 .body
                 .is_empty()
@@ -524,7 +540,7 @@ pub(super) mod tests {
             bad[at] ^= 0x01;
             std::fs::write(&path, &bad).unwrap();
             assert_eq!(
-                read(&path, size, b"k").err(),
+                read(&path, size, b"k", Vec::new()).err(),
                 Some(ReadError::Corrupt),
                 "byte {at}"
             );
@@ -532,7 +548,7 @@ pub(super) mod tests {
         for len in [0, 10, HEADER_LEN, good.len() - 1] {
             std::fs::write(&path, &good[..len]).unwrap();
             assert_eq!(
-                read(&path, size, b"k").err(),
+                read(&path, size, b"k", Vec::new()).err(),
                 Some(ReadError::Corrupt),
                 "cut to {len}"
             );
@@ -540,14 +556,20 @@ pub(super) mod tests {
         let mut longer = good.clone();
         longer.push(0);
         std::fs::write(&path, &longer).unwrap();
-        assert_eq!(read(&path, size, b"k").err(), Some(ReadError::Corrupt));
+        assert_eq!(
+            read(&path, size, b"k", Vec::new()).err(),
+            Some(ReadError::Corrupt)
+        );
         // A zero-filled tail of the right length (a torn write) fails the check sum.
         let mut torn = good.clone();
         torn[HEADER_LEN + 1..].fill(0);
         std::fs::write(&path, &torn).unwrap();
-        assert_eq!(read(&path, size, b"k").err(), Some(ReadError::Corrupt));
+        assert_eq!(
+            read(&path, size, b"k", Vec::new()).err(),
+            Some(ReadError::Corrupt)
+        );
         std::fs::write(&path, &good).unwrap();
-        assert!(read(&path, size, b"k").is_ok());
+        assert!(read(&path, size, b"k", Vec::new()).is_ok());
     }
 
     #[test]
@@ -556,13 +578,16 @@ pub(super) mod tests {
         let (id, size) = put(&s.0, b"key-a", b"body");
         let path = path_of(&s.0, &id);
         // Two bodies swapped between two names: each file holds its own key, so the swap shows.
-        assert_eq!(read(&path, size, b"key-b").err(), Some(ReadError::Corrupt));
         assert_eq!(
-            read(&path, size + 1, b"key-a").err(),
+            read(&path, size, b"key-b", Vec::new()).err(),
             Some(ReadError::Corrupt)
         );
         assert_eq!(
-            read(&s.0.join("nothing"), 1, b"x").err(),
+            read(&path, size + 1, b"key-a", Vec::new()).err(),
+            Some(ReadError::Corrupt)
+        );
+        assert_eq!(
+            read(&s.0.join("nothing"), 1, b"x", Vec::new()).err(),
             Some(ReadError::Missing)
         );
     }
@@ -574,12 +599,21 @@ pub(super) mod tests {
         let path = path_of(&s.0, &id);
         let link = s.0.join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert_eq!(read(&link, size, b"k").err(), Some(ReadError::Corrupt));
+        assert_eq!(
+            read(&link, size, b"k", Vec::new()).err(),
+            Some(ReadError::Corrupt)
+        );
         assert_eq!(read_summary(&link).err(), Some(ReadError::Corrupt));
-        assert_eq!(read(&s.0, size, b"k").err(), Some(ReadError::Corrupt));
+        assert_eq!(
+            read(&s.0, size, b"k", Vec::new()).err(),
+            Some(ReadError::Corrupt)
+        );
         let fifo = s.0.join("fifo");
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
-        assert_eq!(read(&fifo, size, b"k").err(), Some(ReadError::Corrupt));
+        assert_eq!(
+            read(&fifo, size, b"k", Vec::new()).err(),
+            Some(ReadError::Corrupt)
+        );
     }
 
     #[test]
@@ -591,7 +625,10 @@ pub(super) mod tests {
         // A body length of 2^60: the size does not match and no buffer of that size is made.
         bytes[24..32].copy_from_slice(&(1u64 << 60).to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
-        assert_eq!(read(&path, size, b"k").err(), Some(ReadError::Corrupt));
+        assert_eq!(
+            read(&path, size, b"k", Vec::new()).err(),
+            Some(ReadError::Corrupt)
+        );
         assert_eq!(read_summary(&path).err(), Some(ReadError::Corrupt));
         // A version or magic that is not ours.
         let mut other = std::fs::read(path_of(&s.0, &put(&s.0, b"k2", b"b").0)).unwrap();

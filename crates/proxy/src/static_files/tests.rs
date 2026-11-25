@@ -39,8 +39,15 @@ fn bytes(outcome: Outcome) -> Option<Vec<u8>> {
     }
 }
 
+/// A slot of a gate of its own, for a lookup the test runs on its own thread.
+fn slot() -> Slot {
+    Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap()
+}
+
 fn served(folder: &StaticFolder, path: &str) -> Option<Vec<u8>> {
-    bytes(folder.lookup(path.as_bytes(), &Conditions::default(), false, None))
+    bytes(folder.lookup(path.as_bytes(), &Conditions::default(), false, None, slot()))
 }
 
 /// The folder text is checked before the disk is, so none of these needs to exist.
@@ -349,7 +356,7 @@ fn a_file_is_found_through_the_folder_and_a_name_outside_it_is_not() {
     assert_eq!(served(&f, "/index.html").unwrap(), b"home");
     assert_eq!(served(&f, "/css/site.css").unwrap(), b"body{}");
     assert!(matches!(
-        f.lookup(b"/css", &Conditions::default(), false, None),
+        f.lookup(b"/css", &Conditions::default(), false, None, slot()),
         Outcome::Missing
     ));
     for path in [
@@ -502,7 +509,7 @@ fn a_request_for_a_kept_name_makes_no_open_at_all() {
             let before = opens();
             assert!(
                 matches!(
-                    f.lookup(path.as_bytes(), &Conditions::default(), false, None),
+                    f.lookup(path.as_bytes(), &Conditions::default(), false, None, slot()),
                     Outcome::Missing
                 ),
                 "{path}"
@@ -587,15 +594,35 @@ fn a_file_is_read_whole_up_to_a_mebibyte_and_sent_from_its_descriptor_above() {
     sized(&s, "public/exact.bin", READ_WHOLE_MAX);
     sized(&s, "public/over.bin", READ_WHOLE_MAX + 1);
     sized(&s, "public/empty.bin", 0);
+    sized(&s, "public/lookup.bin", LOOKUP_READ_MAX);
+    sized(&s, "public/after.bin", LOOKUP_READ_MAX + 1);
     let f = folder(&s.path("public"));
     let c = Conditions::default();
-    let hit =
-        |path: &str, c: &Conditions, head: bool| match f.lookup(path.as_bytes(), c, head, None) {
-            Outcome::Hit(h) => h,
-            _ => panic!("{path}"),
-        };
+    let hit = |path: &str, c: &Conditions, head: bool| match f.lookup(
+        path.as_bytes(),
+        c,
+        head,
+        None,
+        slot(),
+    ) {
+        Outcome::Hit(h) => h,
+        _ => panic!("{path}"),
+    };
+    let whole = |body: &Body| match body {
+        Body::Whole(_, len, _) => Some(*len as u64),
+        _ => None,
+    };
+    assert_eq!(
+        whole(&hit("/exact.bin", &c, false).body),
+        Some(READ_WHOLE_MAX)
+    );
+    // Up to 64 KiB the lookup reads it; above, the runtime thread reads it into its own buffer.
     assert!(
-        matches!(&hit("/exact.bin", &c, false).body, Body::Bytes(b) if b.len() as u64 == READ_WHOLE_MAX)
+        matches!(&hit("/lookup.bin", &c, false).body, Body::Bytes(b) if b.len() as u64 == LOOKUP_READ_MAX)
+    );
+    assert_eq!(
+        whole(&hit("/after.bin", &c, false).body),
+        Some(LOOKUP_READ_MAX + 1)
     );
     assert!(matches!(hit("/over.bin", &c, false).body, Body::File(_)));
     assert!(matches!(&hit("/empty.bin", &c, false).body, Body::Bytes(b) if b.is_empty()));
@@ -624,7 +651,7 @@ fn a_file_is_read_whole_up_to_a_mebibyte_and_sent_from_its_descriptor_above() {
         &part(&format!("bytes=0-{}", READ_WHOLE_MAX - 1)),
         false,
     );
-    assert!(matches!(&edge.body, Body::Bytes(b) if b.len() as u64 == READ_WHOLE_MAX));
+    assert_eq!(whole(&edge.body), Some(READ_WHOLE_MAX));
     // Nothing is read for a 304 or a 416.
     let tag = Conditions {
         if_none_match: hit("/exact.bin", &c, true).meta.etag().into(),
@@ -636,6 +663,20 @@ fn a_file_is_read_whole_up_to_a_mebibyte_and_sent_from_its_descriptor_above() {
     let outside = hit("/over.bin", &part("bytes=99999999-"), false);
     assert_eq!(outside.plan, Plan::Unsatisfiable);
     assert!(matches!(outside.body, Body::None));
+}
+
+#[test]
+fn a_whole_read_fills_the_buffer_it_is_given_and_fails_for_a_file_that_is_shorter_now() {
+    let s = Scratch::new("read-whole");
+    let path = s.file("f.bin", b"0123456789");
+    let file = File::open(path).unwrap();
+    let buf = Vec::with_capacity(4);
+    let at = buf.as_ptr();
+    let read = read_whole(&file, 3, buf, 4).unwrap();
+    assert_eq!(read, b"3456");
+    assert_eq!(read.as_ptr(), at, "the bytes are in the caller's buffer");
+    assert_eq!(read_whole(&file, 8, Vec::new(), 4), None);
+    assert_eq!(read_whole(&file, 10, Vec::new(), 0), Some(Vec::new()));
 }
 
 fn head(plan: Plan, body: Body, size: u64) -> Hit {

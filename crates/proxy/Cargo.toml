@@ -30,3 +30,5 @@ memchr.workspace = true
 
 [dev-dependencies]
 wafio-engine-fake.workspace = true
+# The agent's allocator, for the test that bounds the memory answers leave behind.
+mimalloc.workspace = true

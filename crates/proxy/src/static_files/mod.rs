@@ -15,7 +15,9 @@
 //! one is sent from its open descriptor in 256 KiB reads ([`FileAnswer`], written by the route).
 //!
 //! Every look and every read runs on a blocking thread through the [`DiskGate`], which bounds how
-//! many threads the folders may hold and how long a request waits for the disk.
+//! many threads the folders may hold and how long a request waits for the disk. A body over 64 KiB
+//! is read on the slot of the look that found its file, so a request that found its file is not
+//! turned away for want of a second slot.
 
 mod answer;
 mod gate;
@@ -38,7 +40,7 @@ use crate::request::{InboundRequest, push_escaped_path, push_forward_query};
 use crate::response::{OutboundResponse, http_date};
 pub(crate) use answer::{Asked, asked, parse_http_date};
 use answer::{Conditions, Meta, Plan};
-pub(crate) use gate::{DISK_DEADLINE, DiskGate, LOOKUP_WAIT};
+pub(crate) use gate::{DISK_DEADLINE, DiskGate, LOOKUP_WAIT, Slot};
 use walk::Found;
 
 /// The longest browser cache time: 365 days.
@@ -68,6 +70,12 @@ const HIDDEN_BY_UNIT: &[&str] = &["/home", "/root", "/run/user"];
 
 /// A file up to this size is read whole; a bigger one is sent from its descriptor.
 const READ_WHOLE_MAX: u64 = 1 << 20;
+
+/// A body up to this size is read during the lookup. A bigger one goes into a buffer made on the
+/// runtime thread that frees it, read on the slot the lookup held: mimalloc 2 gives a block over
+/// 64 KiB pages of the thread that made it, and a disk thread that stops allocating never gives
+/// them back to the system.
+const LOOKUP_READ_MAX: u64 = 64 << 10;
 
 /// How much of a big file one read takes.
 pub(crate) const CHUNK: usize = 256 << 10;
@@ -324,6 +332,9 @@ enum Body {
     Cached(Box<OutboundResponse>),
     /// The bytes of the answer, read.
     Bytes(Vec<u8>),
+    /// An answer of more than [`LOOKUP_READ_MAX`] bytes (the second field), read from the file
+    /// after the lookup, on the slot the lookup held (the third).
+    Whole(File, usize, Slot),
     /// A file that is sent after the head.
     File(Arc<File>),
 }
@@ -391,13 +402,15 @@ impl StaticFolder {
     }
 
     /// Looks `path` (the app's decoded path) up and reads what the answer needs. Blocks. `memory`
-    /// is the memory tier of the app's response cache, when it has one.
+    /// is the memory tier of the app's response cache, when it has one. `slot` is the one the
+    /// lookup runs on: a body that is read after it keeps the slot for that read.
     fn lookup(
         &self,
         path: &[u8],
         conditions: &Conditions,
         head: bool,
         memory: Option<&StaticMemory>,
+        slot: Slot,
     ) -> Outcome {
         let Some(target) = names::plan(path) else {
             return Outcome::Missing;
@@ -412,7 +425,7 @@ impl StaticFolder {
             Found::Nothing => Outcome::Missing,
             Found::Slash => Outcome::Slash,
             Found::File(file, seen, name) => {
-                hit(file, &seen, &name, path, conditions, head, memory)
+                hit(file, &seen, &name, path, conditions, head, memory, slot)
                     .map_or(Outcome::Missing, Outcome::Hit)
             }
         }
@@ -423,6 +436,7 @@ impl StaticFolder {
 /// whole file of 1 MiB or less is also looked for in `memory` (by the path and what `fstat` says
 /// of the file: another file, size or time is another key). `None` when the file changed under
 /// the read.
+#[allow(clippy::too_many_arguments)]
 fn hit(
     file: File,
     seen: &walk::Seen,
@@ -431,6 +445,7 @@ fn hit(
     conditions: &Conditions,
     head: bool,
     memory: Option<&StaticMemory>,
+    slot: Slot,
 ) -> Option<Hit> {
     let meta = Meta {
         size: seen.size,
@@ -460,13 +475,15 @@ fn hit(
         Body::Cached(Box::new(answer))
     } else if head || matches!(plan, Plan::NotModified | Plan::Unsatisfiable) {
         Body::None
+    } else if len <= LOOKUP_READ_MAX {
+        Body::Bytes(read_whole(
+            &file,
+            offset,
+            Vec::new(),
+            usize::try_from(len).ok()?,
+        )?)
     } else if len <= READ_WHOLE_MAX {
-        let mut bytes = vec![0; usize::try_from(len).ok()?];
-        let read = walk::read_at_full(&file, &mut bytes, offset).ok()?;
-        if read != bytes.len() {
-            return None;
-        }
-        Body::Bytes(bytes)
+        Body::Whole(file, usize::try_from(len).ok()?, slot)
     } else {
         Body::File(Arc::new(file))
     };
@@ -477,6 +494,13 @@ fn hit(
         body,
         memory: kept,
     })
+}
+
+/// `len` bytes of `file` from `offset`, read into `buf`. Blocks. `None` when the file is shorter now.
+fn read_whole(file: &File, offset: u64, mut buf: Vec<u8>, len: usize) -> Option<Vec<u8>> {
+    buf.resize(len, 0);
+    let read = walk::read_at_full(file, &mut buf, offset).ok()?;
+    (read == len).then_some(buf)
 }
 
 /// The request headers that decide the answer.
@@ -588,9 +612,11 @@ pub(crate) async fn serve(
         let memory = memory.clone();
         shared
             .disk
-            .run(LOOKUP_WAIT, move || {
-                folder.lookup(&path, &conditions, head, memory.as_ref())
-            })
+            .run_slot(
+                LOOKUP_WAIT,
+                crate::metrics::count_static_unavailable,
+                move |slot| folder.lookup(&path, &conditions, head, memory.as_ref(), slot),
+            )
             .await
     };
     let Some(outcome) = looked else {
@@ -607,38 +633,50 @@ pub(crate) async fn serve(
         _ => (0, hit.meta.size),
     };
     let memory_key = hit.memory;
-    match hit.body {
+    let bytes = match hit.body {
         Body::Cached(answer) => {
             crate::metrics::count_static(answer.status, answer.body.len() as u64);
-            Some(Done::Respond(*answer))
+            return Some(Done::Respond(*answer));
         }
         Body::File(file) => {
             crate::metrics::count_static(response.status, 0);
-            Some(Done::File(Box::new(FileAnswer {
+            return Some(Done::File(Box::new(FileAnswer {
                 head: response,
                 file,
                 offset,
                 len,
-            })))
-        }
-        Body::Bytes(bytes) => {
-            response.body = bytes.into();
-            if let (Some(spec), 200) = (&route.compression, response.status) {
-                let stats = shared.edge.app(&route.app_id);
-                crate::compress::apply(&stats, spec, req, &route.session, &mut response).await;
-            }
-            // The whole file, as it was sent, is kept for the next visitor who takes it the same way.
-            if let (Some(key), Some(m), 200) = (memory_key, &memory, response.status) {
-                m.put(key, &response);
-            }
-            crate::metrics::count_static(response.status, response.body.len() as u64);
-            Some(Done::Respond(response))
+            })));
         }
         Body::None => {
             crate::metrics::count_static(response.status, 0);
-            Some(Done::Respond(response))
+            return Some(Done::Respond(response));
         }
+        Body::Bytes(bytes) => bytes,
+        Body::Whole(file, len, slot) => {
+            // Made here, not on a disk thread: see `LOOKUP_READ_MAX`.
+            let buf = Vec::with_capacity(len);
+            let read = shared
+                .disk
+                .run_held(slot, move || read_whole(&file, offset, buf, len))
+                .await;
+            match read {
+                None => return own.then(|| refusal(503)),
+                Some(None) => return own.then(|| refusal(404)),
+                Some(Some(bytes)) => bytes,
+            }
+        }
+    };
+    response.body = bytes.into();
+    if let (Some(spec), 200) = (&route.compression, response.status) {
+        let stats = shared.edge.app(&route.app_id);
+        crate::compress::apply(&stats, spec, req, &route.session, &mut response).await;
     }
+    // The whole file, as it was sent, is kept for the next visitor who takes it the same way.
+    if let (Some(key), Some(m), 200) = (memory_key, &memory, response.status) {
+        m.put(key, &response);
+    }
+    crate::metrics::count_static(response.status, response.body.len() as u64);
+    Some(Done::Respond(response))
 }
 
 #[cfg(test)]
