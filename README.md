@@ -898,8 +898,9 @@ and are part of the key, and a request with more than 256 bytes of them is not c
 `X-Forwarded-Proto`, in any spelling (`_` for `-` too), does not stay beside the agent's (for `X-Forwarded-Proto`, with the cache off too). The host is always the agent's word: a FastCGI
 application is sent `X-Forwarded-Host` with the host of the request and never the client's or a proxy's, because the key does not hold
 what a proxy says there. The scheme is the word of any peer, trusted or not, so that an application behind a proxy that ends TLS keeps
-being told so when the cache is turned on and no proxy is trusted. The value is sent as the key reads it, from every peer and with the
-cache on or off, so the application hears the same either way: `https` over TLS or for a first value of `https`, otherwise `http`
+being told so when the cache is turned on and no proxy is trusted. A proxy the route trusts is passed on as it wrote it (its first
+line, unless the agent ended TLS), with the cache on or off, and with the cache on that value is part of the key. From any other peer the
+value is sent as the key reads it, with the cache on or off: `https` over TLS or for a first value of `https`, otherwise `http`
 (nothing, for FastCGI). A value of any other form cannot make a third kind of answer, and a spoofed `https` only chooses the key that real
 ones choose.
 

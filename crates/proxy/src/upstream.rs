@@ -261,10 +261,13 @@ pub(crate) fn upstream_request(
         }
     }
     u.set(b"X-Forwarded-Host", &req.host);
-    // The scheme as the key reads it, from every peer and with the cache on or off, so the
-    // application gets the same value either way and a value of any other form cannot make a
-    // third kind of answer: it learns that TLS was ended here or by a front proxy, and nothing
-    // else a peer might write there.
+    // A proxy the route trusts says the scheme in its own words, which go on as it wrote them. Any
+    // other peer's word is the scheme the key reads, with the cache on or off: the application
+    // learns that TLS was ended here or by a front proxy, and a value of any other form cannot
+    // make a third kind of answer. Every other spelling goes.
+    let scheme = crate::cache::forwarded_scheme(req, crate::cache::trusts(route, peer))
+        .unwrap_or(b"http")
+        .to_vec();
     let names: Vec<Vec<u8>> = u
         .header_lines
         .iter()
@@ -275,14 +278,7 @@ pub(crate) fn upstream_request(
     for name in names {
         u.del(&name);
     }
-    u.set(
-        b"X-Forwarded-Proto",
-        if crate::cache::is_https(req) {
-            b"https"
-        } else {
-            b"http"
-        },
-    );
+    u.set(b"X-Forwarded-Proto", &scheme);
     for name in &route.proxy_config.request_headers.remove {
         u.del(name.as_bytes());
     }

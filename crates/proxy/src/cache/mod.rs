@@ -360,7 +360,8 @@ pub(crate) fn trusts(route: &Route, peer: &IpAddress) -> bool {
 }
 
 pub(crate) use key::{
-    forwarded_host, forwarded_host_or_proto, forwarded_proto, is_https, unkeyed_input,
+    forwarded_host, forwarded_host_or_proto, forwarded_proto, forwarded_scheme, is_https,
+    unkeyed_input,
 };
 
 /// Whether the route has the cache on and the peer is not a proxy it trusts: what such a peer says
