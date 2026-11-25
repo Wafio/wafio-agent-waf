@@ -39,6 +39,8 @@ const READY_FALLBACK: Duration = Duration::from_secs(20);
 const CLEANUP_EVERY: Duration = Duration::from_secs(120);
 /// How often a process that is waiting for the key directory lock tries to take it.
 const KEY_LOCK_POLL: Duration = Duration::from_millis(200);
+/// How often the response cache looks at the free space of its file system.
+const CACHE_TICK: Duration = Duration::from_secs(60);
 /// FireHOL refresh period.
 const IPREP_REFRESH: Duration = Duration::from_secs(24 * 3600);
 /// The `Hello.features` entry of an agent that serves the maintenance page.
@@ -51,6 +53,10 @@ pub const FEATURE_TLS_CERTIFICATES: &str = "tls_certificates";
 const FEATURE_EDGE_REDIRECTS: &str = "edge_redirects";
 const FEATURE_EDGE_COMPRESSION: &str = "edge_compression";
 const FEATURE_EDGE_STATIC_FILES: &str = "edge_static_files";
+/// The agent keeps the response cache of an app, purges it on request and says in `EdgeStatus`
+/// what became of it. An agent whose cache directory cannot be used sends it too, and says so for
+/// each app: a missing feature would read as an agent too old for the cache.
+const FEATURE_EDGE_CACHE: &str = "edge_cache";
 
 struct Stats;
 
@@ -340,6 +346,7 @@ pub async fn run_waf_agent(
         FEATURE_EDGE_REDIRECTS.into(),
         FEATURE_EDGE_COMPRESSION.into(),
         FEATURE_EDGE_STATIC_FILES.into(),
+        FEATURE_EDGE_CACHE.into(),
     ];
     // Only an agent that could use its key directory at start takes certificates: without one the
     // `tls` objects of its bundles are ignored, and the control plane must not send a key.
@@ -529,7 +536,12 @@ pub async fn run_waf_agent(
         None
     } else {
         let reg = wafio_agent_io::metrics::Registry::new();
-        crate::metrics::register_agent_metrics(&reg, link.clone(), &agent.tls_metrics());
+        crate::metrics::register_agent_metrics(
+            &reg,
+            link.clone(),
+            &agent.tls_metrics(),
+            agent.cache_host(),
+        );
         let ln = match metrics_inherited {
             Some(s) => {
                 s.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -578,6 +590,19 @@ pub async fn run_waf_agent(
             .await;
         }
     });
+    // The response cache looks at the free space of its file system every minute.
+    if agent.cache_host().is_some() {
+        let a = agent.clone();
+        tokio::spawn(async move {
+            let mut t =
+                tokio::time::interval_at(tokio::time::Instant::now() + CACHE_TICK, CACHE_TICK);
+            loop {
+                t.tick().await;
+                let a = a.clone();
+                let _ = tokio::task::spawn_blocking(move || a.cache_tick()).await;
+            }
+        });
+    }
     let gb = good_bots.clone();
     tokio::spawn(async move {
         loop {

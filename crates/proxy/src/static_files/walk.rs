@@ -43,10 +43,13 @@ fn count_open() {
     OPENS.with(|n| n.set(n.get() + 1));
 }
 
-/// What `fstat` said of a regular file: its size and modification time in seconds.
+/// What `fstat` said of a regular file: its size and modification time in seconds, and which
+/// file it is.
 pub(super) struct Seen {
     pub size: u64,
     pub mtime: i64,
+    pub dev: u64,
+    pub ino: u64,
 }
 
 impl Seen {
@@ -54,6 +57,8 @@ impl Seen {
         Seen {
             size: meta.len(),
             mtime: meta.mtime(),
+            dev: meta.dev(),
+            ino: meta.ino(),
         }
     }
 }

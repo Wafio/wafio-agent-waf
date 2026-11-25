@@ -80,6 +80,14 @@ pub(crate) fn count_static_unavailable() {
     STATIC_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Copies of the response cache that failed their check when read (a size, a check sum or a key
+/// that differs) and were deleted.
+pub static CACHE_CORRUPT_FILES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn count_cache_corrupt() {
+    CACHE_CORRUPT_FILES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Most distinct coverage flags kept as labels; the rest count as "other".
 const COVERAGE_LABEL_CAP: usize = 32;
 

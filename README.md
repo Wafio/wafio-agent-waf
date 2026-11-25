@@ -118,7 +118,11 @@ directory that the user they run as owns (the fixed path needs the user of the u
 are built only with it. No release build enables it.
 
 The feature `test-response-cache` lets `WAFIO_TEST_CACHE_DIR` name the response cache directory, for the same reason (the fixed
-`/var/cache/wafio-waf` belongs to the user of the unit); `tests/control_plane.rs` is built only with it. No release build enables it.
+`/var/cache/wafio-waf` belongs to the user of the unit); `tests/control_plane.rs` and `tests/cache_perf.rs` are built only with it. No
+release build enables it. `cache_perf` is a measurement and is ignored by default: it runs the agent binary behind a load generator with the cache
+off, with copies from memory and with copies from disk, and prints the rate, the CPU the agent spends on a request, the latency and the
+requests the upstream saw (`cargo test --profile conformance --features wafio-waf-agent/test-tls,wafio-waf-agent/test-response-cache -p wafio-waf-agent
+--test cache_perf -- --ignored --nocapture`; the variables are named at the top of the file).
 
 The feature `test-cache-delay` makes the agent wait `WAFIO_TEST_CACHE_WRITE_DELAY_MS` milliseconds before it writes the bundle
 cache, so that the last tests of `tests/control_plane.rs` can signal an agent while a write is pending; those tests are built
@@ -190,9 +194,11 @@ The black-box suites that start an agent binary and drive it over HTTP and gRPC 
 ## Hello features
 
 The agent reports in `Hello.features`: `script_rules` (it runs script rules in its own process), `maintenance_mode` (it
-serves the maintenance page, see below), `edge_redirects`, `edge_compression` and `edge_static_files` (it applies the main host
-name and the path prefix of an app, compresses its answers and serves files from a folder, and reports them in `EdgeStatus`, see
-"Main host name and path prefix", "Compression" and "Static files"; `edge_cache` is not sent yet, see "Response cache"), `tls_certificates` (it takes `CertificateInstall` and sends `CertificateStatus`, see
+serves the maintenance page, see below), `edge_redirects`, `edge_compression`, `edge_static_files` and `edge_cache` (it applies the
+main host name and the path prefix of an app, compresses its answers, serves files from a folder and keeps copies of answers, and
+reports them in `EdgeStatus`, see "Main host name and path prefix", "Compression", "Static files" and "Response cache"; a build
+sends `edge_cache` even when its cache directory cannot be used, because the control plane reads a missing feature as an agent that
+is too old and the refusal reaches it through `EdgeStatus`), `tls_certificates` (it takes `CertificateInstall` and sends `CertificateStatus`, see
 "HTTPS from the agent") and, only when no engine is installed, `no_semantic_engine`. The official agent never sends the last
 one. `tls_certificates` goes in every Hello of an agent that could use its key directory at start; without one the start logs a
 warning that names the directory and the cause, the feature is left out, and the `tls` objects of the bundles are ignored. The
@@ -826,7 +832,8 @@ plane sends the object only while it is on, with every number filled in; a numbe
 
 `default_ttl_s` (0 to 365 days) is how long a file of a type that carries no secrets is kept when the application says nothing: `image/*`,
 `font/*`, `video/*`, `audio/*`, `text/css`, `text/javascript`, `application/javascript` and `application/wasm`; 0 turns it off.
-`stale_if_error_s` (0 to a day) is carried but not used yet. `disk_bytes` is 16 MiB to 1 TiB, `memory_bytes` 0 to 4 GiB,
+`stale_if_error_s` (0 to a day) is how long past its life a copy is still sent when the application is down, for an answer that names no
+window of its own. `disk_bytes` is 16 MiB to 1 TiB, `memory_bytes` 0 to 4 GiB,
 `max_object_bytes` 1 KiB to 64 MiB and no more than `disk_bytes`. `session_cookies` has up to 20 names of up to 64 characters
 without spaces, commas, semicolons or `=`. `rules` has up to 50 rules; a prefix starts with `/`, has at most 256 bytes and no space, `?`
 or `#`, and the longest prefix that matches the path decides. A `cache` rule keeps for `ttl_s` (1 second to 365 days) an answer that
@@ -864,8 +871,9 @@ length above 0 or `Transfer-Encoding` on a `GET`, `X-HTTP-Method-Override`, `X-H
 a CGI parameter makes the same header), a path under a
 `bypass` rule, a path with `;` under any rule (`..;` is `..` to some servers), or a path that the app's `response_decrypt_aes` or
 `response_field_rules` rewrite goes to the application as it is, unread and unstored. Every answer of that path carries `X-Cache`: `HIT` (from
-a copy), `MISS` (asked the application, whether or not the answer was kept), `BYPASS`; a file of the static folder is `BYPASS`. An
-answer from the block page, the main host redirect, the path-prefix 404 and a challenge has none.
+a fresh copy), `STALE` (from a copy past its life, see below), `MISS` (asked the application, whether or not the answer was kept; a
+copy that the application confirmed with `304` is a `MISS` too, because it was asked), `BYPASS`; a file of the static folder is
+`BYPASS`. An answer from the block page, the main host redirect, the path-prefix 404 and a challenge has none.
 
 **Key.** The scheme (HTTPS when the agent ended TLS, else the `X-Forwarded-Proto` of a proxy the app trusts, else HTTP), the host in lower case
 without the scheme's own port, the request target the application gets, byte for byte (`?a=1&b=2` and `?b=2&a=1` are two keys), and the encoding
@@ -903,32 +911,83 @@ copies at once. The copy is written behind the answer: the visitor does not wait
 `If-None-Match` (weak comparison, `*`), else `If-Modified-Since` against the copy's `Last-Modified`, gives `304` with the headers a `304`
 carries; one `Range` of a copy that is an identity `200` gives `206` (an unsatisfiable one `416`; several ranges, another unit or a form that
 does not parse give the whole copy), and `If-Range` keeps the range only for the copy's strong tag or exact `Last-Modified`. A request
-with a `Range` is looked up and never makes a copy. A copy that is not fresh is a miss: stale answers, revalidation and a lock for
-one fill at a time are not built yet. A 2xx or 3xx answer to `POST`, `PUT`, `PATCH` or `DELETE` ends the copies of the same URL, in every
-encoding and variant, before the answer goes on.
+with a `Range` is looked up and never makes a copy. A 2xx or 3xx answer to `POST`, `PUT`, `PATCH` or `DELETE` ends the copies of the same
+URL, in every encoding and variant, before the answer goes on.
+
+**One fetch at a time.** A request that may fill (a `GET` with no `Range` from a visitor who is not signed in, or one a rule opens to the
+signed in) and finds no copy takes the lock of its key; every other request for that key waits for it up to 5 seconds and looks again, so
+100 requests for a page that has no copy make one request to the application. The key is the primary key (scheme, host, target, bucket), as the
+`Vary` names are not known before an answer. A request waits too when it cannot fill itself (a signed-in visitor, a `HEAD`, a `Range`), and is
+answered from the copy that comes in. The lock is taken once the folder of static files has not answered the request, so files do not queue.
+When the fetch ends with no copy made, every waiter is woken at once and goes to the application in parallel, and the key is marked as not kept
+for 30 seconds (the `max-age` of an answer that is `private` or `no-store`, at most 10 minutes), so the next requests take no lock. The marks
+are for an answer with no lifetime, a `Set-Cookie`, `private`, `no-store` or `no-cache`, a `Vary` that cannot be kept, an unparsed
+`Cache-Control`, a status that is not kept (not a 5xx, which may pass, and not a `304` or `412`, which answer a condition and say nothing of the
+page), an answer over `max_object_bytes`, an encoding the bucket does not name, and one sent in pieces. A refusal that depends on the visitor (a
+request with a cookie that gets an answer that is not marked public) does not mark. A process that cannot store (a reload's successor) takes no
+lock. A purge clears the marks.
+
+**A copy that is past its life** is read and used in this order. Within the `stale-while-revalidate` of its answer it is sent at once as `STALE`
+and one request in the background (the lock again, so one at a time) fetches the page and makes the copy fresh; only a request that may fill
+starts it. Past that, a request that may fill and finds a copy with an `ETag` or a `Last-Modified` asks the application: the request goes on
+with `If-None-Match` and `If-Modified-Since` of the copy in place of the visitor's own conditions, and a `304` renews the copy with the headers
+it carries (not `Content-Type`, `Content-Encoding`, `Content-Length`, `Content-Range`, `Transfer-Encoding` or `Vary`) and its new lifetime; it is the
+answer, as `MISS`. A `200` is a new answer and replaces the copy as any other. A `304` that sets a cookie, or whose new headers say the answer is
+not to be kept, removes the copy; the visitor still gets the answer with the cookie. A request that may fill goes to the application with none of the
+visitor's own `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since` and `If-Range`: the application is asked for the page to keep,
+and a `304` or `412` for the visitor's condition would be no page. The answer is then held against the visitor's `If-None-Match` and
+`If-Modified-Since` as a copy's is: `304` when the visitor holds that page, else the whole page. A request that cannot fill goes on as it is, with no question of the cache's and with its own conditions. When the
+application cannot answer (it is down, times out, or says 500, 502, 503 or 504, with a length or in pieces), a copy within the `stale-if-error` of its
+answer, else `stale_if_error_s`, is sent as `STALE`, with the decision event of a request answered with it. An answer with `must-revalidate`,
+`proxy-revalidate` or `s-maxage` is never sent stale unless it names its own `stale-while-revalidate` or `stale-if-error`, and then only for the
+window it names. A copy that can neither be confirmed nor stand in for the application (no `ETag` and no `Last-Modified`, no window left) is read
+once, by the first request that finds it, and removed: that request is a miss, and no later one reads it. The refresh in the background ends at the
+upstream timeout of the app, or after 60 seconds when the app has none, and gives up the lock then.
+
+**Purge.** `CachePurge` removes copies from both tiers: `url` the copies of one address (every bucket and `Vary` variant), `prefix` those whose
+path starts with the text, `app` everything. An address that starts with `/` names every host of the app, an absolute `http://` or `https://` URL
+that host only (either scheme; the host is lower case). `url` is compared byte for byte with the stored request target, query included, and
+`prefix` with its path alone. Every purge raises the app's purge count, and an answer whose fetch began before the raise is not stored, so a page
+that was being fetched while the purge ran cannot bring the old copy back. The purge is acked once the index holds none of the copies and their files are
+deleted (`not_in_bundle` for an app the bundle does not name, `cache_off` for one whose cache does not run, `invalid` for a scope or address that is not
+accepted). A process that does not hold the lock of the cache directory (a reload's successor) acks `busy`: it cannot delete files, and the control
+plane asks again.
 
 **Disk and memory.** A file holds a 64-byte header (magic, version, lengths, CRC-32, times), the key, the head and the body. It is
 created with mode 0600 and `O_NOFOLLOW` in `tmp/` and renamed, without `fsync`; a file that a crash tore fails its length or its CRC. It is
-read whole with `O_NOFOLLOW`, within 256 MiB of reads and writes in flight (a request that finds none goes to the application); a size, a CRC or a
+read whole with `O_NOFOLLOW`, within 256 MiB of reads and writes in flight (a request that finds none goes to the application); a copy that is kept
+for a request that is waiting for the application holds its share of that budget until the request ends. A size, a CRC or a
 key that differs deletes the file and is a miss, and so is a link or anything that is not a plain file. All disk work runs on blocking
 threads, within the slots the static folders share. The index holds at most 200,000 entries for each app. Both tiers evict by a
 segmented LRU: new copies enter probation, a second hit moves a copy to the protected segment (four fifths of the quota), so a crawl only
 cycles probation. The disk holds `disk_bytes` and at most one more object while a store is being made. The memory tier holds copies of up
-to 256 KiB from their second hit, up to `memory_bytes` (0 keeps every copy on disk only).
+to 256 KiB from their second hit, up to `memory_bytes` (0 keeps every copy on disk only). It also holds the answers of the static folder: a
+file of 1 MiB or less, as it was sent (compressed for the bucket of the visitor, or not), is kept from its first read under a key of its path, device,
+inode, size, modification time, encoding bucket, whether the visitor is signed in, the browser cache time and the smallest compressed size. The folder
+still looks the file up on every request, so a file that changed is another key; an answer for a range, a `304` and a `HEAD` are not kept. These answers share
+`memory_bytes` and the LRU with the copies, and an app with no cache keeps none.
 
-Not built yet: the lock for one fill of a key at a time and the marks for answers that cannot be kept, `stale-while-revalidate`, `stale-if-error`,
-revalidation, purge, the counters of `EdgeStatus` and the Prometheus series of the cache, what happens when the file system fills while the
-agent runs, files of the static folder in the memory tier, and the Hello feature `edge_cache`. A write that a process without the lock answers
-(a reload's successor) drops the copies from its index and is remembered with its second, up to 4096 URLs; the process that takes the lock deletes
-the files of copies stored in that second or before when it reads the directory again. Past 4096 URLs it deletes every copy stored up to the last
-write.
+**A full file system.** Every minute the agent reads the free space of the file system under the cache directory. Under 5 % of it, no copy is stored
+(`skipped_disk_full`), and the process that holds the lock pushes out the copies the apps use least, one app after another, until that much is free again
+(`evictions`); a later look that finds room lets the stores go on. A write that fails with `ENOSPC` or `EDQUOT` is the same skip, never an error and never
+visible to the visitor.
+
+**Counters.** `EdgeStatus` carries the counters of an app whose cache runs (see below), and the metrics `wafio_waf_cache_requests{app,result}` (`hit_memory`,
+`hit_disk`, `stale`, `miss`, `bypass`: since the agent started), `wafio_waf_cache_bytes{app,tier}` (`disk`, `memory`: now), `wafio_waf_cache_objects{app}` (now),
+`wafio_waf_cache_evictions{app}` and `wafio_waf_cache_corrupt_files`.
+
+Known limits. A write that a process without the lock answers (a reload's successor) drops the copies from its index and is remembered with its
+second, up to 4096 URLs; the process that takes the lock deletes the files of copies stored in that second or before when it reads the directory
+again. Past 4096 URLs it deletes every copy stored up to the last write. A `GET` whose answer was fetched before a `POST` to the same URL can still
+be stored after the `POST` ended the copies of it. An answer from a request that waited for another's fetch and went on after a purge is not stored (its
+purge count is older). The refresh in the background and the question of the cache are made as the request that started them, with its headers.
 
 ## Edge status and cache purge
 
 An agent that applies the parts above sends `EdgeStatus` for the apps of the bundle in force. After a bundle is applied and when a
 stream comes up it sends one for every app, so the control plane learns the generation each app runs: an app that has a part on (a
-main host name, a path prefix, compression or static files) names the parts that run (`redirects`, `compression`, `static_files`,
-each `applied`, or `static_files` `refused` with a code and the folder, see "Static files") and, for
+main host name, a path prefix, compression, static files or a cache) names the parts that run (`redirects`, `compression`, `static_files`,
+`cache`, each `applied`, or `static_files` and `cache` `refused` with a code and a detail, see "Static files" and "Response cache") and, for
 compression, what the app did in the last hour (answers sent compressed, answers that came in pieces and were not, and the bytes
 saved); an app with no part on gets a status with no features and no counters. That is also how a save that switches the last part
 of an app off is answered: the status at the new generation, with nothing running. Every minute while a stream is up the agent sends
@@ -936,11 +995,15 @@ the apps that have a part on again, with fresh counters; it does not repeat the 
 and the agent sends the sum of the buckets still inside the hour, not a total since start. An app that leaves the bundle gets no
 status.
 
-The response cache reports as a part too: `cache` is `applied`, or `refused` with a code and a detail (see "Response cache"), and when
-the cache directory cannot be used every app gets `cache` `refused` `cache_dir_unusable`, whether its cache is on or off. The cache
-counters are not sent yet, and neither is the Hello feature `edge_cache`: this build keeps copies, but the control plane does not
-offer the cache for an agent that does not say it has one. A `CachePurge` is not carried out yet: it is answered `invalid` for a
-scope or address the agent does not accept, `not_in_bundle` for an app the bundle does not name, else `cache_off`.
+The cache of an app that runs (`applied`, or `refused` with `running_previous`) also carries `EdgeCacheCounters`: `requests` (every answer that
+carried an `X-Cache`), `hits_memory`, `hits_disk`, `misses`, `bypass`, `stale`, `stored`, `skipped_no_lifetime`, `skipped_private` (an answer that was
+private or a signed-in visitor's), `skipped_too_large`, `skipped_streamed`, `skipped_disk_full`, `evictions` and `corrupt`, all over the last hour, and the
+gauges `disk_bytes`, `memory_bytes` and `objects`. When the cache directory cannot be used every app gets `cache` `refused` `cache_dir_unusable`,
+whether its cache is on or off; the agent sends the Hello feature `edge_cache` all the same.
+
+A `CachePurge` (see "Response cache") is answered `invalid` for a scope or address the agent does not accept, `not_in_bundle` for an app the
+bundle does not name, `cache_off` for an app whose cache does not run, `busy` for a process that does not hold the lock of the cache directory, else
+done once the copies are gone.
 
 ## Switching inspection off
 

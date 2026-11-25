@@ -6,13 +6,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::format::{Loaded, Times};
-use super::key::{FileId, PrimaryId};
+use super::key::{FileId, PrimaryId, parse_primary};
+use super::purge::Matcher;
 use super::slru::Slru;
+use crate::response::OutboundResponse;
 
 /// The most entries an app's index holds; the oldest go past it.
 pub(crate) const MAX_ENTRIES: usize = 200_000;
 /// The biggest copy the memory tier holds.
 pub(crate) const MEMORY_COPY_MAX: u64 = 256 << 10;
+/// The biggest answer of a static file the memory tier holds.
+pub(crate) const STATIC_COPY_MAX: u64 = 1 << 20;
+/// What the head of a static answer weighs in the memory tier, besides its body.
+const STATIC_HEAD_WEIGHT: u64 = 512;
 
 pub(crate) struct Entry {
     primary: PrimaryId,
@@ -26,7 +32,13 @@ pub(crate) struct Entry {
 struct Primary {
     names: Vec<Vec<u8>>,
     ids: Vec<FileId>,
+    /// The host and the request target the key holds, which a purge by address compares with.
+    /// `None` for a key this agent did not make.
+    address: Option<Address>,
 }
+
+/// The host and the request target of a primary key.
+type Address = (Box<[u8]>, Box<[u8]>);
 
 /// An entry a request found.
 pub(crate) struct Found {
@@ -34,6 +46,9 @@ pub(crate) struct Found {
     /// The whole key (primary and variant), which the file must hold.
     pub key: Vec<u8>,
     pub size: u64,
+    /// The times the entry had when it was found; with the size, they tell the entry from one a
+    /// store put in its place.
+    pub times: Times,
     /// The hits of the entry, this one included.
     pub hits: u32,
     pub mem: Option<Arc<Loaded>>,
@@ -42,10 +57,15 @@ pub(crate) struct Found {
 pub(crate) struct Index {
     entries: HashMap<FileId, Entry>,
     primaries: HashMap<PrimaryId, Primary>,
+    /// Answers of static files kept in memory, by the key of the file as it was when read. They
+    /// share the memory tier's limit and its LRU with the copies of `entries`.
+    statics: HashMap<FileId, OutboundResponse>,
     disk: Slru<FileId>,
     mem: Slru<FileId>,
     disk_limit: u64,
     mem_limit: u64,
+    /// Entries the limits pushed out, since the last [`Index::take_evicted`].
+    evicted: u64,
 }
 
 impl Default for Index {
@@ -54,10 +74,12 @@ impl Default for Index {
         Index {
             entries: HashMap::new(),
             primaries: HashMap::new(),
+            statics: HashMap::new(),
             disk: Slru::default(),
             mem: Slru::default(),
             disk_limit: u64::MAX,
             mem_limit: 0,
+            evicted: 0,
         }
     }
 }
@@ -75,9 +97,22 @@ impl Index {
         self.mem.bytes()
     }
 
+    /// How many entries the limits pushed out since the last call.
+    pub fn take_evicted(&mut self) -> u64 {
+        std::mem::take(&mut self.evicted)
+    }
+
     #[cfg(test)]
     pub fn contains(&self, id: &FileId) -> bool {
         self.entries.contains_key(id)
+    }
+
+    /// Whether the entry of `id` is still the one with this size and these times, and not one a
+    /// store put in its place.
+    pub fn holds(&self, id: &FileId, size: u64, times: Times) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|e| e.size == size && e.times == times)
     }
 
     /// The `Vary` names of a primary key, when it has an entry.
@@ -136,6 +171,7 @@ impl Index {
                 id,
                 key,
                 size: entry.size,
+                times: entry.times,
                 hits: entry.hits,
                 mem: entry.mem.clone(),
             },
@@ -143,14 +179,16 @@ impl Index {
         ))
     }
 
-    /// Adds the file of `id`, which holds the answer with these `names` to the primary key. A
-    /// primary key whose answer now varies by other names loses its other files, which no request
-    /// can reach any more. The files to delete are returned: those, and the entries pushed out by
-    /// the limits (the new entry may be one when it alone does not fit).
+    /// Adds the file of `id`, which holds the answer with these `names` to the primary key
+    /// (`primary_key` is its bytes, from which a purge by address reads the host and the target).
+    /// A primary key whose answer now varies by other names loses its other files, which no
+    /// request can reach any more. The files to delete are returned: those, and the entries pushed
+    /// out by the limits (the new entry may be one when it alone does not fit).
     pub fn insert(
         &mut self,
         id: FileId,
         primary: PrimaryId,
+        primary_key: &[u8],
         names: Vec<Vec<u8>>,
         size: u64,
         times: Times,
@@ -178,6 +216,8 @@ impl Index {
             .or_insert_with(|| Primary {
                 names,
                 ids: Vec::new(),
+                address: parse_primary(primary_key)
+                    .map(|(_, host, target)| (host.into(), target.into())),
             })
             .ids
             .push(id);
@@ -206,9 +246,20 @@ impl Index {
                 break;
             };
             self.remove(&victim);
+            self.evicted += 1;
             gone.push(victim);
         }
         gone
+    }
+
+    /// Pushes out the entry the disk LRU would lose next and returns its file and size, for the
+    /// host to free space on a full file system.
+    pub fn evict_one(&mut self) -> Option<(FileId, u64)> {
+        let victim = self.disk.victim()?;
+        let size = self.entries.get(&victim).map_or(0, |e| e.size);
+        self.remove(&victim);
+        self.evicted += 1;
+        Some((victim, size))
     }
 
     fn trim_memory(&mut self) {
@@ -217,8 +268,11 @@ impl Index {
                 break;
             };
             self.mem.remove(&victim);
-            if let Some(e) = self.entries.get_mut(&victim) {
-                e.mem = None;
+            match self.entries.get_mut(&victim) {
+                Some(e) => e.mem = None,
+                None => {
+                    self.statics.remove(&victim);
+                }
             }
         }
     }
@@ -261,6 +315,52 @@ impl Index {
             }
         }
         gone
+    }
+
+    /// Removes every entry whose key `matcher` names, in both tiers, and returns the files. A
+    /// purge of everything also forgets the static answers in memory.
+    pub fn purge(&mut self, matcher: &Matcher) -> Vec<FileId> {
+        let named: Vec<PrimaryId> = self
+            .primaries
+            .iter()
+            .filter(|(_, p)| {
+                matcher.matches(
+                    p.address
+                        .as_ref()
+                        .map(|(host, target)| (&host[..], &target[..])),
+                )
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let gone = self.drop_primaries(&named);
+        if matcher.is_all() {
+            for key in std::mem::take(&mut self.statics).into_keys() {
+                self.mem.remove(&key);
+            }
+        }
+        gone
+    }
+
+    /// Keeps the answer of a static file, as it was sent, in the memory tier under `key`, when it
+    /// is small enough and memory has room.
+    pub fn admit_static(&mut self, key: FileId, answer: OutboundResponse) {
+        let size = answer.body.len() as u64 + STATIC_HEAD_WEIGHT;
+        if self.mem_limit == 0
+            || answer.body.len() as u64 > STATIC_COPY_MAX
+            || size > self.mem_limit
+        {
+            return;
+        }
+        self.statics.insert(key, answer);
+        self.mem.insert(key, size);
+        self.trim_memory();
+    }
+
+    /// The answer kept for `key`, which counts as a use of it.
+    pub fn static_copy(&mut self, key: &FileId) -> Option<OutboundResponse> {
+        let answer = self.statics.get(key)?.clone();
+        self.mem.touch(key, true, self.mem_limit);
+        Some(answer)
     }
 
     /// Gives the entry of `id` a copy in memory, when it is still the file that was read, the copy
@@ -308,6 +408,7 @@ mod tests {
     use super::*;
     use crate::cache::format::StoredHead;
     use crate::cache::key::{file_id, primary_id};
+    use crate::response::OutboundResponse;
 
     const T: Times = Times {
         stored_at: 100,
@@ -335,7 +436,7 @@ mod tests {
 
     /// An entry of `size` bytes of its own primary key, whose key is the 4 bytes of `n`.
     fn put(ix: &mut Index, n: u32, size: u64) -> Vec<FileId> {
-        ix.insert(id(n), primary(n), Vec::new(), size, T)
+        ix.insert(id(n), primary(n), &[], Vec::new(), size, T)
     }
 
     #[test]
@@ -371,7 +472,7 @@ mod tests {
         };
         for lang in ["id", "en"] {
             let k = key_for(lang);
-            ix.insert(file_id(&k, b""), p, names.clone(), 5, T);
+            ix.insert(file_id(&k, b""), p, &[], names.clone(), 5, T);
         }
         assert_eq!(ix.len(), 2);
         let ask = |ix: &mut Index, lang: &'static str| {
@@ -396,7 +497,7 @@ mod tests {
         assert!(ask(&mut ix, "fr").is_none());
         // The answer now varies by other names: the old variants are unreachable and go.
         let k = key_for("x");
-        let gone = ix.insert(file_id(&k, b""), p, vec![b"user-agent".to_vec()], 5, T);
+        let gone = ix.insert(file_id(&k, b""), p, &[], vec![b"user-agent".to_vec()], 5, T);
         assert_eq!(gone.len(), 2);
         assert_eq!(ix.len(), 1);
         assert_eq!(ix.names(&p), Some(&[b"user-agent".to_vec()][..]));
@@ -495,8 +596,8 @@ mod tests {
         ix.set_limits(u64::MAX, 1000);
         let p = primary(5);
         let (a, b) = (id(50), id(51));
-        ix.insert(a, p, vec![b"accept".to_vec()], 10, T);
-        ix.insert(b, p, vec![b"accept".to_vec()], 10, T);
+        ix.insert(a, p, &[], vec![b"accept".to_vec()], 10, T);
+        ix.insert(b, p, &[], vec![b"accept".to_vec()], 10, T);
         ix.admit_memory(&a, loaded(10));
         put(&mut ix, 6, 10);
         let mut gone = ix.drop_primaries(&[p]);
@@ -520,6 +621,114 @@ mod tests {
         assert!(ix.contains(&id(3)));
     }
 
+    /// An entry whose key holds this host and target.
+    fn at(ix: &mut Index, n: u32, host: &[u8], target: &[u8]) -> Vec<FileId> {
+        use crate::cache::key::{Bucket, primary_key};
+        let key = primary_key(false, host, target, Bucket::Identity, &[]);
+        ix.insert(id(n), primary_id(&key), &key, Vec::new(), 10, T)
+    }
+
+    #[test]
+    fn a_purge_removes_the_entries_an_address_names_in_both_tiers_and_all_of_them_for_the_app() {
+        use crate::cache::purge::{Matcher, PurgeScope};
+        let mut ix = Index::default();
+        ix.set_limits(u64::MAX, 1000);
+        at(&mut ix, 1, b"a.test", b"/p/1");
+        at(&mut ix, 2, b"a.test", b"/p/2?x=1");
+        at(&mut ix, 3, b"b.test", b"/p/1");
+        put(&mut ix, 4, 10);
+        for n in 1..=4 {
+            ix.admit_memory(&id(n), loaded(10));
+        }
+        assert_eq!((ix.len(), ix.memory_bytes()), (4, 40));
+        let purge = |ix: &mut Index, scope| ix.purge(&Matcher::new(scope).unwrap());
+        // A path names every host; an absolute address one.
+        assert_eq!(
+            purge(&mut ix, PurgeScope::Url("http://b.test/p/1")),
+            vec![id(3)]
+        );
+        assert_eq!((ix.len(), ix.memory_bytes(), ix.disk_bytes()), (3, 30, 30));
+        assert!(
+            purge(&mut ix, PurgeScope::Url("/p/2")).is_empty(),
+            "the query is part of it"
+        );
+        assert_eq!(purge(&mut ix, PurgeScope::Prefix("/p/")).len(), 2);
+        assert_eq!((ix.len(), ix.memory_bytes()), (1, 10));
+        assert!(!ix.contains(&id(1)) && ix.contains(&id(4)));
+        assert_eq!(ix.primaries.len(), 1, "no primary key outlives its entries");
+        // An entry whose address is not known is named only by a purge of everything.
+        assert!(purge(&mut ix, PurgeScope::Prefix("/")).is_empty());
+        assert_eq!(purge(&mut ix, PurgeScope::App), vec![id(4)]);
+        assert_eq!((ix.len(), ix.memory_bytes(), ix.disk_bytes()), (0, 0, 0));
+    }
+
+    fn page(body: usize) -> OutboundResponse {
+        let mut r = OutboundResponse::new(200);
+        r.body = vec![b'x'; body].into();
+        r
+    }
+
+    #[test]
+    fn a_static_answer_is_kept_in_the_memory_tier_with_the_copies_and_goes_with_them() {
+        use crate::cache::purge::{Matcher, PurgeScope};
+        let mut ix = Index::default();
+        ix.set_limits(u64::MAX, 3 * (100 + STATIC_HEAD_WEIGHT));
+        let key = |n: u8| [n; 32];
+        for n in 0..3 {
+            ix.admit_static(key(n), page(100));
+        }
+        assert_eq!(ix.memory_bytes(), 3 * (100 + STATIC_HEAD_WEIGHT));
+        assert_eq!(ix.static_copy(&key(0)).unwrap().body.len(), 100);
+        // A fourth pushes out the one nobody touched since, not the one that was just used.
+        ix.admit_static(key(3), page(100));
+        assert!(ix.static_copy(&key(0)).is_some() && ix.static_copy(&key(1)).is_none());
+        // The copies of answers share the limit: one that needs the room takes it.
+        put(&mut ix, 9, 10);
+        ix.admit_memory(&id(9), loaded(10));
+        assert!(ix.memory_bytes() <= 3 * (100 + STATIC_HEAD_WEIGHT));
+        // Too big for the tier, and a tier with no memory.
+        let mut roomy = Index::default();
+        roomy.set_limits(u64::MAX, u64::MAX);
+        roomy.admit_static(key(7), page(STATIC_COPY_MAX as usize));
+        assert!(roomy.static_copy(&key(7)).is_some(), "1 MiB is the biggest");
+        roomy.admit_static(key(8), page(STATIC_COPY_MAX as usize + 1));
+        assert!(roomy.static_copy(&key(8)).is_none());
+        let mut none = Index::default();
+        none.admit_static(key(1), page(10));
+        assert!(none.static_copy(&key(1)).is_none());
+        // A purge of everything forgets them, a purge of an address does not touch them.
+        ix.purge(&Matcher::new(PurgeScope::Url("/x")).unwrap());
+        assert!(ix.static_copy(&key(0)).is_some());
+        ix.purge(&Matcher::new(PurgeScope::App).unwrap());
+        assert_eq!(ix.memory_bytes(), 0);
+        assert!(ix.static_copy(&key(0)).is_none());
+        // And the limits take memory back from them.
+        ix.set_limits(u64::MAX, 1000);
+        ix.admit_static(key(5), page(100));
+        ix.set_limits(u64::MAX, 0);
+        assert_eq!(ix.memory_bytes(), 0);
+        assert!(ix.static_copy(&key(5)).is_none());
+    }
+
+    #[test]
+    fn what_the_limits_push_out_is_counted_once_and_a_free_eviction_takes_the_least_used() {
+        let mut ix = Index::default();
+        ix.set_limits(25, 0);
+        for n in 0..4 {
+            put(&mut ix, n, 10);
+        }
+        assert_eq!(ix.take_evicted(), 2, "ten bytes each, room for two");
+        assert_eq!(ix.take_evicted(), 0);
+        // Asked twice: protected, so the next to go is the other.
+        ix.find(&primary(2), &2u32.to_le_bytes(), |_| Vec::new(), 150);
+        ix.find(&primary(2), &2u32.to_le_bytes(), |_| Vec::new(), 150);
+        assert_eq!(ix.evict_one(), Some((id(3), 10)));
+        assert_eq!(ix.evict_one(), Some((id(2), 10)));
+        assert_eq!(ix.evict_one(), None);
+        assert_eq!((ix.len(), ix.disk_bytes(), ix.take_evicted()), (0, 0, 2));
+        assert!(ix.primaries.is_empty());
+    }
+
     #[test]
     fn what_is_past_its_window_is_found_by_the_larger_of_the_two_windows() {
         let mut ix = Index::default();
@@ -527,8 +736,8 @@ mod tests {
             stale_window: 50,
             ..T
         };
-        ix.insert(id(1), primary(1), Vec::new(), 1, T);
-        ix.insert(id(2), primary(2), Vec::new(), 1, own);
+        ix.insert(id(1), primary(1), &[], Vec::new(), 1, T);
+        ix.insert(id(2), primary(2), &[], Vec::new(), 1, own);
         // fresh_until is 200: with a setting of 10 the first is past at 210, the second at 250.
         assert!(ix.past_window(209, 10).is_empty());
         assert_eq!(ix.past_window(210, 10), vec![id(1)]);

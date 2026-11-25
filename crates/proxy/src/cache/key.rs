@@ -66,30 +66,56 @@ pub(crate) fn normalized(name: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Whether `name` is `want` once it is read as a CGI parameter: lower case, `_` as `-`. `want` is
+/// written that way. Nothing is allocated, as this runs on every header of every request that the
+/// cache does not answer.
+pub(crate) fn same_name(name: &[u8], want: &[u8]) -> bool {
+    name.len() == want.len()
+        && name.iter().zip(want).all(|(&c, &w)| {
+            (if c == b'_' {
+                b'-'
+            } else {
+                c.to_ascii_lowercase()
+            }) == w
+        })
+}
+
+/// What follows `prefix` in `name`, when `name` starts with it (compared as [`same_name`] does).
+fn after_name_prefix<'a>(name: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let (head, rest) = name.split_at_checked(prefix.len())?;
+    same_name(head, prefix).then_some(rest)
+}
+
 /// Whether a request header is one the application may answer differently for and the key does not
 /// hold: the forwarding headers other than the three the agent writes itself, and the headers a
 /// front-end uses to say what it was asked for. An untrusted peer's are not sent to the
 /// application; a trusted proxy's are part of the key.
 pub(crate) fn unkeyed_input(name: &[u8]) -> bool {
-    let n = normalized(name);
-    if let Some(rest) = n.strip_prefix(b"x-forwarded-") {
-        return !matches!(rest, b"for" | b"host" | b"proto");
+    if let Some(rest) = after_name_prefix(name, b"x-forwarded-") {
+        return ![&b"for"[..], b"host", b"proto"]
+            .iter()
+            .any(|own| same_name(rest, own));
     }
-    n.starts_with(b"x-original-")
-        || matches!(
-            &n[..],
-            b"x-host" | b"x-rewrite-url" | b"forwarded" | b"front-end-https" | b"x-url-scheme"
-        )
+    after_name_prefix(name, b"x-original-").is_some()
+        || [
+            &b"x-host"[..],
+            b"x-rewrite-url",
+            b"forwarded",
+            b"front-end-https",
+            b"x-url-scheme",
+        ]
+        .iter()
+        .any(|n| same_name(name, n))
 }
 
 /// `X-Forwarded-Host`, in any spelling a CGI parameter folds into it.
 pub(crate) fn forwarded_host(name: &[u8]) -> bool {
-    normalized(name) == b"x-forwarded-host"
+    same_name(name, b"x-forwarded-host")
 }
 
 /// `X-Forwarded-Host` and `X-Forwarded-Proto`, which the agent writes itself where it can.
 pub(crate) fn forwarded_host_or_proto(name: &[u8]) -> bool {
-    forwarded_host(name) || normalized(name) == b"x-forwarded-proto"
+    forwarded_host(name) || same_name(name, b"x-forwarded-proto")
 }
 
 /// The scheme of the request: HTTPS when the agent ended TLS, else what `X-Forwarded-Proto` of a
@@ -208,6 +234,50 @@ pub(crate) fn request_header_values(req: &InboundRequest, name: &[u8]) -> Vec<u8
     out
 }
 
+/// The scheme (true for HTTPS), host and target a primary key holds. `None` for bytes that are not
+/// one this agent made.
+pub(crate) fn parse_primary(primary: &[u8]) -> Option<(bool, &[u8], &[u8])> {
+    let rest = primary.strip_prefix(b"P1")?;
+    let (&https, rest) = rest.split_first()?;
+    let host_len = usize::from(u16::from_le_bytes(rest.get(..2)?.try_into().ok()?));
+    let rest = &rest[2..];
+    let host = rest.get(..host_len)?;
+    let rest = &rest[host_len..];
+    let target_len = usize::try_from(u32::from_le_bytes(rest.get(..4)?.try_into().ok()?)).ok()?;
+    let target = rest.get(4..)?.get(..target_len)?;
+    Some((https != 0, host, target))
+}
+
+/// A static file as the memory tier tells it apart: its path, and what `fstat` says of it.
+pub(crate) struct StaticFile<'a> {
+    pub path: &'a [u8],
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime: u64,
+}
+
+/// The key of the answer of a static file in memory: the file, the encoding the visitor takes,
+/// whether they are signed in (compression leaves pages alone for them) and `shape`, the settings
+/// that make the answer (browser cache time, smallest compressed size).
+pub(crate) fn static_key(
+    file: &StaticFile<'_>,
+    bucket: Bucket,
+    signed_in: bool,
+    shape: &[u8],
+) -> FileId {
+    let mut hash = Sha256::new();
+    hash.update(b"S1");
+    hash.update((file.path.len() as u64).to_le_bytes());
+    hash.update(file.path);
+    for n in [file.dev, file.ino, file.size, file.mtime] {
+        hash.update(n.to_le_bytes());
+    }
+    hash.update([bucket.byte(), u8::from(signed_in)]);
+    hash.update(shape);
+    hash.finalize().into()
+}
+
 pub(crate) fn primary_id(primary: &[u8]) -> PrimaryId {
     Sha256::digest(primary).into()
 }
@@ -285,6 +355,29 @@ mod tests {
         ] {
             assert!(!unkeyed_input(name.as_bytes()), "{name}");
         }
+    }
+
+    #[test]
+    fn a_name_is_compared_as_a_cgi_parameter_names_it_without_allocating() {
+        assert!(same_name(b"X_Forwarded-HOST", b"x-forwarded-host"));
+        assert!(same_name(b"", b""));
+        assert!(!same_name(b"x-forwarded-hos", b"x-forwarded-host"));
+        assert!(!same_name(b"x-forwarded-hostt", b"x-forwarded-host"));
+        assert!(!same_name(b"x.forwarded.host", b"x-forwarded-host"));
+        assert!(!same_name(
+            "x-forwarded-h\u{f6}st".as_bytes(),
+            b"x-forwarded-host"
+        ));
+        assert_eq!(
+            after_name_prefix(b"X_Original_Url", b"x-original-"),
+            Some(&b"Url"[..])
+        );
+        assert_eq!(
+            after_name_prefix(b"x-original-", b"x-original-"),
+            Some(&b""[..])
+        );
+        assert_eq!(after_name_prefix(b"x-orig", b"x-original-"), None);
+        assert_eq!(after_name_prefix(b"y-original-url", b"x-original-"), None);
     }
 
     #[test]
@@ -444,6 +537,79 @@ mod tests {
         assert!(keyed_inputs(&fat).is_none());
         let fits = request(&format!("X-Original-URL: {}\r\n", "a".repeat(200)));
         assert!(keyed_inputs(&fits).is_some());
+    }
+
+    #[test]
+    fn a_primary_key_gives_back_its_scheme_host_and_target() {
+        let key = primary_key(
+            true,
+            b"a.test:443",
+            b"/x?a=1",
+            Bucket::Gzip,
+            &[(b"x-forwarded-port".to_vec(), b"8443".to_vec())],
+        );
+        assert_eq!(
+            parse_primary(&key),
+            Some((true, &b"a.test"[..], &b"/x?a=1"[..]))
+        );
+        let plain = primary_key(false, b"a.test:8080", b"/", Bucket::Identity, &[]);
+        assert_eq!(
+            parse_primary(&plain),
+            Some((false, &b"a.test:8080"[..], &b"/"[..]))
+        );
+        // A key that is cut anywhere, or is not one of ours, never panics and names nothing wrong.
+        for n in 0..key.len() {
+            if let Some((_, host, target)) = parse_primary(&key[..n]) {
+                assert_eq!((host, target), (&b"a.test"[..], &b"/x?a=1"[..]));
+            }
+        }
+        for bad in [&b""[..], b"P", b"P1", b"P2\x00\x00\x00", b"P1\x00\xff\xff"] {
+            assert!(parse_primary(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_key_of_a_static_answer_changes_with_the_file_the_encoding_and_the_settings() {
+        let file = |ino, size, mtime| StaticFile {
+            path: b"/a.css",
+            dev: 1,
+            ino,
+            size,
+            mtime,
+        };
+        let base = static_key(&file(5, 10, 100), Bucket::Gzip, false, b"s");
+        assert_eq!(
+            base,
+            static_key(&file(5, 10, 100), Bucket::Gzip, false, b"s")
+        );
+        for other in [
+            static_key(&file(6, 10, 100), Bucket::Gzip, false, b"s"),
+            static_key(&file(5, 11, 100), Bucket::Gzip, false, b"s"),
+            static_key(&file(5, 10, 101), Bucket::Gzip, false, b"s"),
+            static_key(&file(5, 10, 100), Bucket::Brotli, false, b"s"),
+            static_key(&file(5, 10, 100), Bucket::Gzip, true, b"s"),
+            static_key(&file(5, 10, 100), Bucket::Gzip, false, b"t"),
+            static_key(
+                &StaticFile {
+                    path: b"/b.css",
+                    ..file(5, 10, 100)
+                },
+                Bucket::Gzip,
+                false,
+                b"s",
+            ),
+            static_key(
+                &StaticFile {
+                    dev: 2,
+                    ..file(5, 10, 100)
+                },
+                Bucket::Gzip,
+                false,
+                b"s",
+            ),
+        ] {
+            assert_ne!(base, other);
+        }
     }
 
     #[test]

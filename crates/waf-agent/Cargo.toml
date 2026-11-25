@@ -36,6 +36,10 @@ required-features = ["test-tls"]
 name = "control_plane"
 required-features = ["test-tls", "test-response-cache"]
 
+[[test]]
+name = "cache_perf"
+required-features = ["test-tls", "test-response-cache"]
+
 [dependencies]
 wafio-agent-io.workspace = true
 wafio-agent-pages.workspace = true

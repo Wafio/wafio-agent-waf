@@ -1,6 +1,6 @@
 //! Black-box test with the real binary: an in-test fake control plane (tonic, mTLS with the
 //! control crate's fixture CA) checks what `wafio-waf-agent` sends — Hello (kind, version,
-//! the features `script_rules`, `maintenance_mode`, `edge_redirects`, `edge_compression`, `edge_static_files`, `tls_certificates` and
+//! the features `script_rules`, `maintenance_mode`, `edge_redirects`, `edge_compression`, `edge_static_files`, `edge_cache`, `tls_certificates` and
 //! `no_semantic_engine`), the first heartbeat with host info and counters, the edge status of an app after its bundle, the
 //! answer to a cache purge, the malware sync
 //! into the security-data dir given by `--security-data-dir`, the bundle ack, READY after the
@@ -283,10 +283,11 @@ async fn agent_talks_to_the_control_plane() {
             "edge_redirects",
             "edge_compression",
             "edge_static_files",
+            "edge_cache",
             "tls_certificates",
             "no_semantic_engine"
         ],
-        "the agent runs script rules, serves the maintenance page itself, applies the main host, the path prefix, compression and static files, has a key directory it can use, and this binary has no engine"
+        "the agent runs script rules, serves the maintenance page itself, applies the main host, the path prefix, compression, static files and the response cache, has a key directory it can use, and this binary has no engine"
     );
 
     // The stream: Hello, then the first heartbeat with host info and the agent's counters.
@@ -366,7 +367,12 @@ async fn agent_talks_to_the_control_plane() {
         ]
     );
     assert_eq!(edge.compression, Some(EdgeCompressionCounters::default()));
-    assert!(edge.cache.is_none() && edge.unix_time > 0);
+    assert_eq!(
+        edge.cache,
+        Some(EdgeCacheCounters::default()),
+        "a cache that has not answered yet reports zeros"
+    );
+    assert!(edge.unix_time > 0);
     notify
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
@@ -492,23 +498,27 @@ async fn agent_talks_to_the_control_plane() {
         (false, "not_in_bundle")
     );
 
-    // A purge: this build has no response cache, so an app of the bundle has none, and an app that is
-    // not in it is not named by it.
-    for (id, app, code) in [
-        ("cp1", "web", "cache_off"),
+    // A purge of the app removes its copies: it is acked once they are gone, and the next request
+    // goes to the application. An app that is not in the bundle is not named by it, and an
+    // address that is not one is invalid.
+    for (id, app, scope, url, code) in [
+        ("cp1", "web", "app", "", ""),
         (
             "cp2",
             "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11",
+            "app",
+            "",
             "not_in_bundle",
         ),
+        ("cp3", "web", "url", "kept", "invalid"),
     ] {
         c.out
             .send(Ok(ServerMessage {
                 kind: Some(In::CachePurge(CachePurge {
                     command_id: id.into(),
                     app_id: app.into(),
-                    scope: "app".into(),
-                    url: String::new(),
+                    scope: scope.into(),
+                    url: url.into(),
                 })),
             }))
             .await
@@ -520,8 +530,54 @@ async fn agent_talks_to_the_control_plane() {
                 break a;
             }
         };
-        assert_eq!((ack.ok, ack.error.as_str()), (false, code), "{id}");
+        assert_eq!(
+            (ack.ok, ack.error.as_str()),
+            (code.is_empty(), code),
+            "{id}"
+        );
     }
+    let after = tokio::task::spawn_blocking(move || get(listen, "/shop/kept", ""))
+        .await
+        .unwrap();
+    assert!(
+        after.contains("X-Cache: MISS\r\n"),
+        "the copy is gone: {after}"
+    );
+    // A purge of one address, as the dashboard sends it, takes the copy that comes back.
+    let mut again = String::new();
+    for _ in 0..50 {
+        again = tokio::task::spawn_blocking(move || get(listen, "/shop/kept", ""))
+            .await
+            .unwrap();
+        if again.contains("X-Cache: HIT\r\n") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(again.contains("X-Cache: HIT\r\n"), "{again}");
+    c.out
+        .send(Ok(ServerMessage {
+            kind: Some(In::CachePurge(CachePurge {
+                command_id: "cp4".into(),
+                app_id: "web".into(),
+                scope: "url".into(),
+                url: "/shop/kept".into(),
+            })),
+        }))
+        .await
+        .unwrap();
+    let ack = loop {
+        if let Some(Out::Ack(a)) = c.next().await.kind
+            && a.command_id == "cp4"
+        {
+            break a;
+        }
+    };
+    assert!(ack.ok, "{}", ack.error);
+    let after = tokio::task::spawn_blocking(move || get(listen, "/shop/kept", ""))
+        .await
+        .unwrap();
+    assert!(after.contains("X-Cache: MISS\r\n"), "{after}");
 
     // KeyRotation: acked, the agent reconnects with the new key...
     let kr = KeyRotation {

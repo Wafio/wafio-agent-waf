@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -22,10 +22,13 @@ use nix::fcntl::{Flock, FlockArg};
 use tokio::sync::Semaphore;
 
 use super::control::vary_names;
+use super::fills::Fills;
 use super::format::{self, Loaded, ReadError, TMP_DIR, Times};
 use super::host::{CacheRefusal, CacheRefusalCode, HostFacts, check_dir};
 use super::index::{Found, Index, MAX_ENTRIES};
 use super::key::{FileId, PrimaryId, from_hex, primary_id};
+use super::purge::{Matcher, PurgeScope};
+use super::stats::{CacheCounters, CacheTotals, Count, Counters};
 
 /// What may be read from disk or written to it at once, in bytes of files.
 pub(crate) const IN_FLIGHT_MAX: usize = 256 << 20;
@@ -53,6 +56,13 @@ pub(crate) struct HostState {
     holder: AtomicBool,
     ready: AtomicBool,
     cleaned: AtomicBool,
+    /// The file system is nearly full (free space under 5 %): nothing is stored until a check
+    /// finds room again.
+    disk_full: AtomicBool,
+    /// Tests: every write fails as if the file system were full.
+    fail_writes: AtomicBool,
+    /// Tests: free bytes and size of the file system, in place of what `statvfs` says.
+    pretend_free: Mutex<Option<(u64, u64)>>,
     /// Answers that are being written behind the visitor's back.
     stores: AtomicUsize,
     pub budget: Arc<Semaphore>,
@@ -111,6 +121,9 @@ impl Dropped {
 
 /// An answer to put on disk.
 pub(crate) struct Store {
+    /// The purge count of the app when the fetch of this answer began: a purge since then drops
+    /// the answer.
+    pub purge_gen: u64,
     pub id: FileId,
     pub primary: PrimaryId,
     pub key: Vec<u8>,
@@ -126,7 +139,31 @@ pub(crate) struct Store {
 pub(crate) enum Skip {
     /// This process is not the writer yet, or any more.
     NotWriter,
+    /// A purge began after the answer was asked for.
+    Purged,
+    /// The file system is full or nearly so.
+    DiskFull,
     Disk(io::Error),
+}
+
+/// Whether a write failed for want of room.
+fn no_space(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(nix::libc::ENOSPC | nix::libc::EDQUOT)
+    )
+}
+
+/// Why a purge was not done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurgeError {
+    /// The app has no cache here.
+    CacheOff,
+    /// This process does not write (a reload's successor, or still reading the directory): try
+    /// again later.
+    Busy,
+    /// An address that is not a path or an absolute `http://` or `https://` URL.
+    Invalid,
 }
 
 /// One app's files and index.
@@ -140,6 +177,10 @@ pub(crate) struct AppCache {
     /// `stale_if_error_s` of the settings in force: the window kept past an answer's life when
     /// the answer names none of its own.
     stale_s: AtomicU32,
+    /// Raised by every purge; an answer fetched before the raise is not stored.
+    purges: AtomicU64,
+    fills: Arc<Fills>,
+    counts: Counters,
 }
 
 impl AppCache {
@@ -151,11 +192,44 @@ impl AppCache {
             index: Mutex::new(Index::default()),
             dropped: Mutex::new(Dropped::default()),
             stale_s: AtomicU32::new(0),
+            purges: AtomicU64::new(0),
+            fills: Arc::default(),
+            counts: Counters::default(),
         }
     }
 
     pub fn index(&self) -> MutexGuard<'_, Index> {
         lock(&self.index)
+    }
+
+    pub fn fills(&self) -> &Arc<Fills> {
+        &self.fills
+    }
+
+    pub fn count(&self, what: Count) {
+        self.counts.add(what, 1);
+    }
+
+    /// What was counted over the last hour at second `now`, for the tests of the cache.
+    #[cfg(test)]
+    pub fn hour(&self, now: u64) -> CacheCounters {
+        self.counts.hour(now)
+    }
+
+    /// The `stale_if_error_s` of the settings in force.
+    pub fn stale_if_error_s(&self) -> u32 {
+        self.stale_s.load(Ordering::Relaxed)
+    }
+
+    /// The purge count now: what a fetch that begins now carries.
+    pub fn purge_count(&self) -> u64 {
+        self.purges.load(Ordering::Acquire)
+    }
+
+    /// Adds what the limits pushed out of the index since the last look to the counters. The
+    /// caller holds the index.
+    fn account_evictions(&self, index: &mut Index) {
+        self.counts.add(Count::Evictions, index.take_evicted());
     }
 
     /// Whether this process may write now: it holds the lock, the index is built and the clean
@@ -178,43 +252,109 @@ impl AppCache {
 
     /// Reads and checks the file of an entry. A file that is not what the index says (a size, a
     /// check sum or a key that differs, a link in its place) is removed, from the index and from
-    /// the disk, and is reported as `Corrupt`; one that is gone is dropped from the index.
+    /// the disk, and is reported as `Corrupt`; one that is gone is dropped from the index. A store
+    /// that put a newer file in place since `found` was taken is not damage: the entry is left, and
+    /// the read is `Replaced`.
     pub fn read(&self, found: &Found) -> Result<Loaded, ReadError> {
         let path = format::path_of(&self.dir, &found.id);
         let read = format::read(&path, found.size, &found.key);
-        match &read {
-            Err(ReadError::Corrupt) => {
-                self.index().remove(&found.id);
-                if self.host.holder.load(Ordering::Acquire) {
-                    let _ = std::fs::remove_file(&path);
-                }
+        match read {
+            Err(ReadError::Corrupt) if self.forget(&found.id, found.size, found.times) => {
+                self.counts.add(Count::Corrupt, 1);
+                crate::metrics::count_cache_corrupt();
+                read
             }
-            Err(ReadError::Missing) => {
-                self.index().remove(&found.id);
-            }
-            _ => {}
+            Err(ReadError::Missing) if self.forget(&found.id, found.size, found.times) => read,
+            Err(ReadError::Corrupt | ReadError::Missing) => Err(ReadError::Replaced),
+            _ => read,
         }
-        read
     }
 
-    /// Puts an answer on disk and in the index; what the limits push out is deleted.
+    /// Puts an answer on disk and in the index; what the limits push out is deleted. A full file
+    /// system is a skip, never an error: free space under 5 % stops stores (`DiskFull`), and so
+    /// does a write that fails for want of room. The file takes its name while the index is held,
+    /// so a reader that opens the new file finds the new entry when it asks.
     pub fn store(&self, s: Store) -> Result<(), Skip> {
         if !self.can_store() {
             return Err(Skip::NotWriter);
         }
-        let size = format::write(
-            &self.dir,
-            &s.id,
-            s.primary_len,
-            &s.key,
-            &s.head,
-            &s.body,
+        if s.purge_gen != self.purge_count() {
+            return Err(Skip::Purged);
+        }
+        if self.host.disk_full.load(Ordering::Acquire) {
+            self.counts.add(Count::SkippedDiskFull, 1);
+            return Err(Skip::DiskFull);
+        }
+        let written = if self.host.fail_writes.load(Ordering::Relaxed) {
+            Err(io::Error::from_raw_os_error(nix::libc::ENOSPC))
+        } else {
+            format::write_temp(
+                &self.dir,
+                &s.id,
+                s.primary_len,
+                &s.key,
+                &s.head,
+                &s.body,
+                s.times,
+            )
+        };
+        let skip = |e: io::Error| {
+            if no_space(&e) {
+                self.counts.add(Count::SkippedDiskFull, 1);
+                Skip::DiskFull
+            } else {
+                Skip::Disk(e)
+            }
+        };
+        let written = written.map_err(skip)?;
+        let size = written.size();
+        let mut index = self.index();
+        // A purge raises the count before it takes the index, so one that comes after this check
+        // finds the entry and drops it.
+        if s.purge_gen != self.purge_count() {
+            drop(index);
+            written.discard();
+            return Err(Skip::Purged);
+        }
+        written.place().map_err(skip)?;
+        let gone = index.insert(
+            s.id,
+            s.primary,
+            &s.key[..s.primary_len],
+            s.names,
+            size,
             s.times,
-        )
-        .map_err(Skip::Disk)?;
-        let gone = self.index().insert(s.id, s.primary, s.names, size, s.times);
+        );
+        self.account_evictions(&mut index);
+        drop(index);
+        if !gone.contains(&s.id) {
+            self.counts.add(Count::Stored, 1);
+        }
         self.delete_files(&gone);
         Ok(())
+    }
+
+    /// Removes what `matcher` names and ends every fetch that began before: the purge count is
+    /// raised before the index is taken. The files go before this returns.
+    fn purge(&self, matcher: &Matcher) {
+        self.purges.fetch_add(1, Ordering::AcqRel);
+        self.fills.clear_marks();
+        let gone = self.index().purge(matcher);
+        self.delete_files(&gone);
+    }
+
+    /// Forgets an entry and deletes its file: its copy is no longer to be kept. Only the entry
+    /// with this `size` and these `times`, the one that was read: a store may have put a newer one
+    /// in its place since, which stays. The file goes while the index is held, so a store that
+    /// puts a new file under the name comes after. Returns whether the entry went.
+    pub fn forget(&self, id: &FileId, size: u64, times: Times) -> bool {
+        let mut index = self.index();
+        if !index.holds(id, size, times) {
+            return false;
+        }
+        index.remove(id);
+        self.delete_files(std::slice::from_ref(id));
+        true
     }
 
     /// Removes the files of entries that are no longer in the index, when this process may delete.
@@ -248,6 +388,16 @@ impl AppCache {
     }
 }
 
+/// What an app's cache counted since the agent started and what it holds now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppMetrics {
+    pub app_id: String,
+    pub totals: CacheTotals,
+    pub objects: u64,
+    pub disk_bytes: u64,
+    pub memory_bytes: u64,
+}
+
 /// The settings of an app the store needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheLimits {
@@ -261,6 +411,8 @@ pub struct CacheLimits {
 struct Scanned {
     id: FileId,
     primary: PrimaryId,
+    /// The bytes of the primary key, for the address a purge compares with.
+    primary_key: Vec<u8>,
     names: Vec<Vec<u8>>,
     size: u64,
     times: Times,
@@ -372,6 +524,7 @@ fn scan_shard(shard: &str, dir: &Path, found: &mut Vec<Scanned>, junk: &mut Vec<
         found.push(Scanned {
             id,
             primary: primary_id(&summary.key[..summary.primary_len]),
+            primary_key: summary.key[..summary.primary_len].to_vec(),
             names,
             size: summary.size,
             times: summary.times,
@@ -406,6 +559,9 @@ impl CacheHost {
                 holder: AtomicBool::new(false),
                 ready: AtomicBool::new(false),
                 cleaned: AtomicBool::new(false),
+                disk_full: AtomicBool::new(false),
+                fail_writes: AtomicBool::new(false),
+                pretend_free: Mutex::new(None),
                 stores: AtomicUsize::new(0),
                 budget: Arc::new(Semaphore::new(IN_FLIGHT_MAX)),
             }),
@@ -544,8 +700,16 @@ impl CacheHost {
                         gone.push(e.id);
                         continue;
                     }
-                    gone.extend(ix.insert(e.id, e.primary, e.names, e.size, e.times));
+                    gone.extend(ix.insert(
+                        e.id,
+                        e.primary,
+                        &e.primary_key,
+                        e.names,
+                        e.size,
+                        e.times,
+                    ));
                 }
+                app.account_evictions(&mut ix);
                 // The writer deletes those files below; a process that cannot keeps its notes for
                 // the day it takes the lock.
                 if self.holds_lock() {
@@ -578,9 +742,12 @@ impl CacheHost {
             };
             app.stale_s
                 .store(limits.stale_if_error_s, Ordering::Relaxed);
-            let gone = app
-                .index()
-                .set_limits(limits.disk_bytes, limits.memory_bytes);
+            let gone = {
+                let mut index = app.index();
+                let gone = index.set_limits(limits.disk_bytes, limits.memory_bytes);
+                app.account_evictions(&mut index);
+                gone
+            };
             app.delete_files(&gone);
         }
         lock(&self.apps).retain(|id, _| live.contains(id));
@@ -663,6 +830,132 @@ impl CacheHost {
     /// What the host has for the cache directory.
     pub fn host_facts(&self) -> io::Result<HostFacts> {
         HostFacts::read(&self.dir)
+    }
+
+    /// Removes the copies `scope` names from `app_id`, in both tiers, and ends the fetches that
+    /// began before. Once this returns the index holds none of them and their files are gone.
+    /// Blocks. A process that does not write (a reload's successor, or one that has not read the
+    /// directory yet) cannot delete files and says `Busy`.
+    pub fn purge(&self, app_id: &str, scope: PurgeScope<'_>) -> Result<(), PurgeError> {
+        let matcher = Matcher::new(scope).ok_or(PurgeError::Invalid)?;
+        let app = lock(&self.apps)
+            .get(app_id)
+            .cloned()
+            .ok_or(PurgeError::CacheOff)?;
+        if !(self.holds_lock() && self.is_ready()) {
+            return Err(PurgeError::Busy);
+        }
+        app.purge(&matcher);
+        Ok(())
+    }
+
+    /// What the cache of `app_id` counted over the last hour and holds now; `None` for an app the
+    /// store does not know.
+    pub fn counters(&self, app_id: &str) -> Option<CacheCounters> {
+        let app = lock(&self.apps).get(app_id).cloned()?;
+        let (objects, disk, memory) = app.usage();
+        Some(CacheCounters {
+            disk_bytes: disk,
+            memory_bytes: memory,
+            objects: objects as u64,
+            ..app.counts.hour(now())
+        })
+    }
+
+    /// What each app's cache counted since the agent started and holds now, by app id, for the
+    /// metrics.
+    pub fn metrics(&self) -> Vec<AppMetrics> {
+        let mut apps: Vec<AppMetrics> = lock(&self.apps)
+            .values()
+            .map(|app| {
+                let (objects, disk_bytes, memory_bytes) = app.usage();
+                AppMetrics {
+                    app_id: app.id.clone(),
+                    totals: app.counts.totals(),
+                    objects: objects as u64,
+                    disk_bytes,
+                    memory_bytes,
+                }
+            })
+            .collect();
+        apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+        apps
+    }
+
+    /// Looks at the free space of the file system under the cache directory. Under 5 % of it, no
+    /// copy is stored until a later look finds room, and the writer pushes out the copies the
+    /// apps use least until that much is free again. Run it every minute. Blocks.
+    pub fn check_disk(&self) {
+        let pretend = *lock(&self.state.pretend_free);
+        let (free, size) = match pretend {
+            Some(pair) => pair,
+            None => match HostFacts::read(&self.dir) {
+                Ok(f) => (f.free_bytes, f.fs_bytes),
+                Err(e) => {
+                    tracing::warn!("[cache] free space could not be read: {e}");
+                    return;
+                }
+            },
+        };
+        let floor = size / 20;
+        let full = free < floor;
+        if self.state.disk_full.swap(full, Ordering::AcqRel) != full {
+            if full {
+                tracing::warn!(
+                    "[cache] the file system has under 5 % free: no copy is stored until it has room"
+                );
+            } else {
+                tracing::info!("[cache] the file system has room again: copies are stored");
+            }
+        }
+        if !full || !self.holds_lock() || !self.is_ready() {
+            return;
+        }
+        let mut need = floor - free;
+        let mut doomed: Vec<(Arc<AppCache>, Vec<FileId>)> = lock(&self.apps)
+            .values()
+            .map(|app| (app.clone(), Vec::new()))
+            .collect();
+        doomed.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        // One copy at a time from each app in turn, so no app loses all of its own first.
+        while need > 0 {
+            let mut freed_any = false;
+            for (app, gone) in &mut doomed {
+                if need == 0 {
+                    break;
+                }
+                let victim = {
+                    let mut index = app.index();
+                    let victim = index.evict_one();
+                    app.account_evictions(&mut index);
+                    victim
+                };
+                if let Some((id, size)) = victim {
+                    gone.push(id);
+                    need = need.saturating_sub(size.max(1));
+                    freed_any = true;
+                }
+            }
+            if !freed_any {
+                break;
+            }
+        }
+        for (app, gone) in doomed {
+            app.delete_files(&gone);
+        }
+    }
+
+    /// Tests: what the free space check sees (free bytes, size of the file system) in place of
+    /// the file system, or `None` for the file system again.
+    #[doc(hidden)]
+    pub fn pretend_free_space(&self, pair: Option<(u64, u64)>) {
+        *lock(&self.state.pretend_free) = pair;
+    }
+
+    /// Tests: every write fails as if the file system were full.
+    #[doc(hidden)]
+    pub fn fail_writes_for_want_of_room(&self, on: bool) {
+        self.state.fail_writes.store(on, Ordering::Relaxed);
     }
 
     /// Entries, bytes on disk and bytes in memory of an app; `None` for one the store does not
@@ -760,6 +1053,7 @@ mod tests {
     fn answer(name: &str, body: &[u8], times: Times) -> Store {
         let key = name.as_bytes().to_vec();
         Store {
+            purge_gen: 0,
             id: file_id(&key, b""),
             primary: primary_id(&key),
             primary_len: key.len(),
@@ -1161,6 +1455,280 @@ mod tests {
         let used = host.disk_in_use(Duration::from_secs(1)).unwrap();
         assert!((300..1000).contains(&used), "{used}");
         assert!(host.host_facts().unwrap().fs_bytes > 0);
+    }
+
+    #[test]
+    fn an_answer_that_was_asked_for_before_a_purge_is_not_stored_and_leaves_no_file() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        let begun = app.purge_count();
+        app.store(Store {
+            purge_gen: begun,
+            ..answer("kept", b"1", FRESH)
+        })
+        .unwrap();
+        host.purge("shop", PurgeScope::Url("/nothing")).unwrap();
+        assert_eq!(app.purge_count(), begun + 1, "every purge raises the count");
+        let late = Store {
+            purge_gen: begun,
+            ..answer("late", b"2", FRESH)
+        };
+        let path = format::path_of(&dir.0.join("shop"), &late.id);
+        assert!(matches!(app.store(late), Err(Skip::Purged)));
+        assert!(!path.exists() && !has(&app, "late"));
+        // One asked for after it is kept.
+        app.store(Store {
+            purge_gen: app.purge_count(),
+            ..answer("after", b"3", FRESH)
+        })
+        .unwrap();
+        assert!(has(&app, "after"));
+    }
+
+    #[test]
+    fn a_purge_names_what_it_removes_and_says_why_it_cannot() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        for name in ["one", "two"] {
+            app.store(answer(name, b"x", FRESH)).unwrap();
+        }
+        assert_eq!(
+            host.purge("nope", PurgeScope::App),
+            Err(PurgeError::CacheOff)
+        );
+        assert_eq!(
+            host.purge("shop", PurgeScope::Url("a")),
+            Err(PurgeError::Invalid)
+        );
+        assert_eq!(
+            host.usage("shop").unwrap().0,
+            2,
+            "nothing went for a refusal"
+        );
+        assert_eq!(host.purge("shop", PurgeScope::App), Ok(()));
+        assert_eq!(host.usage("shop").unwrap().0, 0);
+        assert!(
+            std::fs::read_dir(dir.0.join("shop"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name() != "tmp")
+                .all(|shard| std::fs::read_dir(shard.path()).unwrap().count() == 0),
+            "the files went with the entries"
+        );
+        // A process that does not hold the lock cannot delete, so it says to try again.
+        let reader = CacheHost::open(&dir.0, uid()).unwrap();
+        reader.commit(&[limits("shop", 1 << 20)]);
+        assert_eq!(reader.purge("shop", PurgeScope::App), Err(PurgeError::Busy));
+    }
+
+    #[test]
+    fn a_full_file_system_and_a_write_without_room_are_skips_and_are_counted() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        host.fail_writes_for_want_of_room(true);
+        assert!(matches!(
+            app.store(answer("a", b"x", FRESH)),
+            Err(Skip::DiskFull)
+        ));
+        assert!(!has(&app, "a"));
+        host.fail_writes_for_want_of_room(false);
+        // Under 5 % free the check stops the stores; room again lets them go on.
+        host.pretend_free_space(Some((4, 100)));
+        host.check_disk();
+        assert!(matches!(
+            app.store(answer("b", b"x", FRESH)),
+            Err(Skip::DiskFull)
+        ));
+        host.pretend_free_space(Some((5, 100)));
+        host.check_disk();
+        app.store(answer("c", b"x", FRESH)).unwrap();
+        let hour = app.hour(now());
+        assert_eq!((hour.skipped_disk_full, hour.stored), (2, 1));
+        // Another error of the disk is an error, not a skip.
+        assert!(no_space(&io::Error::from_raw_os_error(nix::libc::EDQUOT)));
+        assert!(!no_space(&io::Error::from_raw_os_error(nix::libc::EACCES)));
+    }
+
+    #[test]
+    fn a_nearly_full_file_system_loses_the_least_used_copies_of_every_app_in_turn() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("a", 1 << 20), limits("b", 1 << 20)]);
+        let (a, b) = (host.app("a").unwrap(), host.app("b").unwrap());
+        let body = [0u8; 1000];
+        for n in 0..4 {
+            a.store(answer(&format!("a{n}"), &body, FRESH)).unwrap();
+        }
+        b.store(answer("b0", &body, FRESH)).unwrap();
+        let each = host.usage("b").unwrap().1;
+        // The floor is the size of three files and nothing is free: three go, one from each app in
+        // turn, so the app with more of them keeps more.
+        host.pretend_free_space(Some((0, each * 20 * 3)));
+        host.check_disk();
+        let left = host.usage("a").unwrap().0 + host.usage("b").unwrap().0;
+        assert_eq!(left, 2, "five files, three of them freed");
+        assert!(host.usage("b").unwrap().0 == 0 || host.usage("a").unwrap().0 == 1);
+        assert_eq!(a.hour(now()).evictions + b.hour(now()).evictions, 3);
+        let on_disk = |app: &str| -> usize {
+            std::fs::read_dir(dir.0.join(app))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name() != "tmp")
+                .map(|shard| std::fs::read_dir(shard.path()).unwrap().count())
+                .sum()
+        };
+        assert_eq!(
+            on_disk("a") + on_disk("b"),
+            left,
+            "no file outlives its entry"
+        );
+        // A process that does not hold the lock stops stores but deletes nothing.
+        let reader = CacheHost::open(&dir.0, uid()).unwrap();
+        reader.commit(&[limits("a", 1 << 20), limits("b", 1 << 20)]);
+        reader.pretend_free_space(Some((0, 1000)));
+        reader.check_disk();
+        assert_eq!(on_disk("a") + on_disk("b"), left);
+        // Free space that cannot be read changes nothing.
+        reader.pretend_free_space(None);
+        reader.check_disk();
+    }
+
+    #[test]
+    fn the_counters_and_the_gauges_of_an_app_are_what_it_did_and_holds() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        app.store(answer("a", b"12345", FRESH)).unwrap();
+        app.count(Count::HitDisk);
+        app.count(Count::HitDisk);
+        app.count(Count::Miss);
+        let c = host.counters("shop").unwrap();
+        assert_eq!((c.stored, c.hits_disk, c.misses, c.requests), (1, 2, 1, 3));
+        assert_eq!((c.objects, c.disk_bytes > 0, c.memory_bytes), (1, true, 0));
+        assert!(host.counters("nope").is_none());
+        let m = host.metrics();
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            (m[0].app_id.as_str(), m[0].objects, m[0].totals.hits_disk),
+            ("shop", 1, 2)
+        );
+        // A file that fails its check is counted as corrupt, here and for the process.
+        let path = format::path_of(&dir.0.join("shop"), &answer("a", b"", FRESH).id);
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let (found, _) = app
+            .index()
+            .find(&primary_id(b"a"), b"a", |_| Vec::new(), 10)
+            .unwrap();
+        let before = crate::metrics::CACHE_CORRUPT_FILES.load(Ordering::Relaxed);
+        assert!(app.read(&found).is_err());
+        assert_eq!(host.counters("shop").unwrap().corrupt, 1);
+        assert!(crate::metrics::CACHE_CORRUPT_FILES.load(Ordering::Relaxed) > before);
+        // An entry that is forgotten takes its file, but only the entry that was read: one a
+        // store put in its place since stays.
+        app.store(answer("b", b"x", FRESH)).unwrap();
+        let b = answer("b", b"", FRESH).id;
+        let (read, _) = app
+            .index()
+            .find(&primary_id(b"b"), b"b", |_| Vec::new(), 10)
+            .unwrap();
+        let newer = Times {
+            stored_at: 2,
+            ..FRESH
+        };
+        app.store(answer("b", b"y", newer)).unwrap();
+        assert!(!app.forget(&b, read.size, read.times));
+        assert!(has(&app, "b") && format::path_of(&dir.0.join("shop"), &b).exists());
+        assert!(app.forget(&b, read.size, newer));
+        assert!(!has(&app, "b") && !format::path_of(&dir.0.join("shop"), &b).exists());
+    }
+
+    #[test]
+    fn a_reader_of_an_older_entry_than_the_file_finds_no_damage_and_the_new_entry_stays() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        app.store(answer("one", b"short", FRESH)).unwrap();
+        let (found, _) = app
+            .index()
+            .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
+            .unwrap();
+        // A refresh stores a longer answer under the same name before this reader opens the file.
+        let newer = Times {
+            stored_at: 2,
+            ..FRESH
+        };
+        app.store(answer("one", b"a much longer answer than before", newer))
+            .unwrap();
+        assert_eq!(app.read(&found).err(), Some(ReadError::Replaced));
+        let corrupt = host.counters("shop").unwrap().corrupt;
+        assert_eq!(corrupt, 0, "nothing was damaged");
+        let path = format::path_of(&dir.0.join("shop"), &found.id);
+        assert!(path.exists(), "the new file is not deleted");
+        let (now, _) = app
+            .index()
+            .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
+            .expect("the new entry stays");
+        assert_eq!(
+            app.read(&now).unwrap().body,
+            b"a much longer answer than before"
+        );
+        // Replaced again: the reader that holds the second entry is told the same.
+        let third = Times {
+            stored_at: 3,
+            ..FRESH
+        };
+        app.store(answer("one", b"third", third)).unwrap();
+        assert_eq!(app.read(&now).err(), Some(ReadError::Replaced));
+        assert!(has(&app, "one"));
+        assert_eq!(host.counters("shop").unwrap().corrupt, 0);
+    }
+
+    #[test]
+    fn readers_of_a_key_that_is_stored_again_and_again_never_meet_damage() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        app.store(answer("hot", &[1u8; 100], FRESH)).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (app, done) = (app.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !done.load(Ordering::Acquire) {
+                        let Some((found, _)) =
+                            app.index()
+                                .find(&primary_id(b"hot"), b"hot", |_| Vec::new(), 10)
+                        else {
+                            panic!("the entry is never out of the index");
+                        };
+                        match app.read(&found) {
+                            Ok(_) => reads += 1,
+                            Err(ReadError::Replaced) => {}
+                            Err(e) => panic!("a replaced file was taken for {e:?}"),
+                        }
+                    }
+                    reads
+                })
+            })
+            .collect();
+        // Every store changes the length of the file under the same name.
+        for i in 0..1500u64 {
+            let times = Times {
+                stored_at: i + 2,
+                ..FRESH
+            };
+            let body = vec![0u8; 50 + (i as usize % 7) * 90];
+            app.store(answer("hot", &body, times)).unwrap();
+        }
+        done.store(true, Ordering::Release);
+        let reads: u32 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(reads > 0);
+        assert_eq!(host.counters("shop").unwrap().corrupt, 0);
     }
 
     #[test]

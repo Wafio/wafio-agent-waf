@@ -30,6 +30,7 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::cache::{StaticFile, StaticMemory};
 use crate::config::Route;
 use crate::pipeline::Done;
 use crate::proxy::Shared;
@@ -312,11 +313,15 @@ struct Hit {
     content_type: &'static str,
     plan: Plan,
     body: Body,
+    /// Where the answer, once made, is kept in the memory tier of the response cache.
+    memory: Option<crate::cache::StaticKey>,
 }
 
 enum Body {
     /// No body: `HEAD`, `304`, `416`.
     None,
+    /// The whole answer as it was sent before, from the memory tier.
+    Cached(Box<OutboundResponse>),
     /// The bytes of the answer, read.
     Bytes(Vec<u8>),
     /// A file that is sent after the head.
@@ -385,8 +390,15 @@ impl StaticFolder {
         }
     }
 
-    /// Looks `path` (the app's decoded path) up and reads what the answer needs. Blocks.
-    fn lookup(&self, path: &[u8], conditions: &Conditions, head: bool) -> Outcome {
+    /// Looks `path` (the app's decoded path) up and reads what the answer needs. Blocks. `memory`
+    /// is the memory tier of the app's response cache, when it has one.
+    fn lookup(
+        &self,
+        path: &[u8],
+        conditions: &Conditions,
+        head: bool,
+        memory: Option<&StaticMemory>,
+    ) -> Outcome {
         let Some(target) = names::plan(path) else {
             return Outcome::Missing;
         };
@@ -400,20 +412,25 @@ impl StaticFolder {
             Found::Nothing => Outcome::Missing,
             Found::Slash => Outcome::Slash,
             Found::File(file, seen, name) => {
-                hit(file, &seen, &name, conditions, head).map_or(Outcome::Missing, Outcome::Hit)
+                hit(file, &seen, &name, path, conditions, head, memory)
+                    .map_or(Outcome::Missing, Outcome::Hit)
             }
         }
     }
 }
 
-/// The plan for an opened file, and its bytes when the answer is small enough to read whole.
-/// `None` when the file changed under the read.
+/// The plan for an opened file, and its bytes when the answer is small enough to read whole. The
+/// whole file of 1 MiB or less is also looked for in `memory` (by the path and what `fstat` says
+/// of the file: another file, size or time is another key). `None` when the file changed under
+/// the read.
 fn hit(
     file: File,
     seen: &walk::Seen,
     name: &[u8],
+    path: &[u8],
     conditions: &Conditions,
     head: bool,
+    memory: Option<&StaticMemory>,
 ) -> Option<Hit> {
     let meta = Meta {
         size: seen.size,
@@ -425,7 +442,23 @@ fn hit(
         Plan::Part { start, len } => (start, len),
         Plan::NotModified | Plan::Unsatisfiable => (0, 0),
     };
-    let body = if head || matches!(plan, Plan::NotModified | Plan::Unsatisfiable) {
+    let mut kept = None;
+    let cached = memory
+        .filter(|_| !head && matches!(plan, Plan::Whole) && len <= READ_WHOLE_MAX)
+        .and_then(|m| {
+            let key = m.key(&StaticFile {
+                path,
+                dev: seen.dev,
+                ino: seen.ino,
+                size: seen.size,
+                mtime: meta.mtime,
+            });
+            kept = Some(key);
+            m.get(&key)
+        });
+    let body = if let Some(answer) = cached {
+        Body::Cached(Box::new(answer))
+    } else if head || matches!(plan, Plan::NotModified | Plan::Unsatisfiable) {
         Body::None
     } else if len <= READ_WHOLE_MAX {
         let mut bytes = vec![0; usize::try_from(len).ok()?];
@@ -442,6 +475,7 @@ fn hit(
         content_type: mime::content_type(name),
         plan,
         body,
+        memory: kept,
     })
 }
 
@@ -548,11 +582,15 @@ pub(crate) async fn serve(
     }
     let path = crate::redirect::app_path(route, req).to_vec();
     let conditions = conditions(req);
+    let memory = crate::cache::static_memory(route, req, folder.spec.max_age_s);
     let looked = {
         let folder = folder.clone();
+        let memory = memory.clone();
         shared
             .disk
-            .run(LOOKUP_WAIT, move || folder.lookup(&path, &conditions, head))
+            .run(LOOKUP_WAIT, move || {
+                folder.lookup(&path, &conditions, head, memory.as_ref())
+            })
             .await
     };
     let Some(outcome) = looked else {
@@ -568,7 +606,12 @@ pub(crate) async fn serve(
         Plan::Part { start, len } => (start, len),
         _ => (0, hit.meta.size),
     };
+    let memory_key = hit.memory;
     match hit.body {
+        Body::Cached(answer) => {
+            crate::metrics::count_static(answer.status, answer.body.len() as u64);
+            Some(Done::Respond(*answer))
+        }
         Body::File(file) => {
             crate::metrics::count_static(response.status, 0);
             Some(Done::File(Box::new(FileAnswer {
@@ -583,6 +626,10 @@ pub(crate) async fn serve(
             if let (Some(spec), 200) = (&route.compression, response.status) {
                 let stats = shared.edge.app(&route.app_id);
                 crate::compress::apply(&stats, spec, req, &route.session, &mut response).await;
+            }
+            // The whole file, as it was sent, is kept for the next visitor who takes it the same way.
+            if let (Some(key), Some(m), 200) = (memory_key, &memory, response.status) {
+                m.put(key, &response);
             }
             crate::metrics::count_static(response.status, response.body.len() as u64);
             Some(Done::Respond(response))

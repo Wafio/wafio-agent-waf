@@ -47,8 +47,8 @@ pub mod upstream;
 pub mod websocket;
 
 pub use cache::{
-    CacheHost, CacheLimits, CacheRefusal, CacheRefusalCode, CacheRule, CacheSpec, HostFacts,
-    valid_app_id,
+    AppMetrics, CacheCounters, CacheHost, CacheLimits, CacheRefusal, CacheRefusalCode, CacheRule,
+    CacheSpec, CacheTotals, HostFacts, PurgeError, PurgeScope, valid_app_id,
 };
 pub use config::{AppAnalysisSetup, AppSpec, CompressionSpec, MAX_MIN_COMPRESS_BYTES, TlsSite};
 pub use decision::{DecisionEvent, DecisionSink};
