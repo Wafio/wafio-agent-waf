@@ -400,7 +400,7 @@ fn a_file_that_is_damaged_in_any_way_is_never_read_as_an_answer() {
             let len = bytes.len() as u64;
             // Both with the size the index holds and with the size the file has.
             for expect in [size, len] {
-                match format::read(&scratch, expect, &key) {
+                match format::read(&scratch, expect, &key, Vec::new()) {
                     Ok(read) => {
                         assert_eq!(bytes, good, "a damaged file was taken for an answer");
                         assert_eq!((read.body.as_slice(), read.times), (&body[..], TIMES));

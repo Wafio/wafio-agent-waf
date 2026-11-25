@@ -254,10 +254,10 @@ impl AppCache {
     /// check sum or a key that differs, a link in its place) is removed, from the index and from
     /// the disk, and is reported as `Corrupt`; one that is gone is dropped from the index. A store
     /// that put a newer file in place since `found` was taken is not damage: the entry is left, and
-    /// the read is `Replaced`.
-    pub fn read(&self, found: &Found) -> Result<Loaded, ReadError> {
+    /// the read is `Replaced`. The body goes into `body` (`format::read`).
+    pub fn read(&self, found: &Found, body: Vec<u8>) -> Result<Loaded, ReadError> {
         let path = format::path_of(&self.dir, &found.id);
-        let read = format::read(&path, found.size, &found.key);
+        let read = format::read(&path, found.size, &found.key, body);
         match read {
             Err(ReadError::Corrupt) if self.forget(&found.id, found.size, found.times) => {
                 self.counts.add(Count::Corrupt, 1);
@@ -1113,7 +1113,7 @@ mod tests {
             .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
             .unwrap();
         assert!(fresh);
-        let loaded = app.read(&found).unwrap();
+        let loaded = app.read(&found, Vec::new()).unwrap();
         assert_eq!(loaded.body, b"hello");
         assert_eq!(host.usage("shop").unwrap().0, 1);
         host.release();
@@ -1128,7 +1128,7 @@ mod tests {
             .index()
             .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
             .unwrap();
-        assert_eq!(app.read(&found).unwrap().body, b"hello");
+        assert_eq!(app.read(&found, Vec::new()).unwrap().body, b"hello");
     }
 
     #[test]
@@ -1396,7 +1396,7 @@ mod tests {
             .index()
             .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
             .unwrap();
-        assert_eq!(app.read(&found).err(), Some(ReadError::Corrupt));
+        assert_eq!(app.read(&found, Vec::new()).err(), Some(ReadError::Corrupt));
         assert!(!path.exists(), "the corrupt file is deleted");
         assert!(
             app.index()
@@ -1410,7 +1410,7 @@ mod tests {
             .find(&primary_id(b"two"), b"two", |_| Vec::new(), 10)
             .unwrap();
         std::fs::remove_file(format::path_of(&dir.0.join("shop"), &found.id)).unwrap();
-        assert_eq!(app.read(&found).err(), Some(ReadError::Missing));
+        assert_eq!(app.read(&found, Vec::new()).err(), Some(ReadError::Missing));
         assert_eq!(app.usage().0, 0);
     }
 
@@ -1624,7 +1624,7 @@ mod tests {
             .find(&primary_id(b"a"), b"a", |_| Vec::new(), 10)
             .unwrap();
         let before = crate::metrics::CACHE_CORRUPT_FILES.load(Ordering::Relaxed);
-        assert!(app.read(&found).is_err());
+        assert!(app.read(&found, Vec::new()).is_err());
         assert_eq!(host.counters("shop").unwrap().corrupt, 1);
         assert!(crate::metrics::CACHE_CORRUPT_FILES.load(Ordering::Relaxed) > before);
         // An entry that is forgotten takes its file, but only the entry that was read: one a
@@ -1663,7 +1663,10 @@ mod tests {
         };
         app.store(answer("one", b"a much longer answer than before", newer))
             .unwrap();
-        assert_eq!(app.read(&found).err(), Some(ReadError::Replaced));
+        assert_eq!(
+            app.read(&found, Vec::new()).err(),
+            Some(ReadError::Replaced)
+        );
         let corrupt = host.counters("shop").unwrap().corrupt;
         assert_eq!(corrupt, 0, "nothing was damaged");
         let path = format::path_of(&dir.0.join("shop"), &found.id);
@@ -1673,7 +1676,7 @@ mod tests {
             .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
             .expect("the new entry stays");
         assert_eq!(
-            app.read(&now).unwrap().body,
+            app.read(&now, Vec::new()).unwrap().body,
             b"a much longer answer than before"
         );
         // Replaced again: the reader that holds the second entry is told the same.
@@ -1682,7 +1685,7 @@ mod tests {
             ..FRESH
         };
         app.store(answer("one", b"third", third)).unwrap();
-        assert_eq!(app.read(&now).err(), Some(ReadError::Replaced));
+        assert_eq!(app.read(&now, Vec::new()).err(), Some(ReadError::Replaced));
         assert!(has(&app, "one"));
         assert_eq!(host.counters("shop").unwrap().corrupt, 0);
     }
@@ -1706,7 +1709,7 @@ mod tests {
                         else {
                             panic!("the entry is never out of the index");
                         };
-                        match app.read(&found) {
+                        match app.read(&found, Vec::new()) {
                             Ok(_) => reads += 1,
                             Err(ReadError::Replaced) => {}
                             Err(e) => panic!("a replaced file was taken for {e:?}"),

@@ -811,9 +811,11 @@ rest of the bundle applies without it.
   whole file; a span outside the file is `416` with `Content-Range: bytes */<size>`; `If-Range` keeps the range only for the file's
   strong tag or exact modification date. `If-Match` and `If-Unmodified-Since` are not evaluated.
 - A body of 1 MiB or less is read whole and compressed like an upstream answer when the app has compression on (`200` only: a part
-  and a `304` are not). A bigger one is sent from its open descriptor in 256 KiB reads, each written within the write timeout, and
-  never past the size `fstat` gave: a file that grew is cut there, and one that is cut short ends the connection, which is how the
-  client learns the body is incomplete. The memory held for a download is one read buffer, so it does not follow the size of the file.
+  and a `304` are not). Over 64 KiB the read takes a second slot and fills memory of the thread that sends the answer, so that the
+  memory goes back to the system after it. A bigger one is sent from its open descriptor in 256 KiB reads, each written within the
+  write timeout, and never past the size `fstat` gave: a file that grew is cut there, and one that is cut short ends the
+  connection, which is how the client learns the body is incomplete. The memory held for a download is one read buffer, so it does
+  not follow the size of the file.
   A `HEAD` answer reads nothing, and says nothing of an encoding (a `GET` for the same file may be compressed).
 - A decision event for the answer carries the verdict action and the status of the answer. A request that is blocked, or that a
   per-path rule blocks, is never answered from the folder.

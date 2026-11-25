@@ -50,7 +50,8 @@ impl DiskGate {
     /// free within `wait` (zero: none is waited for), when the work did not return within the
     /// deadline, or when it panicked; each is counted. The wait holds no thread. The slot is held
     /// by the thread and given back only when `work` returns, so a thread that is stuck on the
-    /// disk keeps its slot and no more threads pile up behind it.
+    /// disk keeps its slot and no more threads pile up behind it. Work that hands back more than
+    /// 64 KiB fills a buffer the caller made (see `LOOKUP_READ_MAX` in the parent module).
     pub async fn run<T: Send + 'static>(
         &self,
         wait: Duration,
