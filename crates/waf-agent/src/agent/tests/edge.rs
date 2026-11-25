@@ -948,7 +948,8 @@ fn a_bundle_with_a_cache_gives_the_proxy_its_settings_and_the_control_plane_an_a
         cache_feature(&statuses[0]),
         Some(("applied".into(), String::new(), String::new(), false))
     );
-    assert!(statuses[0].cache.is_none(), "no counters in this build");
+    // The store of an app is made by the proxy, which this test does not have: no counters yet.
+    assert!(statuses[0].cache.is_none());
     // After a bundle every app is named; the ones with the cache off have no features.
     let every = a.edge_statuses(true);
     assert_eq!(every.len(), 3);
@@ -1182,4 +1183,176 @@ fn an_agent_that_waits_for_the_cache_lock_takes_over_when_the_holder_lets_go() {
         "nothing to wait for, and nothing taken"
     );
     assert!(third.waits_for_cache());
+}
+
+/// Makes the stores of `apps` in the host of `a`, as the proxy does when it applies a bundle.
+fn open_stores(a: &Agent, apps: &[&str]) {
+    let limits: Vec<_> = apps
+        .iter()
+        .map(|id| CacheSpec::default().limits(id))
+        .collect();
+    a.cache_host().unwrap().commit(&limits);
+}
+
+#[test]
+fn the_status_of_a_cache_that_runs_carries_its_numbers_and_one_that_does_not_has_none() {
+    let dir = Folder::new("cache-numbers");
+    let (a, _proxy) = agent_with_cache(&dir);
+    apply(
+        &a,
+        &bundle_of(&[
+            app_with("c1", 18080, &cache_part(32 << 20)),
+            app_with("c2", 18081, &cache_part(1 << 62)),
+        ]),
+        1,
+    )
+    .unwrap();
+    open_stores(&a, &["c1"]);
+    let statuses = a.edge_statuses(false);
+    let by_id = |id: &str| statuses.iter().find(|s| s.app_id == id).unwrap();
+    assert_eq!(by_id("c1").cache, Some(EdgeCacheCounters::default()));
+    assert_eq!(
+        cache_feature(by_id("c2")).unwrap().0,
+        "refused",
+        "its settings do not pass the check"
+    );
+    assert!(
+        by_id("c2").cache.is_none(),
+        "a cache that is off has no numbers"
+    );
+}
+
+#[test]
+fn every_counter_of_the_cache_is_the_one_of_the_same_name_in_the_status() {
+    use super::super::cache_counters;
+    use wafio_proxy::CacheCounters;
+    let c = CacheCounters {
+        requests: 1,
+        hits_memory: 2,
+        hits_disk: 3,
+        misses: 4,
+        bypass: 5,
+        stale: 6,
+        stored: 7,
+        skipped_no_lifetime: 8,
+        skipped_private: 9,
+        skipped_too_large: 10,
+        skipped_streamed: 11,
+        skipped_disk_full: 12,
+        evictions: 13,
+        corrupt: 14,
+        disk_bytes: 15,
+        memory_bytes: 16,
+        objects: 17,
+    };
+    assert_eq!(
+        cache_counters(c),
+        EdgeCacheCounters {
+            requests: 1,
+            hits_memory: 2,
+            hits_disk: 3,
+            misses: 4,
+            bypass: 5,
+            stale: 6,
+            stored: 7,
+            skipped_no_lifetime: 8,
+            skipped_private: 9,
+            skipped_too_large: 10,
+            skipped_streamed: 11,
+            skipped_disk_full: 12,
+            evictions: 13,
+            corrupt: 14,
+            disk_bytes: 15,
+            memory_bytes: 16,
+            objects: 17,
+        }
+    );
+}
+
+#[test]
+fn a_purge_is_done_for_an_app_whose_cache_runs_and_refused_in_the_order_the_contract_gives() {
+    let dir = Folder::new("cache-purge");
+    let (a, _proxy) = agent_with_cache(&dir);
+    apply(
+        &a,
+        &bundle_of(&[
+            app_with("c1", 18080, &cache_part(32 << 20)),
+            app_with("c2", 18081, ""),
+            app_with("c3", 18082, &cache_part(1 << 62)),
+        ]),
+        1,
+    )
+    .unwrap();
+    open_stores(&a, &["c1"]);
+    for (scope, url) in [
+        ("app", ""),
+        ("url", "/a?b=1"),
+        ("prefix", "/blog/"),
+        ("url", "https://shop.example.com/a"),
+        ("prefix", "http://shop.example.com/blog"),
+    ] {
+        assert_eq!(
+            a.purge_cache(&purge(scope, url, "c1")),
+            Ok(()),
+            "{scope} {url}"
+        );
+    }
+    // The address and the scope are looked at before the app, the app in the bundle before its cache.
+    assert_eq!(
+        a.purge_cache(&purge("url", "a/b", "c1")),
+        Err(PurgeCode::Invalid)
+    );
+    assert_eq!(
+        a.purge_cache(&purge("app", "/a", "c9")),
+        Err(PurgeCode::Invalid)
+    );
+    assert_eq!(
+        a.purge_cache(&purge("app", "", "c9")),
+        Err(PurgeCode::NotInBundle)
+    );
+    assert_eq!(
+        a.purge_cache(&purge("app", "", "c2")),
+        Err(PurgeCode::CacheOff)
+    );
+    assert_eq!(
+        a.purge_cache(&purge("app", "", "c3")),
+        Err(PurgeCode::CacheOff),
+        "a cache the host refused is off"
+    );
+}
+
+#[test]
+fn a_purge_for_an_agent_that_does_not_hold_the_cache_lock_is_busy() {
+    let dir = Folder::new("cache-purge-busy");
+    let (first, _) = agent_with_cache(&dir);
+    let (second, _) = agent_with_cache(&dir);
+    let bundle = bundle_of(&[app_with("c1", 18080, &cache_part(32 << 20))]);
+    apply(&first, &bundle, 1).unwrap();
+    apply(&second, &bundle, 1).unwrap();
+    open_stores(&first, &["c1"]);
+    open_stores(&second, &["c1"]);
+    assert_eq!(first.purge_cache(&purge("app", "", "c1")), Ok(()));
+    assert_eq!(
+        second.purge_cache(&purge("app", "", "c1")),
+        Err(PurgeCode::Busy)
+    );
+    first.release_cache();
+    assert!(second.take_over_cache());
+    assert_eq!(second.purge_cache(&purge("app", "", "c1")), Ok(()));
+}
+
+#[test]
+fn the_minute_tick_of_the_cache_looks_at_the_disk_and_an_agent_with_none_does_nothing() {
+    let dir = Folder::new("cache-tick");
+    let (a, _) = agent_with_cache(&dir);
+    a.cache_tick();
+    let host = a.cache_host().unwrap();
+    // 1 % free: the tick sets the flag that stops stores, and room again clears it.
+    host.pretend_free_space(Some((1 << 20, 100 << 20)));
+    a.cache_tick();
+    host.pretend_free_space(Some((90 << 20, 100 << 20)));
+    a.cache_tick();
+    let (none, _, _) = agent();
+    none.cache_tick();
+    assert!(none.cache_host().is_none());
 }

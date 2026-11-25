@@ -10,15 +10,15 @@ use wafio_application::RateLimitStore;
 use wafio_application::blocklist::BlockStore;
 use wafio_control::{
     AckCode, BundleError, BundleSink, CachePurge, CertificateInstall, CertificateSink,
-    EdgeCompressionCounters, EdgeFeatureState, EdgeSink, EdgeStatus, PurgeCode,
+    EdgeCacheCounters, EdgeCompressionCounters, EdgeFeatureState, EdgeSink, EdgeStatus, PurgeCode,
     WAF_BUNDLE_RETRY_MAX,
 };
 use wafio_engine_rules::json_decode;
 use wafio_engine_rules::{CustomGuiRule, CustomScriptRule, TuningRule};
 use wafio_proxy::cert_store::{BookChange, BookEntry, CertBook};
 use wafio_proxy::{
-    AppAnalysisSetup, AppSpec, CacheRefusal, CacheSpec, CompressionCounters, CompressionSpec,
-    StaticRefusal, StaticSpec, TlsSite,
+    AppAnalysisSetup, AppSpec, CacheCounters, CacheRefusal, CacheSpec, CompressionCounters,
+    CompressionSpec, PurgeError, PurgeScope, StaticRefusal, StaticSpec, TlsSite,
 };
 
 use crate::bundle::{Bundle, BundleApp, CompressionEntry, UnblockEntry, decode_bundle};
@@ -215,6 +215,22 @@ impl Agent {
         match &self.cache {
             Some(CacheSetup::Ready(host)) if !self.lock().closed => host.take_over(),
             _ => true,
+        }
+    }
+
+    /// The cache directory the agent keeps copies in, when it is usable.
+    pub fn cache_host(&self) -> Option<Arc<wafio_proxy::CacheHost>> {
+        match &self.cache {
+            Some(CacheSetup::Ready(host)) => Some(host.clone()),
+            _ => None,
+        }
+    }
+
+    /// The minute work of the cache: looks at the free space of the file system and, when it is
+    /// nearly full, stops stores and pushes out copies. Blocks.
+    pub fn cache_tick(&self) {
+        if let Some(host) = self.cache_host() {
+            host.check_disk();
         }
     }
 
@@ -804,11 +820,23 @@ impl Agent {
                         running_previous: *running_previous,
                     }),
                 }
+                // The cache of an app that runs says what it did over the last hour.
+                let cache = match (&e.cache, &self.cache) {
+                    (
+                        Some(CacheState::Applied)
+                        | Some(CacheState::Refused {
+                            running_previous: true,
+                            ..
+                        }),
+                        Some(CacheSetup::Ready(host)),
+                    ) => host.counters(&app_id).map(cache_counters),
+                    _ => None,
+                };
                 EdgeStatus {
                     app_id,
                     generation,
                     features,
-                    cache: None,
+                    cache,
                     compression,
                     unix_time: now,
                 }
@@ -816,8 +844,10 @@ impl Agent {
             .collect()
     }
 
-    /// Answers a cache purge. This build does not purge yet, so a purge for an app of the bundle
-    /// is answered as one for an app with no cache.
+    /// Answers a cache purge: the scope and the address are checked first, then that the app is
+    /// in the bundle, then that its cache runs. The copies the purge names are gone from both
+    /// tiers when this returns `Ok`; a process that does not write (a reload's successor) says
+    /// `Busy`. Blocks.
     pub fn purge_cache(&self, purge: &CachePurge) -> Result<(), PurgeCode> {
         let address_ok = purge.url.starts_with('/')
             || purge
@@ -828,18 +858,54 @@ impl Agent {
                 .url
                 .strip_prefix("https://")
                 .is_some_and(|rest| !rest.is_empty());
-        let scope_ok = match purge.scope.as_str() {
-            "app" => purge.url.is_empty(),
-            "url" | "prefix" => address_ok,
-            _ => false,
+        let scope = match purge.scope.as_str() {
+            "app" if purge.url.is_empty() => PurgeScope::App,
+            "url" if address_ok => PurgeScope::Url(&purge.url),
+            "prefix" if address_ok => PurgeScope::Prefix(&purge.url),
+            _ => return Err(PurgeCode::Invalid),
         };
-        if !scope_ok {
-            return Err(PurgeCode::Invalid);
-        }
-        if !self.lock().edge.contains_key(&purge.app_id) {
-            return Err(PurgeCode::NotInBundle);
-        }
-        Err(PurgeCode::CacheOff)
+        let runs = match self.lock().edge.get(&purge.app_id) {
+            None => return Err(PurgeCode::NotInBundle),
+            Some(e) => matches!(
+                e.cache,
+                Some(CacheState::Applied)
+                    | Some(CacheState::Refused {
+                        running_previous: true,
+                        ..
+                    })
+            ),
+        };
+        let Some(host) = self.cache_host().filter(|_| runs) else {
+            return Err(PurgeCode::CacheOff);
+        };
+        host.purge(&purge.app_id, scope).map_err(|e| match e {
+            PurgeError::CacheOff => PurgeCode::CacheOff,
+            PurgeError::Busy => PurgeCode::Busy,
+            PurgeError::Invalid => PurgeCode::Invalid,
+        })
+    }
+}
+
+/// What the status says of the cache of an app.
+fn cache_counters(c: CacheCounters) -> EdgeCacheCounters {
+    EdgeCacheCounters {
+        requests: c.requests,
+        hits_memory: c.hits_memory,
+        hits_disk: c.hits_disk,
+        misses: c.misses,
+        bypass: c.bypass,
+        stale: c.stale,
+        stored: c.stored,
+        skipped_no_lifetime: c.skipped_no_lifetime,
+        skipped_private: c.skipped_private,
+        skipped_too_large: c.skipped_too_large,
+        skipped_streamed: c.skipped_streamed,
+        skipped_disk_full: c.skipped_disk_full,
+        evictions: c.evictions,
+        corrupt: c.corrupt,
+        disk_bytes: c.disk_bytes,
+        memory_bytes: c.memory_bytes,
+        objects: c.objects,
     }
 }
 

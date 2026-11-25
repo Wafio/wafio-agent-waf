@@ -342,7 +342,7 @@ fn answer(r: OutboundResponse) -> pingora::Result<Done> {
 
 /// One request.
 pub(crate) async fn handle(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     route: &Arc<Route>,
     req: InboundRequest,
     body: Vec<u8>,
@@ -689,15 +689,23 @@ pub(crate) async fn handle(
     // The response cache, after the verdict: only an `allow` reads or fills it. A fresh copy is
     // the answer, with the response header rules of the app applied as they are to every answer.
     let cache_plan = cache::plan(route, &req, &v.action, body_read, &peer);
-    if let Plan::Lookup(ask) = &cache_plan
-        && let Some(mut hit) = cache::lookup(shared, route, ask, &req).await
-    {
-        if matches!(route.target, Target::Http(_)) {
-            crate::upstream::apply_response_header_rules(route, &mut hit);
+    let cx = cache::Ctx {
+        shared,
+        route,
+        req: &req,
+        peer: &peer,
+        remote: &remote,
+    };
+    let mut pending = cache::Pending::default();
+    if let Plan::Lookup(ask) = &cache_plan {
+        match cache::enter(&cx, ask).await {
+            cache::Entered::Answer(copy, label) => {
+                let hit = from_copy(route, *copy, label);
+                emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, hit.status);
+                return answer(hit);
+            }
+            cache::Entered::Go(p) => pending = p,
         }
-        cache::tag(&mut hit, Label::Hit);
-        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, hit.status);
-        return answer(hit);
     }
 
     // The app's folder of files answers `GET` and `HEAD` for a file it holds, after the verdict
@@ -710,13 +718,13 @@ pub(crate) async fn handle(
         let status = match &mut done {
             Done::Respond(r) => {
                 if cache_plan.label().is_some() {
-                    cache::tag(r, Label::Bypass);
+                    cache::tag(route, r, Label::Bypass);
                 }
                 r.status
             }
             Done::File(f) => {
                 if cache_plan.label().is_some() {
-                    cache::tag(&mut f.head, Label::Bypass);
+                    cache::tag(route, &mut f.head, Label::Bypass);
                 }
                 f.head.status
             }
@@ -727,8 +735,17 @@ pub(crate) async fn handle(
         return Ok(done);
     }
 
+    // The request is the application's. The one that may fill takes its turn for the key, and the
+    // others wait for it; a copy that comes in meanwhile is the answer.
+    if let Plan::Lookup(ask) = &cache_plan
+        && let Some((copy, label)) = cache::take_turn(&cx, ask, &mut pending).await
+    {
+        let hit = from_copy(route, *copy, label);
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, hit.status);
+        return answer(hit);
+    }
+
     // Allow (or monitor-mode block) → upstream, encrypt rules applied to what it receives.
-    let target = upstream_target(route, &req);
     let (mut fbody, mut fct) = (det.body, det.raw_ct.clone());
     if !field_rules.is_empty() && !fbody.is_empty() {
         let (enc, enc_ct) = fp::transform_request_body(
@@ -740,7 +757,135 @@ pub(crate) async fn handle(
         (fbody, fct) = (enc, enc_ct);
     }
     let ct_override = (fct != det.raw_ct && !fct.is_empty()).then_some(fct.as_slice());
-    let result = match &route.target {
+    let result = send_upstream(
+        shared,
+        route,
+        &req,
+        &peer,
+        &remote,
+        &fbody,
+        ct_override,
+        pending.validator(),
+        // An answer that may be kept gets the header rules after its copy is made, so the copy
+        // holds what the application said and a change to the rules reaches it at once. A path
+        // that rewrites the body is never kept.
+        cache_plan.fills(),
+    )
+    .await;
+    match result {
+        Ok(Forwarded::Whole(mut resp)) => {
+            // The application cannot answer and a copy may stand in for it.
+            if cache::is_failure(resp.status)
+                && let Some(copy) = cache::on_error(&cx, &pending)
+            {
+                tracing::warn!(
+                    "[inline-proxy] app={} {} answered {}: a stored copy is sent",
+                    route.app_id,
+                    route.upstream,
+                    resp.status
+                );
+                let stale = from_copy(route, copy, Label::Stale);
+                emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, stale.status);
+                return answer(stale);
+            }
+            // The application confirmed the copy it was asked about.
+            if resp.status == 304
+                && let Plan::Lookup(ask) = &cache_plan
+                && let Some(copy) = cache::revalidated(&cx, ask, &mut pending, &resp)
+            {
+                let kept = from_copy(route, cache::answer_of(&cx, copy), Label::Miss);
+                emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, kept.status);
+                return answer(kept);
+            }
+            if let Some(spec) = &route.compression {
+                let stats = shared.edge.app(&route.app_id);
+                compress::apply(&stats, spec, &req, &route.session, &mut resp).await;
+            }
+            match &cache_plan {
+                Plan::Lookup(ask) if cache_plan.fills() => {
+                    cache::fill(shared, route, ask, &req, &resp, pending.take_guard());
+                    if matches!(route.target, Target::Http(_)) {
+                        crate::upstream::apply_response_header_rules(route, &mut resp);
+                    }
+                }
+                Plan::Lookup(ask) => cache::note_not_kept(route, ask),
+                _ => {}
+            }
+            cache::drop_copies(shared, route, &req, &peer, resp.status).await;
+            if let Some(label) = cache_plan.label() {
+                cache::tag(route, &mut resp, label);
+            }
+            emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, resp.status);
+            answer(resp)
+        }
+        Ok(Forwarded::Stream(mut s)) => {
+            if route.compression.is_some() {
+                compress::note_streamed(
+                    &shared.edge.app(&route.app_id),
+                    &req,
+                    &route.session,
+                    &s.head,
+                );
+            }
+            if let Plan::Lookup(ask) = &cache_plan {
+                cache::note_streamed(route, ask);
+            }
+            cache::drop_copies(shared, route, &req, &peer, s.head.status).await;
+            if let Some(label) = cache_plan.label() {
+                cache::tag(route, &mut s.head, label);
+            }
+            emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, s.head.status);
+            Ok(Done::Stream(s))
+        }
+        Err((kind, e)) => {
+            tracing::warn!(
+                "[inline-proxy] app={} {kind}{} error: {e}",
+                route.app_id,
+                route.upstream
+            );
+            if let Some(copy) = cache::on_error(&cx, &pending) {
+                let stale = from_copy(route, copy, Label::Stale);
+                emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, stale.status);
+                return answer(stale);
+            }
+            emit_upstream_error_event(sink, &route.app_id, mode, &areq, latency);
+            let mut resp = OutboundResponse::with(502, "application/json", UPSTREAM_UNAVAILABLE);
+            if let Some(label) = cache_plan.label() {
+                cache::tag(route, &mut resp, label);
+            }
+            answer(resp)
+        }
+    }
+}
+
+/// An answer made from a stored copy: the response header rules of the app apply as they do to
+/// every answer of an HTTP upstream, then `X-Cache` says what the cache did.
+fn from_copy(route: &Route, mut resp: OutboundResponse, label: Label) -> OutboundResponse {
+    if matches!(route.target, Target::Http(_)) {
+        crate::upstream::apply_response_header_rules(route, &mut resp);
+    }
+    cache::tag(route, &mut resp, label);
+    resp
+}
+
+/// Sends the request to the application of the route and returns what it answered. `validator`
+/// makes it the question of the response cache (the stored copy's validators in place of the
+/// visitor's conditions), `keep_copy` leaves the answer without the response header rules, which
+/// run after the copy is made. The error is what the log says: how the request failed, and why.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_upstream(
+    shared: &Shared,
+    route: &Route,
+    req: &InboundRequest,
+    peer: &IpAddress,
+    remote: &str,
+    fbody: &[u8],
+    ct_override: Option<&[u8]>,
+    validator: Option<&cache::Validator>,
+    keep_copy: bool,
+) -> Result<Forwarded, (&'static str, String)> {
+    let target = upstream_target(route, req);
+    match &route.target {
         Target::Fcgi(pool) => {
             let mut hm = req.headers.clone();
             if let Some(ct) = ct_override {
@@ -754,7 +899,7 @@ pub(crate) async fn handle(
             let over_tls = req.tls.is_some();
             // With the cache on, what an untrusted peer says in the headers that are not part of
             // the key is not sent on, and the scheme is the connection's: PHP would answer by it.
-            let drop_unkeyed = cache::drops_unkeyed_inputs(route, &peer);
+            let drop_unkeyed = cache::drops_unkeyed_inputs(route, peer);
             // The host is the agent's word too, as on the HTTP path, from every peer: a trusted
             // proxy that passes the client's `X-Forwarded-Host` on would make the application
             // write it into its links, and the key does not hold it.
@@ -784,111 +929,54 @@ pub(crate) async fn handle(
             hm.insert(
                 b"X-Forwarded-For".to_vec(),
                 vec![outgoing_forwarded_for(
-                    &peer,
+                    peer,
                     &req.lines,
                     &route.proxy_config,
                 )],
             );
-            crate::fastcgi::forward_fcgi(
-                pool,
-                &req.method,
+            if let Some(v) = validator {
+                v.apply_map(&mut hm);
+            }
+            crate::fastcgi::forward_fcgi(pool, &req.method, &target, &req.host, remote, &hm, fbody)
+                .await
+                .map(Forwarded::Whole)
+                .map_err(|e| ("fastcgi ", e))
+        }
+        Target::Http(t) => {
+            let mut head = crate::upstream::upstream_request(
+                route,
+                t,
+                req,
                 &target,
-                &req.host,
-                &remote,
-                &hm,
-                &fbody,
+                peer,
+                remote,
+                fbody,
+                ct_override,
             )
-            .await
-            .map(Forwarded::Whole)
-            .map_err(|e| ("fastcgi ", e))
-        }
-        Target::Http(t) => match crate::upstream::upstream_request(
-            route,
-            t,
-            &req,
-            &target,
-            &peer,
-            &remote,
-            &fbody,
-            ct_override,
-        ) {
-            Err(e) => Err(("", e.to_string())),
-            Ok(head) => {
-                let rewrites = crate::upstream::rewrites_response_body(route, &req.forward_path);
-                crate::upstream::forward_http(shared, route, t, head, &fbody, !rewrites)
-                    .await
-                    .map(|f| match f {
-                        // An answer that may be kept gets the header rules after its copy is
-                        // made, so the copy holds what the application said and a change to the
-                        // rules reaches it at once. A path that rewrites the body is never kept.
-                        Forwarded::Whole(r) if cache_plan.fills() => Forwarded::Whole(r),
-                        Forwarded::Whole(mut r) => {
-                            crate::upstream::apply_response_rules(
-                                route,
-                                &req.forward_path,
-                                &req.request_target,
-                                &mut r,
-                            );
-                            Forwarded::Whole(r)
-                        }
-                        Forwarded::Stream(mut s) => {
-                            crate::upstream::apply_response_header_rules(route, &mut s.head);
-                            Forwarded::Stream(s)
-                        }
-                    })
-                    .map_err(|e| ("", e))
+            .map_err(|e| ("", e.to_string()))?;
+            if let Some(v) = validator {
+                v.apply_http(&mut head);
             }
-        },
-    };
-    match result {
-        Ok(Forwarded::Whole(mut resp)) => {
-            if let Some(spec) = &route.compression {
-                let stats = shared.edge.app(&route.app_id);
-                compress::apply(&stats, spec, &req, &route.session, &mut resp).await;
-            }
-            if cache_plan.fills() {
-                if let Plan::Lookup(ask) = &cache_plan {
-                    cache::fill(shared, route, ask, &req, &resp);
-                }
-                if matches!(route.target, Target::Http(_)) {
-                    crate::upstream::apply_response_header_rules(route, &mut resp);
-                }
-            }
-            cache::drop_copies(shared, route, &req, &peer, resp.status).await;
-            if let Some(label) = cache_plan.label() {
-                cache::tag(&mut resp, label);
-            }
-            emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, resp.status);
-            answer(resp)
-        }
-        Ok(Forwarded::Stream(mut s)) => {
-            if route.compression.is_some() {
-                compress::note_streamed(
-                    &shared.edge.app(&route.app_id),
-                    &req,
-                    &route.session,
-                    &s.head,
-                );
-            }
-            cache::drop_copies(shared, route, &req, &peer, s.head.status).await;
-            if let Some(label) = cache_plan.label() {
-                cache::tag(&mut s.head, label);
-            }
-            emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, s.head.status);
-            Ok(Done::Stream(s))
-        }
-        Err((kind, e)) => {
-            tracing::warn!(
-                "[inline-proxy] app={} {kind}{} error: {e}",
-                route.app_id,
-                route.upstream
-            );
-            emit_upstream_error_event(sink, &route.app_id, mode, &areq, latency);
-            let mut resp = OutboundResponse::with(502, "application/json", UPSTREAM_UNAVAILABLE);
-            if let Some(label) = cache_plan.label() {
-                cache::tag(&mut resp, label);
-            }
-            answer(resp)
+            let rewrites = crate::upstream::rewrites_response_body(route, &req.forward_path);
+            crate::upstream::forward_http(shared, route, t, head, fbody, !rewrites)
+                .await
+                .map(|f| match f {
+                    Forwarded::Whole(r) if keep_copy => Forwarded::Whole(r),
+                    Forwarded::Whole(mut r) => {
+                        crate::upstream::apply_response_rules(
+                            route,
+                            &req.forward_path,
+                            &req.request_target,
+                            &mut r,
+                        );
+                        Forwarded::Whole(r)
+                    }
+                    Forwarded::Stream(mut s) => {
+                        crate::upstream::apply_response_header_rules(route, &mut s.head);
+                        Forwarded::Stream(s)
+                    }
+                })
+                .map_err(|e| ("", e))
         }
     }
 }

@@ -10,11 +10,12 @@ use wafio_agent_io::metrics::{Label, Registry, Sample, micros};
 use wafio_application::{PARTIAL_COVERAGE_REQUESTS, RECOVERED_ANALYZE_PANICS};
 use wafio_control::{ControlLink, HeartbeatCounters};
 use wafio_engine_api::engine;
+use wafio_proxy::CacheHost;
 use wafio_proxy::metrics::{
-    ANALYZE_LATENCY_HISTOGRAM, COMPRESSED_BROTLI, COMPRESSED_GZIP, COMPRESSION_BYTES_IN,
-    COMPRESSION_BYTES_OUT, COMPRESSION_SKIP_REASONS, COMPRESSION_SKIPPED, MAINTENANCE_RESPONSES,
-    PANIC_COUNT, STATIC_BYTES, STATIC_RESPONSES, STATIC_STATUSES, STATIC_UNAVAILABLE,
-    coverage_flag_samples, latency_percentiles,
+    ANALYZE_LATENCY_HISTOGRAM, CACHE_CORRUPT_FILES, COMPRESSED_BROTLI, COMPRESSED_GZIP,
+    COMPRESSION_BYTES_IN, COMPRESSION_BYTES_OUT, COMPRESSION_SKIP_REASONS, COMPRESSION_SKIPPED,
+    MAINTENANCE_RESPONSES, PANIC_COUNT, STATIC_BYTES, STATIC_RESPONSES, STATIC_STATUSES,
+    STATIC_UNAVAILABLE, coverage_flag_samples, latency_percentiles,
 };
 
 use crate::tls::metrics::TlsMetrics;
@@ -58,9 +59,104 @@ fn threads() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// `RegisterWAFMetrics`.
-pub fn register_agent_metrics(reg: &Registry, link: Arc<ControlLink>, tls: &Arc<TlsMetrics>) {
+/// The series of the response cache, one set for each app that has a cache: what it answered
+/// since the agent started, and what it holds now. `host` is the cache directory.
+fn register_cache_metrics(reg: &Registry, host: Arc<CacheHost>) {
+    let labels = |app: &str, name: &str, value: &str, n: u64| Sample {
+        labels: vec![
+            Label {
+                name: "app".into(),
+                value: app.into(),
+            },
+            Label {
+                name: name.into(),
+                value: value.into(),
+            },
+        ],
+        value: u(n),
+    };
+    let per_app = |app: &str, n: u64| Sample {
+        labels: vec![Label {
+            name: "app".into(),
+            value: app.into(),
+        }],
+        value: u(n),
+    };
+    let h = host.clone();
+    reg.labeled_counter(
+        "wafio_waf_cache_requests",
+        "Answers of an app with a response cache, by result: hit_memory and hit_disk (a stored copy), stale (a copy past its life, sent while it is fetched again or the application is down), miss (the application was asked) and bypass (the cache was not looked at).",
+        move || {
+            h.metrics()
+                .iter()
+                .flat_map(|m| {
+                    let t = m.totals;
+                    [
+                        labels(&m.app_id, "result", "hit_memory", t.hits_memory),
+                        labels(&m.app_id, "result", "hit_disk", t.hits_disk),
+                        labels(&m.app_id, "result", "stale", t.stale),
+                        labels(&m.app_id, "result", "miss", t.misses),
+                        labels(&m.app_id, "result", "bypass", t.bypass),
+                    ]
+                })
+                .collect()
+        },
+    );
+    let h = host.clone();
+    reg.labeled_gauge(
+        "wafio_waf_cache_bytes",
+        "Bytes the copies of an app take now, on disk and in memory.",
+        move || {
+            h.metrics()
+                .iter()
+                .flat_map(|m| {
+                    [
+                        labels(&m.app_id, "tier", "disk", m.disk_bytes),
+                        labels(&m.app_id, "tier", "memory", m.memory_bytes),
+                    ]
+                })
+                .collect()
+        },
+    );
+    let h = host.clone();
+    reg.labeled_gauge(
+        "wafio_waf_cache_objects",
+        "Copies an app has stored now.",
+        move || {
+            h.metrics()
+                .iter()
+                .map(|m| per_app(&m.app_id, m.objects))
+                .collect()
+        },
+    );
+    reg.labeled_counter(
+        "wafio_waf_cache_evictions",
+        "Copies pushed out to keep an app within its disk space, or to free a file system that was nearly full.",
+        move || {
+            host.metrics()
+                .iter()
+                .map(|m| per_app(&m.app_id, m.totals.evictions))
+                .collect()
+        },
+    );
+    reg.counter(
+        "wafio_waf_cache_corrupt_files",
+        "Stored copies that failed their check when read (a size, a check sum or a key that differs) and were deleted.",
+        || u(CACHE_CORRUPT_FILES.load(Ordering::Relaxed)),
+    );
+}
+
+/// `RegisterWAFMetrics`. `cache` is the cache directory, when the agent has a usable one.
+pub fn register_agent_metrics(
+    reg: &Registry,
+    link: Arc<ControlLink>,
+    tls: &Arc<TlsMetrics>,
+    cache: Option<Arc<CacheHost>>,
+) {
     tls.register(reg);
+    if let Some(host) = cache {
+        register_cache_metrics(reg, host);
+    }
     let start = Instant::now();
     reg.gauge(
         "wafio_agent_uptime_seconds",
@@ -319,7 +415,7 @@ mod tests {
     fn registry_has_the_agent_series() {
         let reg = Registry::new();
         let link = test_link();
-        register_agent_metrics(&reg, link, &Arc::new(TlsMetrics::default()));
+        register_agent_metrics(&reg, link, &Arc::new(TlsMetrics::default()), None);
         let text = String::from_utf8(reg.write()).unwrap();
         for name in [
             "wafio_agent_uptime_seconds",
@@ -350,6 +446,49 @@ mod tests {
         }
         assert!(!text.contains("wafio_waf_crs_"));
         assert!(!text.contains("wafio_waf_apps_without_rule_engine"));
+        assert!(text.ends_with("# EOF\n"));
+    }
+
+    #[test]
+    fn the_cache_series_come_with_a_cache_directory_and_name_each_app() {
+        use crate::tls::dir::tests::{Scratch, my_uid};
+        let reg = Registry::new();
+        register_agent_metrics(&reg, test_link(), &Arc::new(TlsMetrics::default()), None);
+        let none = String::from_utf8(reg.write()).unwrap();
+        assert!(
+            !none.contains("wafio_waf_cache_"),
+            "an agent with no cache has no series"
+        );
+
+        let scratch = Scratch::new();
+        let host = CacheHost::open(&scratch.0, my_uid()).unwrap();
+        let limits = |id: &str| wafio_proxy::CacheSpec::default().limits(id);
+        host.commit(&[limits("a1"), limits("a2")]);
+        let reg = Registry::new();
+        register_agent_metrics(
+            &reg,
+            test_link(),
+            &Arc::new(TlsMetrics::default()),
+            Some(host),
+        );
+        let text = String::from_utf8(reg.write()).unwrap();
+        for series in [
+            r#"wafio_waf_cache_requests_total{app="a1",result="hit_memory"} 0"#,
+            r#"wafio_waf_cache_requests_total{app="a1",result="hit_disk"} 0"#,
+            r#"wafio_waf_cache_requests_total{app="a1",result="stale"} 0"#,
+            r#"wafio_waf_cache_requests_total{app="a2",result="miss"} 0"#,
+            r#"wafio_waf_cache_requests_total{app="a2",result="bypass"} 0"#,
+            r#"wafio_waf_cache_bytes{app="a1",tier="disk"} 0"#,
+            r#"wafio_waf_cache_bytes{app="a2",tier="memory"} 0"#,
+            r#"wafio_waf_cache_objects{app="a1"} 0"#,
+            r#"wafio_waf_cache_evictions_total{app="a2"} 0"#,
+            "wafio_waf_cache_corrupt_files_total ",
+        ] {
+            assert!(text.contains(series), "{series} missing in\n{text}");
+        }
+        assert!(text.contains("# TYPE wafio_waf_cache_bytes gauge\n"));
+        assert!(text.contains("# TYPE wafio_waf_cache_objects gauge\n"));
+        assert!(text.contains("# TYPE wafio_waf_cache_requests counter\n"));
         assert!(text.ends_with("# EOF\n"));
     }
 

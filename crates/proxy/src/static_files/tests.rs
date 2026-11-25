@@ -40,7 +40,7 @@ fn bytes(outcome: Outcome) -> Option<Vec<u8>> {
 }
 
 fn served(folder: &StaticFolder, path: &str) -> Option<Vec<u8>> {
-    bytes(folder.lookup(path.as_bytes(), &Conditions::default(), false))
+    bytes(folder.lookup(path.as_bytes(), &Conditions::default(), false, None))
 }
 
 /// The folder text is checked before the disk is, so none of these needs to exist.
@@ -349,7 +349,7 @@ fn a_file_is_found_through_the_folder_and_a_name_outside_it_is_not() {
     assert_eq!(served(&f, "/index.html").unwrap(), b"home");
     assert_eq!(served(&f, "/css/site.css").unwrap(), b"body{}");
     assert!(matches!(
-        f.lookup(b"/css", &Conditions::default(), false),
+        f.lookup(b"/css", &Conditions::default(), false, None),
         Outcome::Missing
     ));
     for path in [
@@ -502,7 +502,7 @@ fn a_request_for_a_kept_name_makes_no_open_at_all() {
             let before = opens();
             assert!(
                 matches!(
-                    f.lookup(path.as_bytes(), &Conditions::default(), false),
+                    f.lookup(path.as_bytes(), &Conditions::default(), false, None),
                     Outcome::Missing
                 ),
                 "{path}"
@@ -589,10 +589,11 @@ fn a_file_is_read_whole_up_to_a_mebibyte_and_sent_from_its_descriptor_above() {
     sized(&s, "public/empty.bin", 0);
     let f = folder(&s.path("public"));
     let c = Conditions::default();
-    let hit = |path: &str, c: &Conditions, head: bool| match f.lookup(path.as_bytes(), c, head) {
-        Outcome::Hit(h) => h,
-        _ => panic!("{path}"),
-    };
+    let hit =
+        |path: &str, c: &Conditions, head: bool| match f.lookup(path.as_bytes(), c, head, None) {
+            Outcome::Hit(h) => h,
+            _ => panic!("{path}"),
+        };
     assert!(
         matches!(&hit("/exact.bin", &c, false).body, Body::Bytes(b) if b.len() as u64 == READ_WHOLE_MAX)
     );
@@ -646,6 +647,7 @@ fn head(plan: Plan, body: Body, size: u64) -> Hit {
         content_type: "text/css; charset=utf-8",
         plan,
         body,
+        memory: None,
     }
 }
 

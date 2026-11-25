@@ -856,13 +856,194 @@ fn a_stored_head_has_no_cookie_no_connection_header_and_no_per_answer_header() {
 }
 
 #[test]
-fn x_cache_goes_on_an_answer_in_place_of_the_applications() {
+fn x_cache_goes_on_an_answer_in_place_of_the_applications_and_each_label_is_counted() {
+    let s = site(Some(CacheSpec::default()), "", &[]);
     let mut r = answer(200, &[("X-Cache", "from-upstream")], b"x");
-    tag(&mut r, Label::Hit);
-    assert_eq!(r.peek(b"X-Cache"), Some(&b"HIT"[..]));
-    tag(&mut r, Label::Miss);
+    for (label, text) in [
+        (Label::HitDisk, "HIT"),
+        (Label::HitMemory, "HIT"),
+        (Label::Stale, "STALE"),
+        (Label::Miss, "MISS"),
+        (Label::Bypass, "BYPASS"),
+    ] {
+        tag(&s.route, &mut r, label);
+        assert_eq!(r.values(b"X-Cache").count(), 1, "{text}");
+        assert_eq!(r.peek(b"X-Cache"), Some(text.as_bytes()));
+    }
+    let (_, app) = s.route.cache_active().unwrap();
+    let hour = app.hour(store::now());
+    assert_eq!(
+        (
+            hour.hits_disk,
+            hour.hits_memory,
+            hour.stale,
+            hour.misses,
+            hour.bypass,
+            hour.requests
+        ),
+        (1, 1, 1, 1, 1, 5)
+    );
+    // An app with no cache has nothing to count and nothing to tag.
+    let off = site(None, "", &[]);
+    tag(&off.route, &mut r, Label::Miss);
     assert_eq!(r.peek(b"X-Cache"), Some(&b"MISS"[..]));
-    tag(&mut r, Label::Bypass);
-    assert_eq!(r.values(b"X-Cache").count(), 1);
-    assert_eq!(r.peek(b"X-Cache"), Some(&b"BYPASS"[..]));
+}
+
+// How far past its life a copy is used, and what an answer that is not kept leads to.
+
+fn copy_saying(lines: &[&str]) -> Loaded {
+    Loaded {
+        times: Times {
+            stored_at: 1,
+            fresh_until: 2,
+            initial_age: 0,
+            stale_window: 0,
+        },
+        head: StoredHead {
+            status: 200,
+            http10: false,
+            reason: b"OK".to_vec(),
+            lines: lines
+                .iter()
+                .map(|l| (b"Cache-Control".to_vec(), l.as_bytes().to_vec()))
+                .collect(),
+        },
+        body: Vec::new(),
+        size: 0,
+    }
+}
+
+fn windows(lines: &[&str], setting: u32) -> (u64, u64) {
+    let w = Windows::of(&copy_saying(lines), setting);
+    (w.revalidate, w.error)
+}
+
+#[test]
+fn the_window_for_an_error_is_the_answers_own_else_the_setting_and_one_for_revalidating_only_its_own()
+ {
+    assert_eq!(windows(&["public, max-age=60"], 600), (0, 600));
+    assert_eq!(windows(&["public, max-age=60"], 0), (0, 0));
+    assert_eq!(windows(&[], 30), (0, 30), "an answer that says nothing");
+    assert_eq!(
+        windows(&["max-age=60, stale-while-revalidate=30"], 600),
+        (30, 600)
+    );
+    assert_eq!(windows(&["max-age=60, stale-if-error=5"], 600), (0, 5));
+    assert_eq!(
+        windows(&["max-age=60", "stale-if-error=9"], 600),
+        (0, 9),
+        "every line is read"
+    );
+    assert_eq!(windows(&["max-age=60, stale-if-error=0"], 600), (0, 0));
+}
+
+#[test]
+fn an_answer_that_must_be_revalidated_has_no_window_unless_it_names_its_own() {
+    for never in [
+        "max-age=60, must-revalidate",
+        "max-age=60, proxy-revalidate",
+        "s-maxage=60",
+        "MUST-REVALIDATE, max-age=60",
+    ] {
+        assert_eq!(windows(&[never], 600), (0, 0), "{never}");
+    }
+    // Its own windows count, only those, and the setting does not fill in for the other.
+    assert_eq!(
+        windows(&["max-age=60, must-revalidate, stale-if-error=7"], 600),
+        (0, 7)
+    );
+    assert_eq!(
+        windows(&["s-maxage=60, stale-while-revalidate=20"], 600),
+        (20, 0)
+    );
+    assert_eq!(
+        windows(
+            &["proxy-revalidate, stale-while-revalidate=1, stale-if-error=2"],
+            600
+        ),
+        (1, 2)
+    );
+}
+
+#[test]
+fn what_is_not_kept_is_counted_where_the_dashboard_has_a_line_and_marks_the_key_unless_it_may_pass()
+{
+    let r = |status, headers: &[(&str, &str)]| answer(status, headers, b"x");
+    let plain = r(200, &[]);
+    for (why, count) in [
+        (NotKept::NoLifetime, Some(Count::SkippedNoLifetime)),
+        (NotKept::Private, Some(Count::SkippedPrivate)),
+        (NotKept::Control, Some(Count::SkippedPrivate)),
+        (NotKept::Vary, Some(Count::SkippedPrivate)),
+        (NotKept::Cookie, Some(Count::SkippedPrivate)),
+        (NotKept::TooLarge, Some(Count::SkippedTooLarge)),
+        (NotKept::Status, None),
+        (NotKept::Encoding, None),
+        (NotKept::Length, None),
+    ] {
+        assert_eq!(skipped(why), count, "{why:?}");
+    }
+    // Thirty seconds, unless the answer says it is private for longer, and never past ten minutes.
+    for why in [
+        NotKept::NoLifetime,
+        NotKept::Control,
+        NotKept::Vary,
+        NotKept::TooLarge,
+        NotKept::Encoding,
+        NotKept::Length,
+    ] {
+        assert_eq!(mark_seconds(why, &plain), Some(30), "{why:?}");
+    }
+    assert_eq!(mark_seconds(NotKept::Status, &r(302, &[])), Some(30));
+    assert_eq!(mark_seconds(NotKept::Status, &r(404, &[])), Some(30));
+    assert_eq!(
+        mark_seconds(NotKept::Status, &r(500, &[])),
+        None,
+        "a server error may pass"
+    );
+    assert_eq!(mark_seconds(NotKept::Status, &r(503, &[])), None);
+    assert_eq!(
+        mark_seconds(NotKept::Cookie, &plain),
+        None,
+        "that is about the visitor"
+    );
+    let private = |cc: &str| mark_seconds(NotKept::Private, &r(200, &[("Cache-Control", cc)]));
+    assert_eq!(private("private"), Some(30));
+    assert_eq!(private("private, max-age=120"), Some(120));
+    assert_eq!(private("no-store, max-age=45"), Some(45));
+    assert_eq!(private("private, max-age=86400"), Some(600));
+    assert_eq!(private("private, max-age=0"), Some(30));
+    assert_eq!(
+        private("no-cache, max-age=120"),
+        Some(30),
+        "only private and no-store say it"
+    );
+    assert_eq!(
+        mark_seconds(NotKept::Private, &r(200, &[("Set-Cookie", "a=b")])),
+        Some(30)
+    );
+}
+
+#[test]
+fn a_request_that_is_not_filled_is_asked_for_what_it_needs_and_a_signed_in_get_says_so() {
+    let s = site(Some(CacheSpec::default()), "", &["sid"]);
+    let a = ask(planned(&s, &get("/p", "")));
+    assert!(a.fillable && !a.signed_in_get);
+    let signed_in = ask(planned(&s, &get("/p", "Cookie: sid=1\r\n")));
+    assert!(!signed_in.fillable && signed_in.signed_in_get);
+    let ranged = ask(planned(&s, &get("/p", "Range: bytes=0-1\r\n")));
+    assert!(!ranged.fillable && !ranged.signed_in_get);
+    let head = ask(planned(&s, &request("HEAD", "/p", "")));
+    assert!(!head.fillable && !head.signed_in_get);
+    // A rule for the signed in lets them fill.
+    let open = site(
+        Some(with_rules(vec![keep("/shared", 60, true)])),
+        "",
+        &["sid"],
+    );
+    let shared = ask(planned(&open, &get("/shared", "Cookie: sid=1\r\n")));
+    assert!(shared.fillable && !shared.signed_in_get);
+    // It carries the purge count the app had when the request came.
+    let (_, app) = s.route.cache_active().unwrap();
+    assert_eq!(a.purge_gen, app.purge_count());
 }

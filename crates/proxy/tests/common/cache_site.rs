@@ -6,10 +6,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use wafio_proxy::{AppSpec, CacheHost, CacheSpec, Proxy, ProxyOptions};
 
 use crate::common::*;
@@ -242,4 +242,84 @@ pub fn lines(up: &TestUpstream) -> Vec<String> {
         .iter()
         .map(|s| s.line.clone())
         .collect()
+}
+
+/// When each request reached an upstream.
+pub type Arrivals = Arc<Mutex<Vec<Instant>>>;
+
+/// [`raw_upstream`] that answers `delay` after the request came, and notes when each came. The
+/// connection stays open for the next request.
+pub async fn slow_upstream(
+    delay: Duration,
+    reply: impl Fn(&Seen) -> Vec<u8> + Send + Sync + 'static,
+) -> (TestUpstream, Arrivals) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = TestUpstream {
+        addr: l.local_addr().unwrap(),
+        accepts: Arc::default(),
+        seen: Arc::default(),
+    };
+    let arrivals = Arrivals::default();
+    let (u, reply, at) = (up.clone(), Arc::new(reply), arrivals.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = l.accept().await else { return };
+            u.accepts.fetch_add(1, Ordering::SeqCst);
+            let (seen, reply, at) = (u.seen.clone(), reply.clone(), at.clone());
+            tokio::spawn(async move {
+                let mut r = BufReader::new(s);
+                while let Ok(Some((line, headers))) = read_head(&mut r).await {
+                    let n = header(&headers, "content-length").map_or(0, |v| v.parse().unwrap());
+                    let mut b = vec![0; n];
+                    if r.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    at.lock().unwrap().push(Instant::now());
+                    let sn = Seen {
+                        line,
+                        headers,
+                        body: b,
+                    };
+                    let bytes = reply(&sn);
+                    seen.lock().unwrap().push(sn);
+                    tokio::time::sleep(delay).await;
+                    if r.get_mut().write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (up, arrivals)
+}
+
+/// `n` requests made at once, each on a connection of its own; the replies in no set order.
+pub async fn burst(addr: SocketAddr, n: usize, raw: Vec<u8>) -> Vec<ReplyParts> {
+    let tasks: Vec<_> = (0..n)
+        .map(|_| {
+            let raw = raw.clone();
+            tokio::spawn(async move { one(addr, &raw).await })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(n);
+    for task in tasks {
+        out.push(task.await.unwrap());
+    }
+    out
+}
+
+/// How many of `replies` carry `X-Cache: label`.
+pub fn labelled(replies: &[ReplyParts], label: &str) -> usize {
+    replies.iter().filter(|r| x_cache(r) == label).count()
+}
+
+/// Waits (at most five seconds) until `ready` says yes.
+pub async fn until(mut ready: impl FnMut() -> bool) -> bool {
+    for _ in 0..500 {
+        if ready() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
 }

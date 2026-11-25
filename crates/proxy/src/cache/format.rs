@@ -372,7 +372,7 @@ pub(crate) fn remove(app_dir: &Path, id: &FileId) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::cache::key::file_id;
 

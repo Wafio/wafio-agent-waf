@@ -1,7 +1,9 @@
 //! The response cache: an app can keep the answers of its application and send them again without
 //! asking it, after the verdict. Two tiers, disk (`format`, `store`) and memory (`index`), both
 //! evicted by a segmented LRU (`slru`); a key made of what a request is (`key`); the rules for what
-//! is kept (`control`, [`decide`]); and the answer for a copy that is found (`hit`).
+//! is kept (`control`, [`decide`]); the answer for a copy that is found (`hit`); the one fetch at
+//! a time for a key that has no copy (`fills`); a copy that is past its life, checked again or sent
+//! stale (`refresh`); and what a purge names (`purge`).
 //!
 //! Only a request the verdict allows reads or fills it: a log or monitor verdict, an upgrade, a body
 //! on a `GET`, a method override and a path under a `bypass` rule go to the application as they
@@ -9,17 +11,24 @@
 //! see [`decide`] for every case.
 
 mod control;
+mod fills;
 mod format;
 mod hit;
 mod host;
 mod index;
 mod key;
+mod purge;
+mod refresh;
 mod slru;
+mod statics;
+mod stats;
 mod store;
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use tokio::sync::OwnedSemaphorePermit;
 use wafio_domain::ip_address::IpAddress;
 
 use crate::compress::media_type;
@@ -30,17 +39,24 @@ use crate::response::OutboundResponse;
 use crate::signed_in::is_signed_in;
 use crate::static_files::LOOKUP_WAIT;
 use control::{CacheControl, MAX_LIFETIME_S, vary_names};
-use format::{MAX_KEY, StoredHead, Times};
+use fills::{FillGuard, Turn};
+use format::{Loaded, MAX_KEY, StoredHead, Times};
 use index::MEMORY_COPY_MAX;
 use key::{
-    Bucket, FileId, PrimaryId, file_id, is_https, keyed_inputs, normalized, primary_id,
-    primary_key, request_header_values, variant,
+    Bucket, FileId, PrimaryId, file_id, is_https, keyed_inputs, primary_id, primary_key,
+    request_header_values, same_name, variant,
 };
-use store::Store;
+use stats::Count;
+use store::{Skip, Store};
 
 pub use host::{CacheRefusal, CacheRefusalCode, HostFacts};
+pub(crate) use key::StaticFile;
+pub use purge::PurgeScope;
+pub(crate) use refresh::Validator;
+pub(crate) use statics::{StaticKey, StaticMemory, static_memory};
+pub use stats::{CacheCounters, CacheTotals};
 pub(crate) use store::AppCache;
-pub use store::{CacheHost, CacheLimits, valid_app_id};
+pub use store::{AppMetrics, CacheHost, CacheLimits, PurgeError, valid_app_id};
 
 /// The settings of an app's cache, as the bundle brings them and after the agent has checked them.
 /// The defaults and ranges are those of the dashboard.
@@ -214,24 +230,39 @@ impl RouteCache {
     }
 }
 
-/// What the cache did with a request, as `X-Cache` says.
+/// What the cache did with a request, as `X-Cache` says. A hit says which tier it came from, for
+/// the counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Label {
-    Hit,
+    HitMemory,
+    HitDisk,
+    /// A copy past its life, sent because the application is allowed to be late or is down.
+    Stale,
+    /// The application was asked, whatever came of it.
     Miss,
     Bypass,
 }
 
-/// Sets `X-Cache` on an answer of an app that has the cache on.
-pub(crate) fn tag(resp: &mut OutboundResponse, label: Label) {
+/// Sets `X-Cache` on an answer of an app that has the cache on, and counts it.
+pub(crate) fn tag(route: &Route, resp: &mut OutboundResponse, label: Label) {
     resp.set(
         b"X-Cache",
         match label {
-            Label::Hit => b"HIT",
+            Label::HitMemory | Label::HitDisk => b"HIT",
+            Label::Stale => b"STALE",
             Label::Miss => b"MISS",
             Label::Bypass => b"BYPASS",
         },
     );
+    if let Some((_, app)) = route.cache_active() {
+        app.count(match label {
+            Label::HitMemory => Count::HitMemory,
+            Label::HitDisk => Count::HitDisk,
+            Label::Stale => Count::Stale,
+            Label::Miss => Count::Miss,
+            Label::Bypass => Count::Bypass,
+        });
+    }
 }
 
 /// What the cache makes of a request.
@@ -261,6 +292,7 @@ impl Plan {
 }
 
 /// A request that the cache looks up.
+#[derive(Clone)]
 pub(crate) struct Ask {
     primary: Vec<u8>,
     primary_id: PrimaryId,
@@ -268,10 +300,15 @@ pub(crate) struct Ask {
     /// The request itself allows a copy to be made of its answer: a `GET` with no `Range`, from a
     /// visitor who is not signed in (or for a path with a rule for them).
     pub fillable: bool,
+    /// A `GET` from a visitor who is signed in, for a path no rule opens to them: its answer is
+    /// not kept, and is counted as private.
+    pub signed_in_get: bool,
     /// The request has a `Cookie`.
     cookie: bool,
     /// The lifetime of the keeping rule the path is under.
     rule_ttl: Option<u64>,
+    /// The purge count of the app when the request came: a purge since then drops its copy.
+    purge_gen: u64,
 }
 
 fn has_line(req: &InboundRequest, names: &[&[u8]]) -> bool {
@@ -307,7 +344,7 @@ const OVERRIDES: [&[u8]; 3] = [
 fn has_override(req: &InboundRequest) -> bool {
     req.lines
         .iter()
-        .any(|(n, _)| OVERRIDES.contains(&&normalized(n)[..]))
+        .any(|(n, _)| OVERRIDES.iter().any(|o| same_name(n, o)))
 }
 
 /// Whether the peer is a proxy the route trusts to say what it was asked for.
@@ -332,7 +369,7 @@ pub(crate) fn plan(
     body_read: bool,
     peer: &IpAddress,
 ) -> Plan {
-    let Some((settings, _)) = route.cache_active() else {
+    let Some((settings, app)) = route.cache_active() else {
         return Plan::Off;
     };
     let get = req.method == b"GET";
@@ -369,15 +406,16 @@ pub(crate) fn plan(
         &keyed,
     );
     let signed_in = is_signed_in(req, &route.session);
+    let may_sign_in = !signed_in || rule.is_some_and(|r| r.signed_in);
     Plan::Lookup(Box::new(Ask {
         primary_id: primary_id(&primary),
         primary,
         bucket,
-        fillable: get
-            && req.peek("Range").is_empty()
-            && (!signed_in || rule.is_some_and(|r| r.signed_in)),
+        fillable: get && req.peek("Range").is_empty() && may_sign_in,
+        signed_in_get: get && !may_sign_in,
         cookie: !req.cookies.is_empty(),
         rule_ttl: rule.map(|r| u64::from(r.ttl_s)),
+        purge_gen: app.purge_count(),
     }))
 }
 
@@ -518,27 +556,83 @@ pub(crate) fn decide(
 /// The longest a request waits for the files of a drop to be deleted. The deletion goes on past it.
 const STORE_WAIT: Duration = Duration::from_millis(500);
 
-/// Offers the answer of the application to the store, which keeps it when [`decide`] allows. The
-/// copy is written behind the visitor: the answer goes out at once, and what bounds the work is
-/// the budget of bytes in flight, taken here, and the wait for a disk slot. The body is shared with
-/// the answer, not copied.
+/// What an answer that is not kept counts as, if the dashboard has a line for it.
+fn skipped(why: NotKept) -> Option<Count> {
+    match why {
+        NotKept::NoLifetime => Some(Count::SkippedNoLifetime),
+        NotKept::Private | NotKept::Control | NotKept::Vary | NotKept::Cookie => {
+            Some(Count::SkippedPrivate)
+        }
+        NotKept::TooLarge => Some(Count::SkippedTooLarge),
+        NotKept::Status | NotKept::Encoding | NotKept::Length => None,
+    }
+}
+
+/// How long the key of an answer that is not kept is marked, so that the next requests do not
+/// queue behind a fetch that will not help them: 30 seconds, or the `max-age` of an answer that
+/// says it is private or not to be stored (at most ten minutes). `None` for a refusal that is
+/// about the visitor, or for an error of the application, which may pass.
+fn mark_seconds(why: NotKept, resp: &OutboundResponse) -> Option<u64> {
+    match why {
+        NotKept::Cookie => None,
+        NotKept::Status if resp.status >= 500 => None,
+        NotKept::Private => {
+            let cc = CacheControl::parse(resp.values(b"Cache-Control"));
+            Some(match cc.max_age {
+                Some(n) if n > 0 && (cc.private || cc.no_store) => n.min(fills::MARK_MAX_S),
+                _ => fills::MARK_DEFAULT_S,
+            })
+        }
+        _ => Some(fills::MARK_DEFAULT_S),
+    }
+}
+
+/// Offers the answer of the application to the store, which keeps it when [`decide`] allows. An
+/// answer that is not kept is counted, and marks its key so that the next requests go on without
+/// waiting. The copy is written behind the visitor: the answer goes out at once, and what bounds
+/// the work is the budget of bytes in flight, taken here, and the wait for a disk slot. The body
+/// is shared with the answer, not copied. `guard` is the fill lock of the request: whoever waits
+/// for it wakes when the copy is in, or at once when there is none.
 pub(crate) fn fill(
     shared: &Shared,
     route: &Route,
     ask: &Ask,
     req: &InboundRequest,
     resp: &OutboundResponse,
+    guard: Option<FillGuard>,
 ) {
     let Some((settings, app)) = route.cache_active() else {
         return;
     };
-    if !app.can_store() {
-        return;
+    let now = store::now();
+    match decide(settings, ask, req, resp, now) {
+        Ok(p) if app.can_store() => keep(shared, app, ask.purge_gen, p, resp.body.clone(), guard),
+        Ok(_) => {}
+        Err(why) => {
+            if let Some(count) = skipped(why) {
+                app.count(count);
+            }
+            // A key that is marked already stays so until its mark ends: asking again how long
+            // would only move the end.
+            if !app.fills().marked(&ask.primary_id, now)
+                && let Some(seconds) = mark_seconds(why, resp)
+            {
+                app.fills().mark(ask.primary_id, seconds, now);
+            }
+        }
     }
-    let Ok(p) = decide(settings, ask, req, resp, store::now()) else {
-        return;
-    };
-    let size = format::file_len(&p.key, &p.head, &resp.body);
+}
+
+/// Writes a prepared answer behind the request that made it, holding `guard` until it is in.
+fn keep(
+    shared: &Shared,
+    app: &Arc<AppCache>,
+    purge_gen: u64,
+    p: Prepared,
+    body: Bytes,
+    guard: Option<FillGuard>,
+) {
+    let size = format::file_len(&p.key, &p.head, &body);
     let Some(permit) = u32::try_from(size)
         .ok()
         .and_then(|n| app.budget().clone().try_acquire_many_owned(n).ok())
@@ -546,13 +640,14 @@ pub(crate) fn fill(
         return;
     };
     let item = Store {
+        purge_gen,
         id: p.id,
         primary: p.primary,
         key: p.key,
         primary_len: p.primary_len,
         names: p.names,
         head: p.head,
-        body: resp.body.clone(),
+        body,
         times: p.times,
     };
     let app = app.clone();
@@ -560,13 +655,14 @@ pub(crate) fn fill(
     let disk = shared.disk.clone();
     tokio::spawn(async move {
         let _storing = storing;
+        let _guard = guard;
         let stored = disk
             .run_counting(LOOKUP_WAIT, no_count, move || {
                 let _permit = permit;
                 app.store(item)
             })
             .await;
-        if let Some(Err(store::Skip::Disk(e))) = stored {
+        if let Some(Err(Skip::Disk(e))) = stored {
             tracing::debug!("[cache] a copy was not written: {e}");
         }
     });
@@ -574,28 +670,64 @@ pub(crate) fn fill(
 
 fn no_count() {}
 
-/// The answer for `req` from a fresh copy, `None` for a miss: no copy, one that is not fresh, one
-/// whose file fails its check, or a disk that gives no slot or no answer.
-pub(crate) async fn lookup(
-    shared: &Shared,
-    route: &Route,
-    ask: &Ask,
-    req: &InboundRequest,
-) -> Option<OutboundResponse> {
-    let (_, app) = route.cache_active()?;
-    let now = store::now();
+/// An answer that came in pieces is not kept, and its key is marked.
+pub(crate) fn note_streamed(route: &Route, ask: &Ask) {
+    if !ask.fillable {
+        return;
+    }
+    if let Some((_, app)) = route.cache_active() {
+        app.count(Count::SkippedStreamed);
+        app.fills()
+            .mark(ask.primary_id, fills::MARK_DEFAULT_S, store::now());
+    }
+}
+
+/// The answer to a visitor who may not have a copy made of it is counted as private.
+pub(crate) fn note_not_kept(route: &Route, ask: &Ask) {
+    if ask.signed_in_get
+        && let Some((_, app)) = route.cache_active()
+    {
+        app.count(Count::SkippedPrivate);
+    }
+}
+
+/// What a request needs to ask the application again for a key: the connection, the route and the
+/// request as the cache step saw them.
+pub(crate) struct Ctx<'a> {
+    pub shared: &'a Arc<Shared>,
+    pub route: &'a Arc<Route>,
+    pub req: &'a InboundRequest,
+    pub peer: &'a IpAddress,
+    pub remote: &'a str,
+}
+
+/// A copy the index named, read. The share of the budget of bytes in flight that a read from disk
+/// took is held with it, so a crowd of requests for a big copy cannot hold more of them in memory
+/// than the budget allows.
+struct Copy {
+    id: FileId,
+    loaded: Arc<Loaded>,
+    from_memory: bool,
+    hits: u32,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+/// The copy for the request, fresh or not, read from memory or disk; `None` for no copy, a file
+/// that fails its check, and a disk that gives no slot or no answer.
+async fn load(cx: &Ctx<'_>, ask: &Ask, now: u64) -> Option<Copy> {
+    let (_, app) = cx.route.cache_active()?;
     let found = {
-        let (found, fresh) = app.index().find(
+        let (found, _) = app.index().find(
             &ask.primary_id,
             &ask.primary,
-            |names| variant(names, ask.bucket, |n| request_header_values(req, n)),
+            |names| variant(names, ask.bucket, |n| request_header_values(cx.req, n)),
             now,
         )?;
-        fresh.then_some(found)?
+        found
     };
     let (id, hits, size) = (found.id, found.hits, found.size);
-    let (loaded, from_memory) = match found.mem.clone() {
-        Some(copy) => (copy, true),
+    let (loaded, from_memory, permit) = match found.mem.clone() {
+        Some(copy) => (copy, true, None),
         None => {
             let permit = app
                 .budget()
@@ -603,24 +735,268 @@ pub(crate) async fn lookup(
                 .try_acquire_many_owned(u32::try_from(size).ok()?)
                 .ok()?;
             let reader = app.clone();
-            let read = shared
+            let (read, permit) = cx
+                .shared
                 .disk
-                .run_counting(LOOKUP_WAIT, no_count, move || {
-                    let _permit = permit;
-                    reader.read(&found)
-                })
+                .run_counting(LOOKUP_WAIT, no_count, move || (reader.read(&found), permit))
                 .await?;
-            (Arc::new(read.ok()?), false)
+            (Arc::new(read.ok()?), false, Some(permit))
         }
     };
-    if loaded.times.fresh_until <= now {
-        return None;
+    Some(Copy {
+        id,
+        loaded,
+        from_memory,
+        hits,
+        permit,
+    })
+}
+
+/// How far past its life a copy may be used. A copy whose answer says `must-revalidate`,
+/// `proxy-revalidate` or `s-maxage` is never used stale unless the answer names its own
+/// `stale-while-revalidate` or `stale-if-error`, and then only for what it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Windows {
+    /// Seconds past its life the copy is sent at once while a fresh one is fetched.
+    revalidate: u64,
+    /// Seconds past its life the copy is sent when the application fails.
+    error: u64,
+}
+
+impl Windows {
+    /// `setting_s` is `stale_if_error_s` of the settings, for an answer that names no window.
+    fn of(copy: &Loaded, setting_s: u32) -> Windows {
+        let cc = CacheControl::parse(
+            copy.head
+                .lines
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case(b"Cache-Control"))
+                .map(|(_, v)| v.as_slice()),
+        );
+        let never = cc.must_revalidate || cc.proxy_revalidate || cc.s_maxage.is_some();
+        let own = cc.stale_while_revalidate.is_some() || cc.stale_if_error.is_some();
+        if never && !own {
+            return Windows {
+                revalidate: 0,
+                error: 0,
+            };
+        }
+        Windows {
+            revalidate: cc.stale_while_revalidate.unwrap_or(0),
+            error: cc
+                .stale_if_error
+                .unwrap_or(if never { 0 } else { u64::from(setting_s) }),
+        }
     }
+}
+
+/// A copy that is past its life: kept for the application to confirm it, and for the day the
+/// application fails.
+pub(crate) struct Old {
+    id: FileId,
+    copy: Arc<Loaded>,
+    windows: Windows,
+    /// What to ask the application with; only a request that may fill asks.
+    validator: Option<Validator>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+/// What a request carries past the cache step to the application.
+#[derive(Default)]
+pub(crate) struct Pending {
+    guard: Option<FillGuard>,
+    old: Option<Old>,
+}
+
+impl Pending {
+    /// The fill lock, to be handed to [`fill`].
+    pub fn take_guard(&mut self) -> Option<FillGuard> {
+        self.guard.take()
+    }
+
+    /// What the request asks the application to confirm, when there is a copy to confirm.
+    pub fn validator(&self) -> Option<&Validator> {
+        self.old.as_ref()?.validator.as_ref()
+    }
+}
+
+/// What the cache step made of a request.
+pub(crate) enum Entered {
+    /// The answer, from a copy, with the label it takes.
+    Answer(Box<OutboundResponse>, Label),
+    /// The request goes on, to the folder of files or to the application.
+    Go(Pending),
+}
+
+/// A fresh copy as the answer, which a second hit of a small one also puts in memory.
+fn fresh(
+    cx: &Ctx<'_>,
+    app: &Arc<AppCache>,
+    copy: Copy,
+    now: u64,
+) -> (Box<OutboundResponse>, Label) {
     // The second hit of a small copy puts it in memory, so the third reads no disk.
-    if !from_memory && hits >= 2 && loaded.size <= MEMORY_COPY_MAX {
-        app.index().admit_memory(&id, loaded.clone());
+    if !copy.from_memory && copy.hits >= 2 && copy.loaded.size <= MEMORY_COPY_MAX {
+        app.index().admit_memory(&copy.id, copy.loaded.clone());
     }
-    Some(hit::answer(req, loaded, now))
+    let label = if copy.from_memory {
+        Label::HitMemory
+    } else {
+        Label::HitDisk
+    };
+    (Box::new(hit::answer(cx.req, copy.loaded, now)), label)
+}
+
+/// What the lookup finds: the answer, or the copy past its life.
+enum Settled {
+    Answer(Box<OutboundResponse>, Label),
+    Old(Option<Old>),
+}
+
+/// Looks the copy up. A fresh one answers. One past its life but within the `stale-while-revalidate`
+/// of its answer is sent as `STALE` and one fetch in the background makes it fresh (`first`: only
+/// the first look does that). Any other is handed back to be confirmed or replaced.
+async fn settle(cx: &Ctx<'_>, ask: &Ask, app: &Arc<AppCache>, first: bool) -> Settled {
+    let now = store::now();
+    let Some(copy) = load(cx, ask, now).await else {
+        return Settled::Old(None);
+    };
+    if now < copy.loaded.times.fresh_until {
+        let (answer, label) = fresh(cx, app, copy, now);
+        return Settled::Answer(answer, label);
+    }
+    let windows = Windows::of(&copy.loaded, app.stale_if_error_s());
+    let late = now - copy.loaded.times.fresh_until;
+    let validator = ask.fillable.then(|| Validator::of(&copy.loaded)).flatten();
+    // A copy that can neither be confirmed nor stand in for the application is of no use.
+    if validator.is_none() && late >= windows.revalidate.max(windows.error) {
+        return Settled::Old(None);
+    }
+    let old = Old {
+        id: copy.id,
+        validator,
+        copy: copy.loaded,
+        windows,
+        _permit: copy.permit,
+    };
+    if first && late < windows.revalidate {
+        let answer = hit::answer(cx.req, old.copy.clone(), now);
+        if ask.fillable
+            && app.can_store()
+            && let Some(guard) = app.fills().try_lead(ask.primary_id, now)
+        {
+            refresh::spawn(cx, ask, old, guard);
+        }
+        return Settled::Answer(Box::new(answer), Label::Stale);
+    }
+    Settled::Old(Some(old))
+}
+
+/// The cache step of a request that the verdict allows: a fresh copy is the answer, and so is one
+/// within its `stale-while-revalidate`. With none, the request goes on with what it needs to ask
+/// the application about a copy past its life, or to send it when the application fails. It has
+/// not taken its turn for the key yet: [`take_turn`] does that once the folder of files has said
+/// the request is not its own.
+pub(crate) async fn enter(cx: &Ctx<'_>, ask: &Ask) -> Entered {
+    let Some((_, app)) = cx.route.cache_active() else {
+        return Entered::Go(Pending::default());
+    };
+    match settle(cx, ask, app, true).await {
+        Settled::Answer(answer, label) => Entered::Answer(answer, label),
+        Settled::Old(old) => Entered::Go(Pending { guard: None, old }),
+    }
+}
+
+/// The turn of a request for its key, before it asks the application: the one that may fill
+/// fetches, the others wait up to five seconds for it and look again, so one request at a time
+/// goes to the application for a key that has no copy. A copy that came in meanwhile is the
+/// answer.
+pub(crate) async fn take_turn(
+    cx: &Ctx<'_>,
+    ask: &Ask,
+    pending: &mut Pending,
+) -> Option<(Box<OutboundResponse>, Label)> {
+    let (_, app) = cx.route.cache_active()?;
+    // Only the process that writes fetches for others: one that cannot store has nothing to give
+    // those who wait.
+    let lead = ask.fillable && app.can_store();
+    let guard = match app.fills().turn(ask.primary_id, lead, store::now()) {
+        Turn::Free => return None,
+        Turn::Lead(guard) => Some(guard),
+        Turn::Wait(rx) => {
+            fills::wait(rx).await;
+            None
+        }
+    };
+    match settle(cx, ask, app, false).await {
+        Settled::Answer(answer, label) => return Some((answer, label)),
+        Settled::Old(old) => pending.old = old.or(pending.old.take()),
+    }
+    pending.guard = guard;
+    None
+}
+
+/// The copy as the answer when the application cannot give one: it is down or timed out, or it
+/// answered 500, 502, 503 or 504, and the copy is within the window its answer allows (else the
+/// setting's).
+pub(crate) fn on_error(cx: &Ctx<'_>, pending: &Pending) -> Option<OutboundResponse> {
+    let old = pending.old.as_ref()?;
+    let now = store::now();
+    (now.saturating_sub(old.copy.times.fresh_until) < old.windows.error)
+        .then(|| hit::answer(cx.req, old.copy.clone(), now))
+}
+
+/// Whether an answer of the application is one that a copy may stand in for.
+pub(crate) fn is_failure(status: u16) -> bool {
+    matches!(status, 500 | 502 | 503 | 504)
+}
+
+/// The application said `304` to the question the cache asked: the copy holds. Its headers take
+/// the new ones and it is kept again for as long as the new answer says. Returns the copy as it
+/// now is, for [`answer_of`]; `None` when the request asked no question.
+pub(crate) fn revalidated(
+    cx: &Ctx<'_>,
+    ask: &Ask,
+    pending: &mut Pending,
+    answer: &OutboundResponse,
+) -> Option<Arc<Loaded>> {
+    let guard = pending.take_guard();
+    let old = pending.old.as_ref().filter(|o| o.validator.is_some())?;
+    let (settings, app) = cx.route.cache_active()?;
+    let now = store::now();
+    let Some((head, merged)) = refresh::merged(&old.copy, answer) else {
+        // It brought a cookie: the copy is not to be kept.
+        app.drop_entry(&old.id);
+        return Some(old.copy.clone());
+    };
+    let prepared = decide(settings, ask, cx.req, &merged, now);
+    let times = prepared.as_ref().map_or(
+        Times {
+            stored_at: now,
+            fresh_until: now,
+            initial_age: 0,
+            stale_window: 0,
+        },
+        |p| p.times,
+    );
+    let loaded = Arc::new(Loaded {
+        times,
+        head,
+        body: old.copy.body.clone(),
+        size: old.copy.size,
+    });
+    match prepared {
+        Ok(p) if app.can_store() => keep(cx.shared, app, ask.purge_gen, p, merged.body, guard),
+        Ok(_) => {}
+        // The new headers say it is not to be kept: it goes, and still answers this request.
+        Err(_) => app.drop_entry(&old.id),
+    }
+    Some(loaded)
+}
+
+/// The answer a copy gives to the request.
+pub(crate) fn answer_of(cx: &Ctx<'_>, copy: Arc<Loaded>) -> OutboundResponse {
+    hit::answer(cx.req, copy, store::now())
 }
 
 /// A 2xx or 3xx answer to `POST`, `PUT`, `PATCH` or `DELETE` ends the copies of the URL, in every
@@ -674,5 +1050,7 @@ pub(crate) async fn drop_copies(
     let _ = tokio::time::timeout(STORE_WAIT, job).await;
 }
 
+#[cfg(test)]
+mod fuzz;
 #[cfg(test)]
 mod tests;
