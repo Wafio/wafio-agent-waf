@@ -201,6 +201,18 @@ pub fn push_forward_query(dst: &mut Vec<u8>, query: &[u8]) {
     }
 }
 
+/// The request target an upstream receives, and the cache keys a copy by: the re-quoted
+/// `forward_path`, then `?` and the forwarded `query` when there is one.
+pub(crate) fn forward_target(forward_path: &[u8], query: &[u8]) -> Vec<u8> {
+    let mut target = Vec::with_capacity(forward_path.len() + query.len() + 1);
+    push_escaped_path(&mut target, forward_path);
+    if !query.is_empty() {
+        target.push(b'?');
+        push_forward_query(&mut target, query);
+    }
+    target
+}
+
 /// Removes every line named `key` by swapping it with the last one, so each delete reorders the
 /// lines that follow it (two lines of one name come out the other way round).
 pub(crate) fn remove_all_lines_named(h: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8]) {
@@ -219,7 +231,7 @@ pub(crate) fn remove_all_lines_named(h: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8]
 
 /// The path and query of the URI the handler sees: `uri` is the request-target with an
 /// absolute-form scheme and authority already taken off.
-fn split_path_query(uri: &[u8]) -> (&[u8], &[u8]) {
+pub(crate) fn split_path_query(uri: &[u8]) -> (&[u8], &[u8]) {
     let q = uri.iter().position(|&c| c == b'?');
     let f = uri.iter().position(|&c| c == b'#');
     match (q, f) {
@@ -306,11 +318,7 @@ impl InboundRequest {
         req.original_path = path_original.to_vec();
         req.query = query.to_vec();
         req.forward_path = decode_forwarded_path(&req.request_target).0;
-        push_escaped_path(&mut req.forward_request_target, &req.forward_path);
-        if !req.query.is_empty() {
-            req.forward_request_target.push(b'?');
-            push_forward_query(&mut req.forward_request_target, &req.query);
-        }
+        req.forward_request_target = forward_target(&req.forward_path, &req.query);
         // The header map: the Host header as written (not the URI host), Content-Length,
         // Content-Type, User-Agent, Trailer, Cookie, the other lines in order (every non-close
         // Connection line, Transfer-Encoding, the body's trailer lines), then Connection: close

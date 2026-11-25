@@ -1,14 +1,20 @@
 //! What a purge names: every copy of the app, of an address, or of a path below one, whatever its
 //! encoding or `Vary` variant.
 
+use crate::request::{forward_target, split_path_query};
+use wafio_engine_rules::decode_forwarded_path;
+
 /// What a `CachePurge` asks to remove.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PurgeScope<'a> {
     /// The copies of one address: a path with its query (on every host of the app) or an absolute
-    /// `http://` or `https://` URL (that host only), compared byte for byte with the target.
+    /// `http://` or `https://` URL (that host only). The address is read as a request target is
+    /// before its copy is keyed (the path decoded, dot segments resolved and escaped again, the
+    /// query kept with `"`, `<` and `>` written out), then compared byte for byte with the stored
+    /// target.
     Url(&'a str),
     /// The copies whose target path starts with a path (on every host), or with the path of an
-    /// absolute URL (on its host).
+    /// absolute URL (on its host), read the same way.
     Prefix(&'a str),
     /// Everything the app has stored.
     App,
@@ -36,6 +42,17 @@ fn split(address: &str) -> Option<(Option<Vec<u8>>, Vec<u8>)> {
     Some((Some(host.into_bytes()), target))
 }
 
+/// The target a request for `target` is stored under: its path decoded, its dot segments resolved
+/// and escaped again, its query with `"`, `<` and `>` written out. `None` when the path holds a
+/// `%` that no two hex digits follow, or a space or control byte (which no request line carries).
+fn stored_target(target: &[u8]) -> Option<Vec<u8>> {
+    let (path, valid) = decode_forwarded_path(target);
+    if !valid || target.iter().any(|&c| c <= b' ' || c == 0x7f) {
+        return None;
+    }
+    Some(forward_target(&path, split_path_query(target).1))
+}
+
 /// [`PurgeScope`] ready to compare with the host and target of a key.
 #[derive(Debug)]
 pub(crate) enum Matcher {
@@ -57,6 +74,7 @@ impl Matcher {
             PurgeScope::App => Matcher::All,
             PurgeScope::Url(address) => {
                 let (host, target) = split(address)?;
+                let target = stored_target(&target)?;
                 Matcher::Url { host, target }
             }
             PurgeScope::Prefix(address) => {
@@ -68,7 +86,7 @@ impl Matcher {
                     .unwrap_or(target.len());
                 Matcher::Prefix {
                     host,
-                    path: target[..end].to_vec(),
+                    path: stored_target(&target[..end])?,
                 }
             }
         })
@@ -159,6 +177,97 @@ mod tests {
             named(prefix("/"), "a.test", "/"),
             "the root names every path"
         );
+    }
+
+    #[test]
+    fn an_address_is_read_the_way_a_request_target_is_before_its_copy_is_keyed() {
+        let url = PurgeScope::Url;
+        // The copy of /x_(y) is stored with its parentheses escaped.
+        assert!(named(url("/x_(y)"), "a.test", "/x_%28y%29"));
+        assert!(named(url("/x_%28y%29"), "a.test", "/x_%28y%29"));
+        assert!(named(url("/a%2db"), "a.test", "/a-b"), "lower-case escape");
+        assert!(named(url("/a%2Db"), "a.test", "/a-b"));
+        assert!(named(url("/a-b"), "a.test", "/a-b"));
+        assert!(named(url("/caf%c3%a9"), "a.test", "/caf%C3%A9"));
+        assert!(
+            named(url("/caf\u{e9}"), "a.test", "/caf%C3%A9"),
+            "raw UTF-8"
+        );
+        assert!(named(url("/a/./b"), "a.test", "/a/b"), "dot segment");
+        assert!(named(url("/a/x/../b"), "a.test", "/a/b"), "dot-dot segment");
+        assert!(named(url("/a/%2e%2e/b"), "a.test", "/b"), "escaped dots");
+        assert!(named(url("//a///b"), "a.test", "/a/b"), "repeated slash");
+        assert!(named(url("https://A.test/x_(y)"), "a.test", "/x_%28y%29"));
+        assert!(
+            !named(url("/a%2db"), "a.test", "/a%2Db"),
+            "stored form only"
+        );
+        assert!(!named(url("/a%2fb"), "a.test", "/a-b"));
+        // The query keeps its bytes, but `"`, `<` and `>` are written out as in the key.
+        assert!(named(url("/p?q=\"x\""), "a.test", "/p?q=%22x%22"));
+        assert!(named(url("/p?q=<b>"), "a.test", "/p?q=%3Cb%3E"));
+        assert!(named(url("/p?q=%22x"), "a.test", "/p?q=%22x"));
+        assert!(!named(url("/p?q=%2d"), "a.test", "/p?q=-"), "no decoding");
+        assert!(
+            !named(url("/p?q=%2d"), "a.test", "/p?q=%2D"),
+            "no case change"
+        );
+        assert!(
+            !named(url("/p?b=2&a=1"), "a.test", "/p?a=1&b=2"),
+            "no sorting"
+        );
+        assert!(named(url("/p?"), "a.test", "/p"), "an empty query is none");
+    }
+
+    #[test]
+    fn a_prefix_is_read_the_same_way_and_keeps_its_text_meaning() {
+        let prefix = PurgeScope::Prefix;
+        assert!(named(
+            prefix("/wiki/Foo_("),
+            "a.test",
+            "/wiki/Foo_%28bar%29"
+        ));
+        assert!(named(
+            prefix("/wiki/Foo_%28bar"),
+            "a.test",
+            "/wiki/Foo_%28bar%29"
+        ));
+        assert!(named(prefix("/a%2d"), "a.test", "/a-b/x"));
+        assert!(named(prefix("/a/./b/"), "a.test", "/a/b/c"));
+        assert!(named(prefix("/a/x/../"), "a.test", "/a/b"));
+        assert!(
+            named(prefix("/caf%c3"), "a.test", "/caf%C3%A9"),
+            "half a character"
+        );
+        assert!(
+            named(prefix("/p/?ignored=1"), "a.test", "/p/x"),
+            "query left out"
+        );
+        assert!(named(prefix("https://a.test/x_("), "a.test", "/x_%28y%29"));
+        assert!(!named(prefix("https://a.test/x_("), "b.test", "/x_%28y%29"));
+        assert!(!named(prefix("/a%2d"), "a.test", "/a%2Db"));
+    }
+
+    #[test]
+    fn an_address_that_cannot_be_read_as_a_request_target_names_nothing() {
+        for bad in [
+            "/a%zz",
+            "/a%4",
+            "/a%",
+            "/a%2",
+            "/a b",
+            "/a\x01",
+            "/a\x7f",
+            "/a\tb",
+            "https://a.test/a%zz",
+            "http://a.test/a b",
+        ] {
+            assert!(Matcher::new(PurgeScope::Url(bad)).is_none(), "{bad:?}");
+            assert!(Matcher::new(PurgeScope::Prefix(bad)).is_none(), "{bad:?}");
+        }
+        // A bad escape in the query is no escape of the path: the query is kept as it is.
+        assert!(named(PurgeScope::Url("/p?q=%zz"), "a.test", "/p?q=%zz"));
+        assert!(Matcher::new(PurgeScope::Prefix("/p?q=%zz")).is_some());
     }
 
     #[test]
