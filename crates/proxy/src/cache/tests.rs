@@ -487,13 +487,14 @@ fn headers_of_an_untrusted_peer_are_not_in_the_key_and_a_trusted_proxys_are() {
         key(&trusting, &odd, &client())
     );
     // The scheme is the word of any peer, trusted or not: a front proxy that ends TLS and is not
-    // trusted still tells the application, and a value other than `https` is the http key.
+    // trusted still tells the application, and a value other than `https` is the http key. A
+    // trusted proxy's value goes on as it wrote it, so each value is a key of its own.
     let https = get("/x", "X-Forwarded-Proto: https\r\n");
-    for (site, peer) in [
-        (&trusting, proxy()),
-        (&trusting, client()),
-        (&untrusting, proxy()),
-        (&untrusting, client()),
+    for (site, peer, trusted) in [
+        (&trusting, proxy(), true),
+        (&trusting, client(), false),
+        (&untrusting, proxy(), false),
+        (&untrusting, client(), false),
     ] {
         assert_ne!(
             key(site, &plain, &peer),
@@ -505,9 +506,9 @@ fn headers_of_an_untrusted_peer_are_not_in_the_key_and_a_trusted_proxys_are() {
             "X-Forwarded-Proto: wss, https\r\n",
         ] {
             assert_eq!(
-                key(site, &plain, &peer),
-                key(site, &get("/x", other), &peer),
-                "{other}"
+                key(site, &plain, &peer) == key(site, &get("/x", other), &peer),
+                !trusted,
+                "{peer:?} {other}"
             );
         }
     }

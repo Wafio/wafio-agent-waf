@@ -142,6 +142,20 @@ pub(crate) fn is_https(req: &InboundRequest) -> bool {
     req.tls.is_some() || forwarded_https(req)
 }
 
+/// What the application is told in `X-Forwarded-Proto`: `https` when the agent ended TLS, a
+/// trusted proxy's first line as it wrote it (the key holds it), else the scheme the key reads,
+/// with `None` for HTTP.
+pub(crate) fn forwarded_scheme(req: &InboundRequest, trusted: bool) -> Option<&[u8]> {
+    let said = req.peek("X-Forwarded-Proto");
+    if req.tls.is_some() {
+        Some(b"https")
+    } else if trusted && !said.is_empty() {
+        Some(said)
+    } else {
+        forwarded_https(req).then_some(&b"https"[..])
+    }
+}
+
 /// `host` without a port that is the scheme's own.
 pub(crate) fn host_without_default_port(host: &[u8], https: bool) -> &[u8] {
     let port: &[u8] = if https { b":443" } else { b":80" };
@@ -152,13 +166,14 @@ pub(crate) fn host_without_default_port(host: &[u8], https: bool) -> &[u8] {
     }
 }
 
-/// The values of the unkeyed inputs of a trusted proxy, by name then arrival; `None` when they
-/// hold more than [`KEYED_INPUT_MAX`] bytes.
+/// The values of the unkeyed inputs of a trusted proxy and of its `X-Forwarded-Proto`, which goes
+/// on as it wrote it, by name then arrival; `None` when they hold more than [`KEYED_INPUT_MAX`]
+/// bytes.
 pub(crate) fn keyed_inputs(req: &InboundRequest) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut found: Vec<(Vec<u8>, Vec<u8>)> = req
         .lines
         .iter()
-        .filter(|(name, _)| unkeyed_input(name))
+        .filter(|(name, _)| unkeyed_input(name) || forwarded_proto(name))
         .map(|(name, value)| (normalized(name), value.clone()))
         .collect();
     let total: usize = found.iter().map(|(n, v)| n.len() + v.len()).sum();

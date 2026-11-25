@@ -995,16 +995,21 @@ async fn a_file_for_a_cookie_visitor_is_kept_only_while_the_default_lifetime_is_
 }
 
 /// What a front proxy may write in `X-Forwarded-Proto`, and what the application is told, the
-/// same with the cache on or off and from a trusted peer or not: `https` for a first value of
-/// `https` in any case, nothing for every other form, which the key reads as no TLS.
-const PROTOS: [(&[&str], &str); 7] = [
-    (&[], ""),
-    (&["X-Forwarded-Proto: https"], "https"),
-    (&["X-Forwarded-Proto: HTTPS, http"], "https"),
-    (&["X-Forwarded-Proto: http"], ""),
-    (&["X-Forwarded-Proto: http, https"], ""),
-    (&["X-Forwarded-Proto: gopher"], ""),
-    (&["X-Forwarded-Proto: http", "X_Forwarded_Proto: https"], ""),
+/// same with the cache on or off. From a peer that is not trusted: `https` for a first value of
+/// `https` in any case, nothing for every other form, which the key reads as no TLS. From a trusted
+/// proxy: its first line as it wrote it. Another spelling never goes on.
+const PROTOS: [(&[&str], &str, &str); 7] = [
+    (&[], "", ""),
+    (&["X-Forwarded-Proto: https"], "https", "https"),
+    (&["X-Forwarded-Proto: HTTPS, http"], "https", "HTTPS, http"),
+    (&["X-Forwarded-Proto: http"], "", "http"),
+    (&["X-Forwarded-Proto: http, https"], "", "http, https"),
+    (&["X-Forwarded-Proto: gopher"], "", "gopher"),
+    (
+        &["X-Forwarded-Proto: http", "X_Forwarded_Proto: https"],
+        "",
+        "http",
+    ),
 ];
 
 const CACHE_AND_TRUST: [(bool, bool); 4] =
@@ -1012,16 +1017,21 @@ const CACHE_AND_TRUST: [(bool, bool); 4] =
 
 const TRUSTING: &[u8] = br#"{"trust_forwarded":true}"#;
 
+/// The scheme line the application is told for `PROTOS[i]` over FastCGI, which gets none for HTTP.
+fn heard_over_fastcgi(i: usize, trusted: bool) -> &'static str {
+    if trusted { PROTOS[i].2 } else { PROTOS[i].1 }
+}
+
 /// The scheme line the application is told for `PROTOS[i]` by an HTTP upstream, which always gets one.
-fn heard_over_http(i: usize) -> &'static str {
-    match PROTOS[i].1 {
+fn heard_over_http(i: usize, trusted: bool) -> &'static str {
+    match heard_over_fastcgi(i, trusted) {
         "" => "http",
         said => said,
     }
 }
 
 #[tokio::test]
-async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_or_not_over_http() {
+async fn a_front_proxys_scheme_is_heard_with_the_cache_on_or_off_over_http() {
     for (cache_on, trusted) in CACHE_AND_TRUST {
         let up = counting("200 OK", PUBLIC).await;
         let seen = up.clone();
@@ -1045,11 +1055,11 @@ async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_o
             addr = listening;
             keep = Box::new(h);
         }
-        for (i, (lines, _)) in PROTOS.iter().enumerate() {
+        for (i, (lines, ..)) in PROTOS.iter().enumerate() {
             fetch(addr, &with(&format!("/proto/{i}"), lines)).await;
             assert_eq!(
                 seen.last().all("x-forwarded-proto"),
-                [heard_over_http(i)],
+                [heard_over_http(i, trusted)],
                 "cache {cache_on}, trusted {trusted}, {lines:?}"
             );
         }
@@ -1058,8 +1068,7 @@ async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_o
 }
 
 #[tokio::test]
-async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_or_not_over_fastcgi()
-{
+async fn a_front_proxys_scheme_is_heard_with_the_cache_on_or_off_over_fastcgi() {
     for (cache_on, trusted) in CACHE_AND_TRUST {
         let (fcgi, fake) = fake_fcgi().await;
         let dir = Dir::new("fcgi-proto");
@@ -1070,12 +1079,13 @@ async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_o
         }
         a.cache = cache_on.then(spec);
         let (_h, addr) = serve_with(&host, a);
-        for (i, (lines, want)) in PROTOS.iter().enumerate() {
+        for (i, (lines, ..)) in PROTOS.iter().enumerate() {
             fetch(addr, &with(&format!("/index.php?{i}"), lines)).await;
             let params = fake.params.lock().unwrap().last().cloned().unwrap();
+            let want = heard_over_fastcgi(i, trusted);
             assert_eq!(
                 params.get("HTTP_X_FORWARDED_PROTO").map(String::as_str),
-                (!want.is_empty()).then_some(*want),
+                (!want.is_empty()).then_some(want),
                 "cache {cache_on}, trusted {trusted}, {lines:?}: {params:?}"
             );
         }
@@ -1105,6 +1115,24 @@ async fn an_untrusted_front_proxys_scheme_is_part_of_the_key_so_it_cannot_poison
     );
     let odd = fetch(s.addr, &strange).await;
     assert_eq!((x_cache(&odd), odd.text().as_str()), ("HIT", "answer 2"));
+    assert_eq!(s.up.count(), 2);
+}
+
+#[tokio::test]
+async fn a_trusted_proxys_scheme_is_part_of_the_key_as_it_wrote_it() {
+    let s = site(counting("200 OK", PUBLIC).await, spec(), |a| {
+        a.proxy_config = TRUSTING.to_vec()
+    })
+    .await;
+    // Both say https first, and the application hears each as it was written.
+    for (lines, want) in [
+        (["X-Forwarded-Proto: https"], ("MISS", "answer 1")),
+        (["X-Forwarded-Proto: HTTPS, http"], ("MISS", "answer 2")),
+        (["X-Forwarded-Proto: https"], ("HIT", "answer 1")),
+    ] {
+        let r = fetch(s.addr, &with("/k", &lines)).await;
+        assert_eq!((x_cache(&r), r.text().as_str()), want, "{lines:?}");
+    }
     assert_eq!(s.up.count(), 2);
 }
 
