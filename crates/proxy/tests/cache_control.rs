@@ -328,6 +328,35 @@ async fn a_lead_whose_answer_is_refused_for_its_cookie_hands_the_turn_to_one_wai
     assert!(waiters.iter().all(|r| r.text() == "the page"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiter_with_a_cookie_does_not_queue_a_second_time() {
+    let (up, arrivals) = slow_upstream(Duration::from_millis(300), |seen| {
+        reply_to(seen, "200 OK", "Content-Type: text/html\r\n", b"the page")
+    })
+    .await;
+    let s = site(up, keeping_everything(), |_| {}).await;
+    let addr = s.addr;
+    let lead =
+        tokio::spawn(async move { one(addr, &with("/p", &["Cookie: _ga=GA1.1.1.1"])).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Every waiter has a cookie too: a second lead among them would be refused the same way, so
+    // after the first wait they all go to the application together.
+    let waiters = burst(addr, 2, with("/p", &["Cookie: _ga=GA1.1.1.2"])).await;
+    assert_eq!(x_cache(&lead.await.unwrap()), "MISS");
+    assert_eq!(labelled(&waiters, "MISS"), 2);
+    assert_eq!(s.up.count(), 3);
+    let at = arrivals.lock().unwrap();
+    let spread = at[1..]
+        .iter()
+        .max()
+        .unwrap()
+        .duration_since(*at[1..].iter().min().unwrap());
+    assert!(
+        spread < Duration::from_millis(200),
+        "one fetch each, not one after the other: {spread:?}"
+    );
+}
+
 // A copy that is past its life.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

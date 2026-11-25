@@ -940,8 +940,9 @@ pub(crate) async fn enter(cx: &Ctx<'_>, ask: &Ask) -> Entered {
 /// fetches, the others wait up to five seconds for it and look again, so one request at a time
 /// goes to the application for a key that has no copy. A copy that came in while a request waited
 /// is the answer. A fetch that ends with no copy and no mark (its visitor had a cookie, which says
-/// nothing of the page) leaves one more turn: one of the waiters leads and the rest wait again,
-/// once, so the wait stays bounded.
+/// nothing of the page) leaves one more turn: one of the waiters without a cookie leads and the
+/// rest wait again, once, so the wait stays bounded. A waiter with a cookie goes on after its first
+/// wait, as its own answer may be refused the same way.
 pub(crate) async fn take_turn(
     cx: &Ctx<'_>,
     ask: &Ask,
@@ -967,7 +968,7 @@ pub(crate) async fn take_turn(
                     Settled::Old(old) => pending.old = old.or(pending.old.take()),
                 }
                 // A wait that ran out is not asked again: the application is slow, not refusing.
-                if waited || !ended {
+                if waited || !ended || ask.cookie {
                     return None;
                 }
                 waited = true;

@@ -945,9 +945,10 @@ are for an answer with no lifetime, a `Set-Cookie`, `private`, `no-store` or `no
 `Cache-Control`, a status that is not kept (not a 5xx, which may pass, and not a `304` or `412`, which answer a condition and say nothing of the
 page), an answer over `max_object_bytes`, an encoding the bucket does not name, and one sent in pieces. A refusal that depends on the visitor (a
 request with a cookie that gets an answer that is not marked public) does not mark: it says nothing of the page, which another visitor may
-get a copy of. The waiters of such a fetch are woken, one of them takes the lock in its place and the others wait for it once more (up to 5
-seconds again), so one visitor with a cookie that leads does not release the queue. If that second fetch ends with no copy too, the rest go
-on in parallel. A wait that ran out is not repeated. A process that cannot store (a
+get a copy of. The waiters of such a fetch are woken, one of them without a cookie takes the lock in its place and the others without a
+cookie wait for it once more (up to 5 seconds again), so one visitor with a cookie that leads does not release the queue. A waiter with a
+cookie goes on to the application after its first wait, as its answer may be refused the same way. If that second fetch ends with no copy
+too, the rest go on in parallel. A wait that ran out is not repeated. A process that cannot store (a
 reload's successor) takes no lock. A purge clears the marks.
 
 **A copy that is past its life** is read and used in this order. Within the `stale-while-revalidate` of its answer it is sent at once as `STALE`
