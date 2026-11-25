@@ -964,17 +964,47 @@ async fn the_response_header_rules_reach_the_pages_of_php_sent_directly_made_and
     has_the_header_rules(&hit, "a copy");
 }
 
-/// What a front proxy may write in `X-Forwarded-Proto`: the lines, what the application is told
-/// when the cache is off or the peer is trusted (the line itself, nothing when there is none), and
-/// what it is told when the cache is on and the peer is not trusted (`https` for a first value of
-/// `https`, nothing for every other form, which the key reads as no TLS).
-const PROTOS: [(&[&str], &str, &str); 6] = [
-    (&[], "", ""),
-    (&["X-Forwarded-Proto: https"], "https", "https"),
-    (&["X-Forwarded-Proto: HTTPS, http"], "HTTPS, http", "https"),
-    (&["X-Forwarded-Proto: http"], "http", ""),
-    (&["X-Forwarded-Proto: http, https"], "http, https", ""),
-    (&["X-Forwarded-Proto: gopher"], "gopher", ""),
+#[tokio::test]
+async fn a_file_for_a_cookie_visitor_is_kept_only_while_the_default_lifetime_is_on() {
+    let jwt = ["Cookie: jwt=eyJ.a.b"];
+    for (default_ttl_s, second) in [(3600, "HIT"), (0, "MISS")] {
+        let up = counting(
+            "200 OK",
+            "Content-Type: image/jpeg\r\nCache-Control: max-age=3600\r\n",
+        )
+        .await;
+        let s = site(
+            up,
+            CacheSpec {
+                default_ttl_s,
+                ..spec()
+            },
+            |_| {},
+        )
+        .await;
+        assert_eq!(
+            x_cache(&fetch(s.addr, &with("/id.jpg", &jwt)).await),
+            "MISS"
+        );
+        assert_eq!(
+            x_cache(&fetch(s.addr, &with("/id.jpg", &jwt)).await),
+            second,
+            "default_ttl_s {default_ttl_s}"
+        );
+    }
+}
+
+/// What a front proxy may write in `X-Forwarded-Proto`, and what the application is told, the
+/// same with the cache on or off and from a trusted peer or not: `https` for a first value of
+/// `https` in any case, nothing for every other form, which the key reads as no TLS.
+const PROTOS: [(&[&str], &str); 7] = [
+    (&[], ""),
+    (&["X-Forwarded-Proto: https"], "https"),
+    (&["X-Forwarded-Proto: HTTPS, http"], "https"),
+    (&["X-Forwarded-Proto: http"], ""),
+    (&["X-Forwarded-Proto: http, https"], ""),
+    (&["X-Forwarded-Proto: gopher"], ""),
+    (&["X-Forwarded-Proto: http", "X_Forwarded_Proto: https"], ""),
 ];
 
 const CACHE_AND_TRUST: [(bool, bool); 4] =
@@ -983,13 +1013,8 @@ const CACHE_AND_TRUST: [(bool, bool); 4] =
 const TRUSTING: &[u8] = br#"{"trust_forwarded":true}"#;
 
 /// The scheme line the application is told for `PROTOS[i]` by an HTTP upstream, which always gets one.
-fn heard_over_http(i: usize, cache_on: bool, trusted: bool) -> &'static str {
-    let (_, line, untrusted) = PROTOS[i];
-    match if cache_on && !trusted {
-        untrusted
-    } else {
-        line
-    } {
+fn heard_over_http(i: usize) -> &'static str {
+    match PROTOS[i].1 {
         "" => "http",
         said => said,
     }
@@ -1020,11 +1045,11 @@ async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_o
             addr = listening;
             keep = Box::new(h);
         }
-        for (i, (lines, _, _)) in PROTOS.iter().enumerate() {
+        for (i, (lines, _)) in PROTOS.iter().enumerate() {
             fetch(addr, &with(&format!("/proto/{i}"), lines)).await;
             assert_eq!(
                 seen.last().all("x-forwarded-proto"),
-                [heard_over_http(i, cache_on, trusted)],
+                [heard_over_http(i)],
                 "cache {cache_on}, trusted {trusted}, {lines:?}"
             );
         }
@@ -1045,14 +1070,9 @@ async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_o
         }
         a.cache = cache_on.then(spec);
         let (_h, addr) = serve_with(&host, a);
-        for (i, (lines, line, untrusted)) in PROTOS.iter().enumerate() {
+        for (i, (lines, want)) in PROTOS.iter().enumerate() {
             fetch(addr, &with(&format!("/index.php?{i}"), lines)).await;
             let params = fake.params.lock().unwrap().last().cloned().unwrap();
-            let want = if cache_on && !trusted {
-                untrusted
-            } else {
-                line
-            };
             assert_eq!(
                 params.get("HTTP_X_FORWARDED_PROTO").map(String::as_str),
                 (!want.is_empty()).then_some(*want),

@@ -908,33 +908,31 @@ pub(crate) async fn send_upstream(
             // Every spelling that becomes the same CGI param (`X_Forwarded_For`, `X-Real_IP`) goes
             // too: PHP-FPM keeps the last of a repeated param and the sorted map put such a
             // spelling after ours, so a client could name its own address.
-            // Over TLS the scheme is ours to state too: PHP derives `HTTPS` and the port from it.
-            let over_tls = req.tls.is_some();
             // With the cache on, what an untrusted peer says in the headers that are not part of
-            // the key is not sent on. Its `X-Forwarded-Proto` is, as the key reads it: `https`
-            // when it says so, nothing otherwise, so a front proxy that ends TLS still tells PHP,
-            // and a value of any other form cannot make a third kind of answer.
+            // the key is not sent on. `X-Forwarded-Proto` is sent as the key reads it, from every
+            // peer and with the cache on or off: `https` over TLS or when the first value says so,
+            // nothing otherwise, so a front proxy that ends TLS still tells PHP, and a value of any
+            // other form cannot make a third kind of answer.
             let drop_unkeyed = cache::drops_unkeyed_inputs(route, peer);
             // The host is the agent's word too, as on the HTTP path, from every peer: a trusted
             // proxy that passes the client's `X-Forwarded-Host` on would make the application
             // write it into its links, and the key does not hold it.
             let cache_on = route.cache_active().is_some();
             hm.retain(|k, _| {
-                if drop_unkeyed
-                    && (crate::cache::unkeyed_input(k) || crate::cache::forwarded_proto(k))
+                if crate::cache::forwarded_proto(k)
+                    || (drop_unkeyed && crate::cache::unkeyed_input(k))
                 {
                     return false;
                 }
                 if cache_on && crate::cache::forwarded_host(k) {
                     return false;
                 }
-                match cgi_header_param(k).as_slice() {
-                    b"HTTP_X_REAL_IP" | b"HTTP_X_FORWARDED_FOR" => false,
-                    b"HTTP_X_FORWARDED_PROTO" => !over_tls,
-                    _ => true,
-                }
+                !matches!(
+                    cgi_header_param(k).as_slice(),
+                    b"HTTP_X_REAL_IP" | b"HTTP_X_FORWARDED_FOR" | b"HTTP_X_FORWARDED_PROTO"
+                )
             });
-            if over_tls || (drop_unkeyed && cache::forwarded_https(req)) {
+            if cache::is_https(req) {
                 hm.insert(b"X-Forwarded-Proto".to_vec(), vec![b"https".to_vec()]);
             }
             if cache_on {
@@ -963,7 +961,12 @@ pub(crate) async fn send_upstream(
                 .await
                 .map(|mut r| {
                     if !keep_copy {
-                        crate::upstream::apply_response_header_rules(route, &mut r);
+                        crate::upstream::apply_response_rules(
+                            route,
+                            &req.forward_path,
+                            &req.request_target,
+                            &mut r,
+                        );
                     }
                     Forwarded::Whole(r)
                 })
