@@ -6,9 +6,10 @@
 //! stale (`refresh`); and what a purge names (`purge`).
 //!
 //! Only a request the verdict allows reads or fills it: a log or monitor verdict, an upgrade, a body
-//! on a `GET`, a method override and a path under a `bypass` rule go to the application as they
-//! are, unread and unstored (`X-Cache: BYPASS`). The agent never keeps what is private to a visitor:
-//! see [`decide`] for every case.
+//! on a `GET`, a method override, a path under a `bypass` rule and a visitor who is signed in (unless
+//! a rule says to keep for them) go to the application as they are, unread and unstored
+//! (`X-Cache: BYPASS`). The agent never keeps what is private to a visitor: see [`decide`] for every
+//! case.
 
 mod control;
 mod fills;
@@ -83,7 +84,8 @@ pub struct CacheRule {
     pub bypass: bool,
     /// Seconds to keep an answer that does not say; 1 or more for a keeping rule.
     pub ttl_s: u32,
-    /// Also keep for a signed-in visitor.
+    /// Also read and fill copies for a signed-in visitor, and keep the answer to a request with a
+    /// cookie that is not on the session list although the answer does not say it is for everyone.
     pub signed_in: bool,
 }
 
@@ -265,6 +267,12 @@ pub(crate) fn tag(route: &Route, resp: &mut OutboundResponse, label: Label) {
     }
 }
 
+/// Sets `X-Cache: BYPASS` on a file of the static folder and counts nothing: the cache neither
+/// answered it nor passed it on, so it is no part of the request counters.
+pub(crate) fn tag_static(resp: &mut OutboundResponse) {
+    resp.set(b"X-Cache", b"BYPASS");
+}
+
 /// What the cache makes of a request.
 pub(crate) enum Plan {
     /// The app has no cache.
@@ -297,16 +305,15 @@ pub(crate) struct Ask {
     primary: Vec<u8>,
     primary_id: PrimaryId,
     bucket: Bucket,
-    /// The request itself allows a copy to be made of its answer: a `GET` with no `Range`, from a
-    /// visitor who is not signed in (or for a path with a rule for them).
+    /// The request itself allows a copy to be made of its answer: a `GET` with no `Range`. (A
+    /// visitor who is signed in never gets here unless a rule for them covers the path.)
     pub fillable: bool,
-    /// A `GET` from a visitor who is signed in, for a path no rule opens to them: its answer is
-    /// not kept, and is counted as private.
-    pub signed_in_get: bool,
     /// The request has a `Cookie`.
     cookie: bool,
     /// The lifetime of the keeping rule the path is under.
     rule_ttl: Option<u64>,
+    /// The rule the path is under keeps for visitors who are signed in.
+    rule_signed_in: bool,
     /// The purge count of the app when the request came: a purge since then drops its copy.
     purge_gen: u64,
 }
@@ -352,12 +359,22 @@ pub(crate) fn trusts(route: &Route, peer: &IpAddress) -> bool {
     route.proxy_config.may_supply_forwarded_headers(peer)
 }
 
-pub(crate) use key::{forwarded_host, forwarded_host_or_proto, unkeyed_input};
+pub(crate) use key::{
+    forwarded_host, forwarded_host_or_proto, forwarded_https, forwarded_proto, unkeyed_input,
+};
 
 /// Whether the route has the cache on and the peer is not a proxy it trusts: what such a peer says
 /// in the headers that are not part of the key is not sent to the application.
 pub(crate) fn drops_unkeyed_inputs(route: &Route, peer: &IpAddress) -> bool {
     route.cache_active().is_some() && !trusts(route, peer)
+}
+
+/// The `Accept-Encoding` an application is asked with when its answer may be kept: the one coding
+/// of the visitor's bucket, or `identity`. A visitor's own list names codings the copy is not made
+/// in (`gzip, deflate, br, zstd`), and an application that compresses by itself would answer in
+/// one the bucket does not name and have its answer refused.
+pub(crate) fn upstream_encoding(req: &InboundRequest) -> &'static [u8] {
+    Bucket::of(req).token()
 }
 
 /// What the cache makes of `req`, after the verdict: `action` is the verdict, `body_read` whether
@@ -388,6 +405,12 @@ pub(crate) fn plan(
     if rule.is_some_and(|r| r.bypass || req.forward_path.contains(&b';')) {
         return Plan::Bypass;
     }
+    // A visitor who is signed in is the application's alone, as with `proxy_cache_bypass`: no copy
+    // is read for them and none is made, unless a rule for the path says so.
+    let rule_signed_in = rule.is_some_and(|r| r.signed_in);
+    if !rule_signed_in && is_signed_in(req, &route.session) {
+        return Plan::Bypass;
+    }
     let trusted = trusts(route, peer);
     let keyed = if trusted {
         match keyed_inputs(req) {
@@ -399,22 +422,20 @@ pub(crate) fn plan(
     };
     let bucket = Bucket::of(req);
     let primary = primary_key(
-        is_https(req, trusted),
+        is_https(req),
         &req.host,
         &req.forward_request_target,
         bucket,
         &keyed,
     );
-    let signed_in = is_signed_in(req, &route.session);
-    let may_sign_in = !signed_in || rule.is_some_and(|r| r.signed_in);
     Plan::Lookup(Box::new(Ask {
         primary_id: primary_id(&primary),
         primary,
         bucket,
-        fillable: get && req.peek("Range").is_empty() && may_sign_in,
-        signed_in_get: get && !may_sign_in,
+        fillable: get && req.peek("Range").is_empty(),
         cookie: !req.cookies.is_empty(),
         rule_ttl: rule.map(|r| u64::from(r.ttl_s)),
+        rule_signed_in,
         purge_gen: app.purge_count(),
     }))
 }
@@ -472,8 +493,9 @@ fn digits(value: Option<&[u8]>) -> u32 {
 /// or of more than four names; a body over the largest object; an encoding other than the
 /// request's own bucket; an answer with no lifetime (`s-maxage`, `max-age`, `Expires` minus `Date`,
 /// a keeping rule's time, or the default for a file type; at most 365 days); and, for a request
-/// with a cookie, an answer that is not `public`, has no `s-maxage`, is not a file type and has no
-/// rule behind it. A signed-in visitor, a `Range` and a `HEAD` are refused before ([`Ask::fillable`]).
+/// with a cookie, an answer that is not `public`, has no `s-maxage` and is not a file type, unless
+/// the rule behind the path is one for signed-in visitors. A signed-in visitor (unless such a rule
+/// covers the path), a `Range` and a `HEAD` are refused before ([`plan`], [`Ask::fillable`]).
 pub(crate) fn decide(
     settings: &Settings,
     ask: &Ask,
@@ -517,8 +539,10 @@ pub(crate) fn decide(
     if left == 0 {
         return Err(NotKept::NoLifetime);
     }
+    // A cookie that is not on the session list may still be a login the agent cannot see: only an
+    // answer that says it is for everyone, a file, or a rule that took that risk keeps it.
     if ask.cookie
-        && !(cc.public || cc.s_maxage.is_some() || file_type(&media) || ask.rule_ttl.is_some())
+        && !(cc.public || cc.s_maxage.is_some() || file_type(&media) || ask.rule_signed_in)
     {
         return Err(NotKept::Cookie);
     }
@@ -680,15 +704,6 @@ pub(crate) fn note_streamed(route: &Route, ask: &Ask) {
         app.count(Count::SkippedStreamed);
         app.fills()
             .mark(ask.primary_id, fills::MARK_DEFAULT_S, store::now());
-    }
-}
-
-/// The answer to a visitor who may not have a copy made of it is counted as private.
-pub(crate) fn note_not_kept(route: &Route, ask: &Ask) {
-    if ask.signed_in_get
-        && let Some((_, app)) = route.cache_active()
-    {
-        app.count(Count::SkippedPrivate);
     }
 }
 
@@ -1051,7 +1066,7 @@ pub(crate) async fn drop_copies(
     } else {
         Vec::new()
     };
-    let https = is_https(req, trusted);
+    let https = is_https(req);
     let primaries: Vec<PrimaryId> = Bucket::ALL
         .iter()
         .map(|&bucket| {

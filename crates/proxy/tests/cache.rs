@@ -459,7 +459,7 @@ async fn sessions_never_share_and_a_visitor_who_is_not_signed_in_is_not_given_th
         (a.text().as_str(), b.text().as_str()),
         ("answer 1", "answer 2")
     );
-    assert_eq!((x_cache(&a), x_cache(&b)), ("MISS", "MISS"));
+    assert_eq!((x_cache(&a), x_cache(&b)), ("BYPASS", "BYPASS"));
     let anonymous = fetch(s.addr, &get("/me")).await;
     assert_eq!(
         (anonymous.text().as_str(), x_cache(&anonymous)),
@@ -469,6 +469,179 @@ async fn sessions_never_share_and_a_visitor_who_is_not_signed_in_is_not_given_th
         answer_files(&s.dir.0).len(),
         1,
         "only the anonymous answer is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_signed_in_visitor_is_never_answered_from_a_copy_even_when_one_is_there() {
+    let s = page_site().await;
+    let first = fetch(s.addr, &get("/page")).await;
+    assert_eq!(
+        (x_cache(&first), first.text().as_str()),
+        ("MISS", "answer 1")
+    );
+    assert_eq!(x_cache(&fetch(s.addr, &get("/page")).await), "HIT");
+    // Each way of being signed in goes to the application, which is asked, and it is told so.
+    let userinfo = b"GET http://u:p@app.test/page HTTP/1.1\r\nHost: app.test\r\n\r\n".to_vec();
+    let signed_in = [
+        with("/page", &["Cookie: PHPSESSID=abc"]),
+        with("/page", &["Cookie: theme=dark; wordpress_logged_in_x=1"]),
+        with("/page", &["Authorization: Bearer t"]),
+        userinfo,
+    ];
+    for (i, raw) in signed_in.iter().enumerate() {
+        let r = fetch(s.addr, raw).await;
+        assert_eq!(
+            (x_cache(&r), r.text()),
+            ("BYPASS", format!("answer {}", i + 2)),
+            "{i}"
+        );
+        assert_eq!(s.up.count(), i + 2, "{i}: the application was asked");
+    }
+    // Their answers made no copy, and the one anonymous visitors get is as it was.
+    assert_eq!(answer_files(&s.dir.0).len(), 1);
+    let again = fetch(s.addr, &get("/page")).await;
+    assert_eq!(
+        (x_cache(&again), again.text().as_str()),
+        ("HIT", "answer 1")
+    );
+    // They count as requests that were not looked up, and as nothing else.
+    let c = s.host.counters("shop").unwrap();
+    assert_eq!(
+        (
+            c.bypass,
+            c.misses,
+            c.hits_memory + c.hits_disk,
+            c.skipped_private
+        ),
+        (4, 1, 2, 0),
+        "{c:?}"
+    );
+    assert_eq!(c.requests, 7);
+}
+
+#[tokio::test]
+async fn a_path_that_a_rule_has_for_the_signed_in_is_looked_up_and_filled_for_them() {
+    let mut cache = spec();
+    cache.rules = vec![
+        CacheRule {
+            prefix: "/docs/".into(),
+            bypass: false,
+            ttl_s: 60,
+            signed_in: true,
+        },
+        CacheRule {
+            prefix: "/blog/".into(),
+            bypass: false,
+            ttl_s: 60,
+            signed_in: false,
+        },
+    ];
+    let s = site(
+        counting("200 OK", "Content-Type: text/html\r\n").await,
+        cache,
+        |_| {},
+    )
+    .await;
+    let signed = ["Cookie: PHPSESSID=abc"];
+    assert_eq!(
+        x_cache(&fetch(s.addr, &with("/docs/a", &signed)).await),
+        "MISS"
+    );
+    assert_eq!(
+        x_cache(&fetch(s.addr, &with("/docs/a", &signed)).await),
+        "HIT"
+    );
+    // An anonymous visitor shares the copy a rule for the signed in made, which is the rule's cost.
+    assert_eq!(x_cache(&fetch(s.addr, &get("/docs/a")).await), "HIT");
+    // A rule without the box does not open the path to them, with a copy there or not.
+    assert_eq!(x_cache(&fetch(s.addr, &get("/blog/a")).await), "MISS");
+    for _ in 0..2 {
+        assert_eq!(
+            x_cache(&fetch(s.addr, &with("/blog/a", &signed)).await),
+            "BYPASS"
+        );
+    }
+    assert_eq!(x_cache(&fetch(s.addr, &get("/blog/a")).await), "HIT");
+}
+
+#[tokio::test]
+async fn a_cookie_that_is_not_a_session_cookie_is_kept_for_only_when_the_answer_says_public_or_is_a_file()
+ {
+    let up = raw_upstream(|seen| {
+        let (ty, control) = match seen.line.split(' ').nth(1).unwrap_or("") {
+            p if p.starts_with("/public") => ("text/html", "public, max-age=60"),
+            p if p.starts_with("/shared") => ("text/html", "s-maxage=60"),
+            p if p.starts_with("/logo") => ("image/png", ""),
+            _ => ("text/html", ""),
+        };
+        let control = if control.is_empty() {
+            String::new()
+        } else {
+            format!("Cache-Control: {control}\r\n")
+        };
+        (
+            reply_to(
+                seen,
+                "200 OK",
+                &format!("Content-Type: {ty}\r\n{control}"),
+                b"page",
+            ),
+            false,
+        )
+    })
+    .await;
+    let mut cache = spec();
+    cache.rules = vec![
+        CacheRule {
+            prefix: "/".into(),
+            bypass: false,
+            ttl_s: 600,
+            signed_in: false,
+        },
+        CacheRule {
+            prefix: "/open/".into(),
+            bypass: false,
+            ttl_s: 600,
+            signed_in: true,
+        },
+    ];
+    let s = site(up, cache, |_| {}).await;
+    let jwt = ["Cookie: jwt=eyJ.a.b"];
+    // A rule that gives a lifetime is not enough: the page may be this visitor's own.
+    for _ in 0..2 {
+        assert_eq!(
+            x_cache(&fetch(s.addr, &with("/api/me", &jwt)).await),
+            "MISS"
+        );
+    }
+    assert_eq!(s.up.count(), 2);
+    assert_eq!(s.host.counters("shop").unwrap().skipped_private, 2);
+    assert!(answer_files(&s.dir.0).is_empty());
+    // The same cookie with an answer marked public, with s-maxage, or for a file is kept.
+    for path in ["/public/a", "/shared/a", "/logo.png"] {
+        assert_eq!(
+            x_cache(&fetch(s.addr, &with(path, &jwt)).await),
+            "MISS",
+            "{path}"
+        );
+        assert_eq!(
+            x_cache(&fetch(s.addr, &with(path, &jwt)).await),
+            "HIT",
+            "{path}"
+        );
+    }
+    // A visitor with no cookie gets the lifetime of the rule, as before.
+    assert_eq!(x_cache(&fetch(s.addr, &get("/api/me")).await), "MISS");
+    assert_eq!(x_cache(&fetch(s.addr, &get("/api/me")).await), "HIT");
+    // Only a rule that is for the signed in lets the cookie's answer be kept without a word of its own.
+    assert_eq!(
+        x_cache(&fetch(s.addr, &with("/open/me", &jwt)).await),
+        "MISS"
+    );
+    assert_eq!(
+        x_cache(&fetch(s.addr, &with("/open/me", &jwt)).await),
+        "HIT"
     );
 }
 
@@ -497,11 +670,12 @@ async fn a_rule_for_the_signed_in_keeps_a_page_for_them_and_nothing_else_is() {
         x_cache(&fetch(s.addr, &with("/docs/a", &signed)).await),
         "HIT"
     );
-    // The name the app gave counts as a session outside the rule's path too.
+    // The name the app gave counts as a session outside the rule's path too, which is the
+    // application's alone.
     for _ in 0..2 {
         assert_eq!(
             x_cache(&fetch(s.addr, &with("/other", &["Cookie: MyAuth=token"])).await),
-            "MISS"
+            "BYPASS"
         );
     }
     assert_eq!(s.up.count(), 3);
@@ -593,7 +767,8 @@ async fn an_untrusted_peers_front_end_headers_never_reach_the_application_with_t
             seen.headers
         );
     }
-    // The three the agent writes itself are its own, and a line of the client's does not stay.
+    // The three the agent writes itself are its own, and a line of the client's does not stay
+    // beside them: the scheme is what the key holds, `https` here as the peer said.
     fetch(
         s.addr,
         &with(
@@ -609,7 +784,7 @@ async fn an_untrusted_peers_front_end_headers_never_reach_the_application_with_t
     .await;
     let seen = s.up.last();
     assert_eq!(seen.all("x-forwarded-host"), ["app.test"]);
-    assert_eq!(seen.all("x-forwarded-proto"), ["http"]);
+    assert_eq!(seen.all("x-forwarded-proto"), ["https"]);
     assert_eq!(seen.all("x-forwarded-for"), ["127.0.0.1"]);
     assert_eq!(seen.all("x-real-ip"), ["127.0.0.1"]);
 }
@@ -647,9 +822,7 @@ async fn the_underscore_spellings_of_the_headers_the_agent_writes_never_stay_bes
         .await;
         let seen = s.up.last();
         assert_eq!(folded(&seen, "x-forwarded-host"), ["app.test"], "{trust}");
-        // The scheme is the peer's word only from a proxy the route trusts.
-        let scheme = if trust { "https" } else { "http" };
-        assert_eq!(folded(&seen, "x-forwarded-proto"), [scheme], "{trust}");
+        assert_eq!(folded(&seen, "x-forwarded-proto"), ["https"], "{trust}");
     }
 }
 
@@ -726,13 +899,172 @@ async fn php_gets_the_same_treatment_of_front_end_headers() {
     ] {
         assert!(!params.contains_key(gone), "{gone}: {params:?}");
     }
-    assert!(!params.contains_key("HTTP_X_FORWARDED_PROTO"), "{params:?}");
+    assert_eq!(
+        params.get("HTTP_X_FORWARDED_PROTO").map(String::as_str),
+        Some("https"),
+        "the scheme the peer said, as the key holds it: {params:?}"
+    );
     // The host is the agent's own, as on the HTTP path, not the client's.
     assert_eq!(
         params.get("HTTP_X_FORWARDED_HOST").map(String::as_str),
         Some("app.test")
     );
     assert!(params.contains_key("HTTP_X_REAL_IP"));
+}
+
+/// What a front proxy may write in `X-Forwarded-Proto`: the lines, what the application is told
+/// when the cache is off or the peer is trusted (the line itself, nothing when there is none), and
+/// what it is told when the cache is on and the peer is not trusted (`https` for a first value of
+/// `https`, nothing for every other form, which the key reads as no TLS).
+const PROTOS: [(&[&str], &str, &str); 6] = [
+    (&[], "", ""),
+    (&["X-Forwarded-Proto: https"], "https", "https"),
+    (&["X-Forwarded-Proto: HTTPS, http"], "HTTPS, http", "https"),
+    (&["X-Forwarded-Proto: http"], "http", ""),
+    (&["X-Forwarded-Proto: http, https"], "http, https", ""),
+    (&["X-Forwarded-Proto: gopher"], "gopher", ""),
+];
+
+const CACHE_AND_TRUST: [(bool, bool); 4] =
+    [(false, false), (false, true), (true, false), (true, true)];
+
+const TRUSTING: &[u8] = br#"{"trust_forwarded":true}"#;
+
+/// The scheme line the application is told for `PROTOS[i]` by an HTTP upstream, which always gets one.
+fn heard_over_http(i: usize, cache_on: bool, trusted: bool) -> &'static str {
+    let (_, line, untrusted) = PROTOS[i];
+    match if cache_on && !trusted {
+        untrusted
+    } else {
+        line
+    } {
+        "" => "http",
+        said => said,
+    }
+}
+
+#[tokio::test]
+async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_or_not_over_http() {
+    for (cache_on, trusted) in CACHE_AND_TRUST {
+        let up = counting("200 OK", PUBLIC).await;
+        let seen = up.clone();
+        let keep: Box<dyn std::any::Any>;
+        let addr;
+        if cache_on {
+            let s = site(up, spec(), |a| {
+                if trusted {
+                    a.proxy_config = TRUSTING.to_vec()
+                }
+            })
+            .await;
+            addr = s.addr;
+            keep = Box::new(s);
+        } else {
+            let mut a = app_for(&up, free_port(), None);
+            if trusted {
+                a.proxy_config = TRUSTING.to_vec();
+            }
+            let (h, listening) = Harness::serve(vec![a]);
+            addr = listening;
+            keep = Box::new(h);
+        }
+        for (i, (lines, _, _)) in PROTOS.iter().enumerate() {
+            fetch(addr, &with(&format!("/proto/{i}"), lines)).await;
+            assert_eq!(
+                seen.last().all("x-forwarded-proto"),
+                [heard_over_http(i, cache_on, trusted)],
+                "cache {cache_on}, trusted {trusted}, {lines:?}"
+            );
+        }
+        drop(keep);
+    }
+}
+
+#[tokio::test]
+async fn a_front_proxy_that_ends_tls_is_heard_with_the_cache_on_or_off_trusted_or_not_over_fastcgi()
+{
+    for (cache_on, trusted) in CACHE_AND_TRUST {
+        let (fcgi, fake) = fake_fcgi().await;
+        let dir = Dir::new("fcgi-proto");
+        let host = CacheHost::open(&dir.0, uid()).unwrap();
+        let mut a = fcgi_app(free_port(), format!("fcgi://{fcgi}"), "/srv/www", "");
+        if trusted {
+            a.proxy_config = TRUSTING.to_vec();
+        }
+        a.cache = cache_on.then(spec);
+        let (_h, addr) = serve_with(&host, a);
+        for (i, (lines, line, untrusted)) in PROTOS.iter().enumerate() {
+            fetch(addr, &with(&format!("/index.php?{i}"), lines)).await;
+            let params = fake.params.lock().unwrap().last().cloned().unwrap();
+            let want = if cache_on && !trusted {
+                untrusted
+            } else {
+                line
+            };
+            assert_eq!(
+                params.get("HTTP_X_FORWARDED_PROTO").map(String::as_str),
+                (!want.is_empty()).then_some(*want),
+                "cache {cache_on}, trusted {trusted}, {lines:?}: {params:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_untrusted_front_proxys_scheme_is_part_of_the_key_so_it_cannot_poison_the_other_one() {
+    let s = page_site().await;
+    let https = with("/k", &["X-Forwarded-Proto: https"]);
+    let strange = with("/k", &["X-Forwarded-Proto: gopher"]);
+    let first = fetch(s.addr, &https).await;
+    assert_eq!(
+        (x_cache(&first), first.text().as_str()),
+        ("MISS", "answer 1")
+    );
+    let again = fetch(s.addr, &https).await;
+    assert_eq!(
+        (x_cache(&again), again.text().as_str()),
+        ("HIT", "answer 1")
+    );
+    // The visitor with no line is the other scheme, and so is a value that is not `https`.
+    let plain = fetch(s.addr, &get("/k")).await;
+    assert_eq!(
+        (x_cache(&plain), plain.text().as_str()),
+        ("MISS", "answer 2")
+    );
+    let odd = fetch(s.addr, &strange).await;
+    assert_eq!((x_cache(&odd), odd.text().as_str()), ("HIT", "answer 2"));
+    assert_eq!(s.up.count(), 2);
+}
+
+#[tokio::test]
+async fn an_application_behind_a_front_proxy_that_ends_tls_meets_no_redirect_when_the_cache_is_turned_on()
+ {
+    // An application that sends a visitor to https when it is not told it is there.
+    let up = raw_upstream(|seen| {
+        let secure = seen.header("x-forwarded-proto") == Some("https");
+        let (status, headers, body): (&str, &str, &[u8]) = if secure {
+            ("200 OK", PUBLIC, b"the page")
+        } else {
+            (
+                "301 Moved Permanently",
+                "Location: https://app.test/x\r\nCache-Control: public, max-age=600\r\n",
+                b"",
+            )
+        };
+        (reply_to(seen, status, headers, body), false)
+    })
+    .await;
+    let s = site(up, spec(), |_| {}).await;
+    let behind = with("/x", &["X-Forwarded-Proto: https"]);
+    for want in ["MISS", "HIT"] {
+        let r = fetch(s.addr, &behind).await;
+        assert_eq!((r.status, x_cache(&r)), (200, want));
+        assert_eq!(r.text(), "the page");
+    }
+    // The redirect a visitor on plain http gets is kept under its own key and never reaches them.
+    let plain = fetch(s.addr, &get("/x")).await;
+    assert_eq!((plain.status, x_cache(&plain)), (301, "MISS"));
+    assert_eq!(fetch(s.addr, &behind).await.text(), "the page");
 }
 
 #[tokio::test]
@@ -1033,18 +1365,133 @@ async fn compression_runs_before_the_copy_is_made_and_each_encoding_has_its_own(
     assert_eq!(s.up.count(), 3);
 }
 
-#[tokio::test]
-async fn an_answer_the_application_encoded_itself_is_kept_only_for_the_encoding_that_asked() {
-    let up = raw_upstream(|seen| {
-        let enc = if seen.header("accept-encoding").is_some_and(|a| a.contains("zstd")) {
-            "zstd"
+/// An application that compresses by itself: gzip for a client that says it takes gzip, the page
+/// as it is for any other.
+async fn gzipping_upstream() -> TestUpstream {
+    raw_upstream(|seen| {
+        let takes_gzip = seen
+            .header("accept-encoding")
+            .is_some_and(|a| a.contains("gzip"));
+        let page = "a page that an application packs by itself. ".repeat(100);
+        let (extra, body) = if takes_gzip {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut gz, page.as_bytes()).unwrap();
+            ("Content-Encoding: gzip\r\n", gz.finish().unwrap())
         } else {
-            "gzip"
+            ("", page.into_bytes())
         };
+        let head =
+            format!("Content-Type: text/html\r\nCache-Control: public, max-age=600\r\n{extra}");
+        (reply_to(seen, "200 OK", &head, &body), false)
+    })
+    .await
+}
+
+fn unpacked(r: &ReplyParts) -> Vec<u8> {
+    let mut out = Vec::new();
+    match r.header("content-encoding") {
+        Some("gzip") => {
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&r.body[..]), &mut out)
+                .unwrap();
+        }
+        Some("br") => {
+            std::io::Read::read_to_end(&mut brotli::Decompressor::new(&r.body[..], 4096), &mut out)
+                .unwrap();
+        }
+        None => out = r.body.clone(),
+        Some(other) => panic!("encoding {other}"),
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_browser_gets_a_copy_when_the_application_compresses_by_itself() {
+    // A browser says `gzip, deflate, br, zstd` and is in the brotli bucket. The application is
+    // asked for the coding of the bucket, so a gzip answer is not made for a copy that holds br.
+    const BROWSER: &str = "Accept-Encoding: gzip, deflate, br, zstd";
+    let page = "a page that an application packs by itself. "
+        .repeat(100)
+        .into_bytes();
+    for compression in [None, Some(CompressionSpec { min_bytes: 100 })] {
+        let s = site(gzipping_upstream().await, spec(), |a| {
+            a.compression = compression
+        })
+        .await;
+        let first = fetch(s.addr, &with("/b", &[BROWSER])).await;
+        assert_eq!(x_cache(&first), "MISS");
+        assert_eq!(s.up.last().all("accept-encoding"), ["br"]);
+        let hit = fetch(s.addr, &with("/b", &[BROWSER])).await;
+        assert_eq!(x_cache(&hit), "HIT", "{compression:?}");
+        assert_eq!(unpacked(&hit), page);
+        assert_eq!(s.up.count(), 1);
+        // With compression on the copy holds what the agent made: brotli, as the browser asked.
+        assert_eq!(
+            hit.header("content-encoding"),
+            compression.map(|_| "br"),
+            "{compression:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_application_is_asked_in_the_one_coding_of_the_bucket_or_in_identity() {
+    let s = site(gzipping_upstream().await, spec(), |_| {}).await;
+    for (i, (visitor, asked)) in [
+        ("gzip", "gzip"),
+        ("gzip;q=0.5, br;q=0.1", "gzip"),
+        ("br", "br"),
+        ("zstd", "identity"),
+        ("identity", "identity"),
+        ("gzip;q=0", "identity"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = fetch(
+            s.addr,
+            &with(
+                &format!("/e/{i}"),
+                &[&format!("Accept-Encoding: {visitor}")],
+            ),
+        )
+        .await;
+        assert_eq!(x_cache(&r), "MISS", "{visitor}");
+        assert_eq!(s.up.last().all("accept-encoding"), [asked], "{visitor}");
+        assert_eq!(
+            x_cache(
+                &fetch(
+                    s.addr,
+                    &with(
+                        &format!("/e/{i}"),
+                        &[&format!("Accept-Encoding: {visitor}")]
+                    )
+                )
+                .await
+            ),
+            "HIT",
+            "{visitor}"
+        );
+    }
+    // A request that cannot fill is asked as the visitor wrote it.
+    one(
+        s.addr,
+        &with(
+            "/range",
+            &["Accept-Encoding: gzip, br, zstd", "Range: bytes=0-9"],
+        ),
+    )
+    .await;
+    assert_eq!(s.up.last().all("accept-encoding"), ["gzip, br, zstd"]);
+}
+
+#[tokio::test]
+async fn an_application_that_ignores_the_coding_it_is_asked_for_is_not_kept() {
+    let up = raw_upstream(|seen| {
         (
-            http(
+            reply_to(
+                seen,
                 "200 OK",
-                &format!("Content-Type: text/html\r\nCache-Control: public, max-age=600\r\nContent-Encoding: {enc}\r\nVary: Accept-Encoding\r\n"),
+                "Content-Type: text/html\r\nCache-Control: public, max-age=600\r\nContent-Encoding: zstd\r\n",
                 b"packed",
             ),
             false,
@@ -1052,17 +1499,14 @@ async fn an_answer_the_application_encoded_itself_is_kept_only_for_the_encoding_
     })
     .await;
     let s = site(up, spec(), |_| {}).await;
-    let gzip = ["Accept-Encoding: gzip"];
-    fetch(s.addr, &with("/e", &gzip)).await;
-    assert_eq!(x_cache(&fetch(s.addr, &with("/e", &gzip)).await), "HIT");
-    // A client that also takes zstd gets zstd from the application, and it is not kept: it would
-    // be sent to the client that asked for gzip only.
-    let both = ["Accept-Encoding: zstd, gzip"];
     for _ in 0..2 {
-        let r = fetch(s.addr, &with("/z", &both)).await;
-        assert_eq!(x_cache(&r), "MISS");
+        let r = fetch(s.addr, &with("/z", &["Accept-Encoding: gzip"])).await;
+        assert_eq!(
+            (x_cache(&r), r.header("content-encoding")),
+            ("MISS", Some("zstd"))
+        );
     }
-    assert_eq!(x_cache(&fetch(s.addr, &with("/z", &gzip)).await), "MISS");
+    assert!(answer_files(&s.dir.0).is_empty());
 }
 
 #[tokio::test]
@@ -1083,7 +1527,49 @@ async fn files_from_a_folder_are_not_from_the_cache() {
         );
     }
     assert_eq!(s.up.count(), 0);
+    // A visitor who is signed in gets the file from the folder too.
+    let signed_in = fetch(s.addr, &with("/a.txt", &["Cookie: PHPSESSID=abc"])).await;
+    assert_eq!(
+        (signed_in.text().as_str(), x_cache(&signed_in)),
+        ("from the folder", "BYPASS")
+    );
+    // No cache counter has a file of the folder: it is neither answered from the cache nor passed on.
+    assert_eq!(s.host.counters("shop").unwrap().requests, 0);
     assert_eq!(x_cache(&fetch(s.addr, &get("/b")).await), "MISS");
+    let c = s.host.counters("shop").unwrap();
+    assert_eq!((c.requests, c.misses, c.bypass), (1, 1, 0), "{c:?}");
+}
+
+#[tokio::test]
+async fn the_response_header_rules_reach_the_files_of_the_folder_also_from_memory() {
+    let dir = Dir::new("folder-rules");
+    std::fs::create_dir_all(dir.0.join("public")).unwrap();
+    std::fs::write(dir.0.join("public/a.txt"), b"from the folder").unwrap();
+    let root = dir.0.join("public").to_str().unwrap().to_owned();
+    let rule = |frame: &str| {
+        format!(r#"{{"resp_headers":{{"add":{{"X-Frame-Options":"{frame}"}}}}}}"#).into_bytes()
+    };
+    let s = site(counting("200 OK", PUBLIC).await, spec(), |a| {
+        a.static_files = Some(wafio_proxy::StaticSpec::check(&root, "", 0).unwrap());
+        a.proxy_config = rule("DENY");
+    })
+    .await;
+    // The first read fills the memory tier and the next answers come from it.
+    for _ in 0..3 {
+        let r = fetch(s.addr, &get("/a.txt")).await;
+        assert_eq!(
+            (r.text().as_str(), r.header("x-frame-options"), x_cache(&r)),
+            ("from the folder", Some("DENY"), "BYPASS")
+        );
+    }
+    // A change to the rules reaches what memory holds at once: the copy was made without them.
+    let mut a = app_for(&s.up, s.addr.port(), Some(spec()));
+    a.static_files = Some(wafio_proxy::StaticSpec::check(&root, "", 0).unwrap());
+    a.proxy_config = rule("SAMEORIGIN");
+    apply(&s.h, a);
+    let r = fetch(s.addr, &get("/a.txt")).await;
+    assert_eq!(r.header("x-frame-options"), Some("SAMEORIGIN"));
+    assert_eq!(s.up.count(), 0);
 }
 
 #[tokio::test]

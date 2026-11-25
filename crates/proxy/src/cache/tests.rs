@@ -347,35 +347,61 @@ fn rules_send_a_path_one_way_or_the_other_and_a_semicolon_under_a_rule_is_never_
 }
 
 #[test]
-fn a_request_may_fill_when_it_is_a_get_without_a_range_from_a_visitor_who_is_not_signed_in() {
-    let spec = with_rules(vec![keep("/docs/", 60, true), keep("/blog/", 60, false)]);
-    let s = site(Some(spec), "", &["MyAuth"]);
+fn a_request_may_fill_when_it_is_a_get_without_a_range() {
+    let s = site(Some(CacheSpec::default()), "", &[]);
     let fills = |req: &InboundRequest| ask(planned(&s, req)).fillable;
     assert!(fills(&get("/", "")));
     assert!(fills(&get("/", "Cookie: theme=dark\r\n")));
     assert!(!fills(&request("HEAD", "/", "")));
     assert!(!fills(&get("/", "Range: bytes=0-9\r\n")));
-    // Signed in: by `Authorization`, by a name the agent knows, by a name the app gave.
-    for head in [
-        "Authorization: Bearer t\r\n",
-        "Cookie: PHPSESSID=1\r\n",
-        "Cookie: myauth=1\r\n",
-    ] {
-        assert!(!fills(&get("/", head)), "{head}");
-        assert!(
-            !fills(&get("/blog/a", head)),
-            "a rule without the signed-in box: {head}"
-        );
-        assert!(fills(&get("/docs/a", head)), "{head}");
+}
+
+#[test]
+fn a_visitor_who_is_signed_in_is_never_looked_up_or_filled_unless_a_rule_opens_the_path() {
+    let spec = with_rules(vec![keep("/docs/", 60, true), keep("/blog/", 60, false)]);
+    let s = site(Some(spec), "", &["MyAuth"]);
+    // Signed in: by `Authorization`, by a name the agent knows, by a name the app gave, by the
+    // userinfo of an absolute-form target.
+    let signed_in = |path: &str| -> Vec<InboundRequest> {
+        let mut all: Vec<InboundRequest> = [
+            "Authorization: Bearer t\r\n",
+            "Cookie: PHPSESSID=1\r\n",
+            "Cookie: myauth=1\r\n",
+            "Cookie: theme=dark; myauth=1\r\n",
+        ]
+        .iter()
+        .map(|head| get(path, head))
+        .collect();
+        all.push(InboundRequest::from_head(
+            format!("GET http://u:p@shop.test{path} HTTP/1.1\r\nHost: shop.test\r\n\r\n")
+                .as_bytes(),
+        ));
+        all
+    };
+    for path in ["/", "/blog/a"] {
+        for req in signed_in(path) {
+            assert!(
+                is_bypass(&planned(&s, &req)),
+                "{path}, a rule without the signed-in box or none: {:?}",
+                req.lines
+            );
+        }
     }
-    // A visitor who is signed in may still be answered from a copy.
+    for req in signed_in("/docs/a") {
+        let a = ask(planned(&s, &req));
+        assert!(a.fillable && a.rule_signed_in, "{:?}", req.lines);
+    }
+    // Not signed in: a cookie that no list names, the same path.
     assert!(matches!(
-        planned(&s, &get("/", "Cookie: PHPSESSID=1\r\n")),
+        planned(&s, &get("/", "Cookie: theme=dark\r\n")),
         Plan::Lookup(_)
     ));
-    let userinfo =
-        InboundRequest::from_head(b"GET http://u:p@shop.test/ HTTP/1.1\r\nHost: shop.test\r\n\r\n");
-    assert!(!fills(&userinfo));
+    // A rule for the signed in does not make a `Range` fill.
+    let ranged = ask(planned(
+        &s,
+        &get("/docs/a", "Cookie: PHPSESSID=1\r\nRange: bytes=0-1\r\n"),
+    ));
+    assert!(!ranged.fillable);
 }
 
 #[test]
@@ -431,7 +457,7 @@ fn headers_of_an_untrusted_peer_are_not_in_the_key_and_a_trusted_proxys_are() {
     let plain = get("/x", "");
     let odd = get(
         "/x",
-        "X-Forwarded-Port: 8443\r\nX-Original-URL: /admin\r\nX-Host: evil.test\r\nForwarded: host=evil\r\nX-Forwarded-Proto: https\r\n",
+        "X-Forwarded-Port: 8443\r\nX-Original-URL: /admin\r\nX-Host: evil.test\r\nForwarded: host=evil\r\n",
     );
     // No proxy is trusted: nothing a peer says there reaches the key (and none of it the upstream).
     assert_eq!(
@@ -451,16 +477,31 @@ fn headers_of_an_untrusted_peer_are_not_in_the_key_and_a_trusted_proxys_are() {
         key(&trusting, &plain, &client()),
         key(&trusting, &odd, &client())
     );
-    // The scheme is the proxy's word only from a proxy.
+    // The scheme is the word of any peer, trusted or not: a front proxy that ends TLS and is not
+    // trusted still tells the application, and a value other than `https` is the http key.
     let https = get("/x", "X-Forwarded-Proto: https\r\n");
-    assert_ne!(
-        key(&trusting, &plain, &proxy()),
-        key(&trusting, &https, &proxy())
-    );
-    assert_eq!(
-        key(&trusting, &plain, &client()),
-        key(&trusting, &https, &client())
-    );
+    for (site, peer) in [
+        (&trusting, proxy()),
+        (&trusting, client()),
+        (&untrusting, proxy()),
+        (&untrusting, client()),
+    ] {
+        assert_ne!(
+            key(site, &plain, &peer),
+            key(site, &https, &peer),
+            "{peer:?}"
+        );
+        for other in [
+            "X-Forwarded-Proto: http\r\n",
+            "X-Forwarded-Proto: wss, https\r\n",
+        ] {
+            assert_eq!(
+                key(site, &plain, &peer),
+                key(site, &get("/x", other), &peer),
+                "{other}"
+            );
+        }
+    }
     // Two values differ, and more than 256 bytes of them are not cached.
     let one = get("/x", "X-Forwarded-Port: 1\r\n");
     let two = get("/x", "X-Forwarded-Port: 2\r\n");
@@ -807,10 +848,24 @@ fn a_request_with_a_cookie_gets_only_an_answer_that_is_the_same_for_everyone() {
         &answer(200, &[("Content-Type", "image/png"), max_age], b"x"),
     );
     assert!(image.is_ok());
-    // A rule behind the path does too.
-    let s = site(Some(with_rules(vec![keep("/p", 60, false)])), "", &[]);
-    let a = ask(planned(&s, &cookie));
-    assert!(decide(&settings(), &a, &cookie, &answer(200, &[], b"x"), NOW).is_ok());
+    // A rule behind the path does not, as the application may put a login behind a cookie the agent
+    // does not know: only a rule that is for signed-in visitors does.
+    let plain = site(Some(with_rules(vec![keep("/p", 60, false)])), "", &[]);
+    let a = ask(planned(&plain, &cookie));
+    let bare = answer(200, &[], b"x");
+    assert_eq!(
+        decide(&settings(), &a, &cookie, &bare, NOW).err(),
+        Some(NotKept::Cookie)
+    );
+    // The same rule keeps a public answer, which the visitor's cookie does not change.
+    let public = answer(200, &[PUBLIC], b"x");
+    assert!(decide(&settings(), &a, &cookie, &public, NOW).is_ok());
+    let open = site(Some(with_rules(vec![keep("/p", 60, true)])), "", &[]);
+    let a = ask(planned(&open, &cookie));
+    assert!(decide(&settings(), &a, &cookie, &bare, NOW).is_ok());
+    // With no cookie the rule alone gives the lifetime, as before.
+    let a = ask(planned(&plain, &get("/p", "")));
+    assert!(decide(&settings(), &a, &get("/p", ""), &bare, NOW).is_ok());
 }
 
 #[test]
@@ -1036,25 +1091,28 @@ fn what_is_not_kept_is_counted_where_the_dashboard_has_a_line_and_marks_the_key_
 }
 
 #[test]
-fn a_request_that_is_not_filled_is_asked_for_what_it_needs_and_a_signed_in_get_says_so() {
+fn a_request_that_is_not_filled_is_looked_up_and_carries_the_purge_count_it_came_with() {
     let s = site(Some(CacheSpec::default()), "", &["sid"]);
     let a = ask(planned(&s, &get("/p", "")));
-    assert!(a.fillable && !a.signed_in_get);
-    let signed_in = ask(planned(&s, &get("/p", "Cookie: sid=1\r\n")));
-    assert!(!signed_in.fillable && signed_in.signed_in_get);
-    let ranged = ask(planned(&s, &get("/p", "Range: bytes=0-1\r\n")));
-    assert!(!ranged.fillable && !ranged.signed_in_get);
-    let head = ask(planned(&s, &request("HEAD", "/p", "")));
-    assert!(!head.fillable && !head.signed_in_get);
-    // A rule for the signed in lets them fill.
+    assert!(a.fillable);
+    assert!(!ask(planned(&s, &get("/p", "Range: bytes=0-1\r\n"))).fillable);
+    assert!(!ask(planned(&s, &request("HEAD", "/p", ""))).fillable);
+    // A rule for the signed in lets them fill, and only a rule for them is read as one.
     let open = site(
-        Some(with_rules(vec![keep("/shared", 60, true)])),
+        Some(with_rules(vec![
+            keep("/shared", 60, true),
+            keep("/own", 60, false),
+        ])),
         "",
         &["sid"],
     );
     let shared = ask(planned(&open, &get("/shared", "Cookie: sid=1\r\n")));
-    assert!(shared.fillable && !shared.signed_in_get);
-    // It carries the purge count the app had when the request came.
+    assert!(shared.fillable && shared.rule_signed_in);
+    assert!(is_bypass(&planned(
+        &open,
+        &get("/own", "Cookie: sid=1\r\n")
+    )));
+    assert!(!ask(planned(&open, &get("/own", ""))).rule_signed_in);
     let (_, app) = s.route.cache_active().unwrap();
     assert_eq!(a.purge_gen, app.purge_count());
 }

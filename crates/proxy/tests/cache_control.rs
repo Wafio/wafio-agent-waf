@@ -135,7 +135,7 @@ async fn a_page_that_sets_a_cookie_makes_no_one_wait_and_the_next_burst_skips_th
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_visitor_who_cannot_have_a_copy_made_waits_for_the_fetch_and_gets_the_public_copy() {
+async fn a_request_that_cannot_make_a_copy_waits_for_the_fetch_and_a_signed_in_visitor_does_not() {
     let (up, _) = slow_upstream(Duration::from_millis(400), |seen| {
         reply_to(seen, "200 OK", PUBLIC, b"public page")
     })
@@ -144,13 +144,24 @@ async fn a_visitor_who_cannot_have_a_copy_made_waits_for_the_fetch_and_gets_the_
     let addr = s.addr;
     let leader = tokio::spawn(async move { one(addr, &get("/page")).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let signed_in = one(addr, &with("/page", &["Cookie: sessionid=abc"])).await;
+    // A visitor who is signed in is the application's: it is asked at once, and nothing of the
+    // fetch in progress reaches them.
+    let signed_in =
+        tokio::spawn(async move { one(addr, &with("/page", &["Cookie: sessionid=abc"])).await });
+    // A `HEAD` cannot make a copy but may be answered from one, so it waits for the fetch.
+    let head = head_of(addr, "/page", &[]).await;
+    assert_eq!((head.status, x_cache(&head)), (200, "HIT"));
+    let signed_in = signed_in.await.unwrap();
     assert_eq!(
         (x_cache(&signed_in), signed_in.text().as_str()),
-        ("HIT", "public page")
+        ("BYPASS", "public page")
     );
     assert_eq!(x_cache(&leader.await.unwrap()), "MISS");
-    assert_eq!(s.up.count(), 1);
+    assert_eq!(
+        s.up.count(),
+        2,
+        "the fetch of the leader and the signed-in visitor's"
+    );
 }
 
 /// An application that answers `304` to a visitor's `If-None-Match` and `412` to an `If-Match`, as
@@ -513,7 +524,7 @@ async fn only_a_request_that_may_fill_asks_the_application_about_a_copy() {
     tokio::time::sleep(SECOND).await;
     // A signed-in visitor's request goes on as it is, with no question of the cache's.
     let r = one(s.addr, &with("/a", &["Cookie: sessionid=abc"])).await;
-    assert_eq!((r.status, x_cache(&r)), (200, "MISS"));
+    assert_eq!((r.status, x_cache(&r)), (200, "BYPASS"));
     assert!(s.up.last().header("if-none-match").is_none());
     assert_eq!(r.text(), "page 2", "a full answer, not a copy");
 }
@@ -1060,7 +1071,7 @@ async fn the_counters_say_what_the_cache_did_and_why_answers_were_not_kept() {
     fetch(s.addr, &get("/plain")).await;
     fetch(s.addr, &get("/private")).await;
     fetch(s.addr, &get("/large")).await;
-    // A signed-in visitor's request is counted as private, and a POST is not checked.
+    // A signed-in visitor's request is not looked up, and a POST is not checked: both are bypasses.
     fetch(s.addr, &with("/other", &["Cookie: sessionid=abc"])).await;
     let held = s.host.counters("shop").unwrap();
     assert_eq!((held.objects, held.disk_bytes > 0), (1, true));
@@ -1074,12 +1085,15 @@ async fn the_counters_say_what_the_cache_did_and_why_answers_were_not_kept() {
             c.bypass,
             c.stale
         ),
-        (3, true, 5, 1, 0),
+        (3, true, 4, 2, 0),
         "{c:?}"
     );
     assert_eq!(c.requests, 9);
     assert_eq!((c.skipped_no_lifetime, c.skipped_too_large), (1, 1));
-    assert_eq!(c.skipped_private, 2, "private and signed in");
+    assert_eq!(
+        c.skipped_private, 1,
+        "the private answer, not the signed-in visitor"
+    );
     assert_eq!(c.stored, 1);
     assert_eq!(
         (c.objects, c.disk_bytes),

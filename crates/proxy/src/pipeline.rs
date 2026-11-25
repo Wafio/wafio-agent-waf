@@ -710,21 +710,25 @@ pub(crate) async fn handle(
 
     // The app's folder of files answers `GET` and `HEAD` for a file it holds, after the verdict
     // like everything that reaches the application. A request that asks for an upgrade is the
-    // application's. What the folder sends is not from the cache.
+    // application's. What the folder sends is not from the cache, and no cache counter has it.
+    // The response header rules of the app apply as they do to every answer, the stored copies of
+    // the folder's files included: they are made without them.
     if let Some(folder) = &route.static_files
         && !req.has_upgrade()
         && let Some(mut done) = crate::static_files::serve(shared, route, folder, &req).await
     {
         let status = match &mut done {
             Done::Respond(r) => {
+                crate::upstream::apply_response_header_rules(route, r);
                 if cache_plan.label().is_some() {
-                    cache::tag(route, r, Label::Bypass);
+                    cache::tag_static(r);
                 }
                 r.status
             }
             Done::File(f) => {
+                crate::upstream::apply_response_header_rules(route, &mut f.head);
                 if cache_plan.label().is_some() {
-                    cache::tag(route, &mut f.head, Label::Bypass);
+                    cache::tag_static(&mut f.head);
                 }
                 f.head.status
             }
@@ -818,7 +822,6 @@ pub(crate) async fn handle(
                         resp = held;
                     }
                 }
-                Plan::Lookup(ask) => cache::note_not_kept(route, ask),
                 _ => {}
             }
             cache::drop_copies(shared, route, &req, &peer, resp.status).await;
@@ -881,9 +884,10 @@ fn from_copy(route: &Route, mut resp: OutboundResponse, label: Label) -> Outboun
 /// Sends the request to the application of the route and returns what it answered. `validator`
 /// makes it the question of the response cache (the stored copy's validators in place of the
 /// visitor's conditions). `keep_copy` says the answer may be kept: it is asked with no condition
-/// of the visitor's, whose `304` or `412` would be no answer to keep, and it is left without the
-/// response header rules, which run after the copy is made. The error is what the log says: how
-/// the request failed, and why.
+/// of the visitor's, whose `304` or `412` would be no answer to keep, and with the one coding the
+/// copy is made in (`Accept-Encoding`), so that an application that compresses by itself answers
+/// in it. It is left without the response header rules, which run after the copy is made. The
+/// error is what the log says: how the request failed, and why.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_upstream(
     shared: &Shared,
@@ -911,7 +915,9 @@ pub(crate) async fn send_upstream(
             // Over TLS the scheme is ours to state too: PHP derives `HTTPS` and the port from it.
             let over_tls = req.tls.is_some();
             // With the cache on, what an untrusted peer says in the headers that are not part of
-            // the key is not sent on, and the scheme is the connection's: PHP would answer by it.
+            // the key is not sent on. Its `X-Forwarded-Proto` is, as the key reads it: `https`
+            // when it says so, nothing otherwise, so a front proxy that ends TLS still tells PHP,
+            // and a value of any other form cannot make a third kind of answer.
             let drop_unkeyed = cache::drops_unkeyed_inputs(route, peer);
             // The host is the agent's word too, as on the HTTP path, from every peer: a trusted
             // proxy that passes the client's `X-Forwarded-Host` on would make the application
@@ -919,7 +925,7 @@ pub(crate) async fn send_upstream(
             let cache_on = route.cache_active().is_some();
             hm.retain(|k, _| {
                 if drop_unkeyed
-                    && (crate::cache::unkeyed_input(k) || crate::cache::forwarded_host_or_proto(k))
+                    && (crate::cache::unkeyed_input(k) || crate::cache::forwarded_proto(k))
                 {
                     return false;
                 }
@@ -932,7 +938,7 @@ pub(crate) async fn send_upstream(
                     _ => true,
                 }
             });
-            if over_tls {
+            if over_tls || (drop_unkeyed && cache::forwarded_https(req)) {
                 hm.insert(b"X-Forwarded-Proto".to_vec(), vec![b"https".to_vec()]);
             }
             if cache_on {
@@ -947,6 +953,13 @@ pub(crate) async fn send_upstream(
                     &route.proxy_config,
                 )],
             );
+            if keep_copy {
+                hm.retain(|k, _| cgi_header_param(k) != b"HTTP_ACCEPT_ENCODING");
+                hm.insert(
+                    b"Accept-Encoding".to_vec(),
+                    vec![cache::upstream_encoding(req).to_vec()],
+                );
+            }
             if let Some(v) = validator {
                 v.apply_map(&mut hm);
             }
@@ -967,6 +980,10 @@ pub(crate) async fn send_upstream(
                 ct_override,
             )
             .map_err(|e| ("", e.to_string()))?;
+            if keep_copy {
+                // The value is one of three fixed tokens, which http never refuses.
+                let _ = head.insert_header("Accept-Encoding", cache::upstream_encoding(req));
+            }
             if let Some(v) = validator {
                 v.apply_http(&mut head);
             }
