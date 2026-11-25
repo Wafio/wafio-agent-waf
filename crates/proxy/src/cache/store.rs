@@ -252,30 +252,28 @@ impl AppCache {
 
     /// Reads and checks the file of an entry. A file that is not what the index says (a size, a
     /// check sum or a key that differs, a link in its place) is removed, from the index and from
-    /// the disk, and is reported as `Corrupt`; one that is gone is dropped from the index.
+    /// the disk, and is reported as `Corrupt`; one that is gone is dropped from the index. A store
+    /// that put a newer file in place since `found` was taken is not damage: the entry is left, and
+    /// the read is `Replaced`.
     pub fn read(&self, found: &Found) -> Result<Loaded, ReadError> {
         let path = format::path_of(&self.dir, &found.id);
         let read = format::read(&path, found.size, &found.key);
-        match &read {
-            Err(ReadError::Corrupt) => {
+        match read {
+            Err(ReadError::Corrupt) if self.forget(&found.id, found.size, found.times) => {
                 self.counts.add(Count::Corrupt, 1);
                 crate::metrics::count_cache_corrupt();
-                self.index().remove(&found.id);
-                if self.host.holder.load(Ordering::Acquire) {
-                    let _ = std::fs::remove_file(&path);
-                }
+                read
             }
-            Err(ReadError::Missing) => {
-                self.index().remove(&found.id);
-            }
-            _ => {}
+            Err(ReadError::Missing) if self.forget(&found.id, found.size, found.times) => read,
+            Err(ReadError::Corrupt | ReadError::Missing) => Err(ReadError::Replaced),
+            _ => read,
         }
-        read
     }
 
     /// Puts an answer on disk and in the index; what the limits push out is deleted. A full file
     /// system is a skip, never an error: free space under 5 % stops stores (`DiskFull`), and so
-    /// does a write that fails for want of room.
+    /// does a write that fails for want of room. The file takes its name while the index is held,
+    /// so a reader that opens the new file finds the new entry when it asks.
     pub fn store(&self, s: Store) -> Result<(), Skip> {
         if !self.can_store() {
             return Err(Skip::NotWriter);
@@ -290,7 +288,7 @@ impl AppCache {
         let written = if self.host.fail_writes.load(Ordering::Relaxed) {
             Err(io::Error::from_raw_os_error(nix::libc::ENOSPC))
         } else {
-            format::write(
+            format::write_temp(
                 &self.dir,
                 &s.id,
                 s.primary_len,
@@ -300,22 +298,25 @@ impl AppCache {
                 s.times,
             )
         };
-        let size = match written {
-            Ok(size) => size,
-            Err(e) if no_space(&e) => {
+        let skip = |e: io::Error| {
+            if no_space(&e) {
                 self.counts.add(Count::SkippedDiskFull, 1);
-                return Err(Skip::DiskFull);
+                Skip::DiskFull
+            } else {
+                Skip::Disk(e)
             }
-            Err(e) => return Err(Skip::Disk(e)),
         };
+        let written = written.map_err(skip)?;
+        let size = written.size();
         let mut index = self.index();
         // A purge raises the count before it takes the index, so one that comes after this check
         // finds the entry and drops it.
         if s.purge_gen != self.purge_count() {
             drop(index);
-            format::remove(&self.dir, &s.id);
+            written.discard();
             return Err(Skip::Purged);
         }
+        written.place().map_err(skip)?;
         let gone = index.insert(
             s.id,
             s.primary,
@@ -342,10 +343,18 @@ impl AppCache {
         self.delete_files(&gone);
     }
 
-    /// Forgets an entry and deletes its file: its copy is no longer to be kept.
-    pub fn drop_entry(&self, id: &FileId) {
-        self.index().remove(id);
+    /// Forgets an entry and deletes its file: its copy is no longer to be kept. Only the entry
+    /// with this `size` and these `times`, the one that was read: a store may have put a newer one
+    /// in its place since, which stays. The file goes while the index is held, so a store that
+    /// puts a new file under the name comes after. Returns whether the entry went.
+    pub fn forget(&self, id: &FileId, size: u64, times: Times) -> bool {
+        let mut index = self.index();
+        if !index.holds(id, size, times) {
+            return false;
+        }
+        index.remove(id);
         self.delete_files(std::slice::from_ref(id));
+        true
     }
 
     /// Removes the files of entries that are no longer in the index, when this process may delete.
@@ -1618,11 +1627,108 @@ mod tests {
         assert!(app.read(&found).is_err());
         assert_eq!(host.counters("shop").unwrap().corrupt, 1);
         assert!(crate::metrics::CACHE_CORRUPT_FILES.load(Ordering::Relaxed) > before);
-        // An entry that is dropped by hand takes its file.
+        // An entry that is forgotten takes its file, but only the entry that was read: one a
+        // store put in its place since stays.
         app.store(answer("b", b"x", FRESH)).unwrap();
         let b = answer("b", b"", FRESH).id;
-        app.drop_entry(&b);
+        let (read, _) = app
+            .index()
+            .find(&primary_id(b"b"), b"b", |_| Vec::new(), 10)
+            .unwrap();
+        let newer = Times {
+            stored_at: 2,
+            ..FRESH
+        };
+        app.store(answer("b", b"y", newer)).unwrap();
+        assert!(!app.forget(&b, read.size, read.times));
+        assert!(has(&app, "b") && format::path_of(&dir.0.join("shop"), &b).exists());
+        assert!(app.forget(&b, read.size, newer));
         assert!(!has(&app, "b") && !format::path_of(&dir.0.join("shop"), &b).exists());
+    }
+
+    #[test]
+    fn a_reader_of_an_older_entry_than_the_file_finds_no_damage_and_the_new_entry_stays() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        app.store(answer("one", b"short", FRESH)).unwrap();
+        let (found, _) = app
+            .index()
+            .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
+            .unwrap();
+        // A refresh stores a longer answer under the same name before this reader opens the file.
+        let newer = Times {
+            stored_at: 2,
+            ..FRESH
+        };
+        app.store(answer("one", b"a much longer answer than before", newer))
+            .unwrap();
+        assert_eq!(app.read(&found).err(), Some(ReadError::Replaced));
+        let corrupt = host.counters("shop").unwrap().corrupt;
+        assert_eq!(corrupt, 0, "nothing was damaged");
+        let path = format::path_of(&dir.0.join("shop"), &found.id);
+        assert!(path.exists(), "the new file is not deleted");
+        let (now, _) = app
+            .index()
+            .find(&primary_id(b"one"), b"one", |_| Vec::new(), 10)
+            .expect("the new entry stays");
+        assert_eq!(
+            app.read(&now).unwrap().body,
+            b"a much longer answer than before"
+        );
+        // Replaced again: the reader that holds the second entry is told the same.
+        let third = Times {
+            stored_at: 3,
+            ..FRESH
+        };
+        app.store(answer("one", b"third", third)).unwrap();
+        assert_eq!(app.read(&now).err(), Some(ReadError::Replaced));
+        assert!(has(&app, "one"));
+        assert_eq!(host.counters("shop").unwrap().corrupt, 0);
+    }
+
+    #[test]
+    fn readers_of_a_key_that_is_stored_again_and_again_never_meet_damage() {
+        let dir = Dir::new();
+        let host = writable(&dir, &[limits("shop", 1 << 20)]);
+        let app = host.app("shop").unwrap();
+        app.store(answer("hot", &[1u8; 100], FRESH)).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (app, done) = (app.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !done.load(Ordering::Acquire) {
+                        let Some((found, _)) =
+                            app.index()
+                                .find(&primary_id(b"hot"), b"hot", |_| Vec::new(), 10)
+                        else {
+                            panic!("the entry is never out of the index");
+                        };
+                        match app.read(&found) {
+                            Ok(_) => reads += 1,
+                            Err(ReadError::Replaced) => {}
+                            Err(e) => panic!("a replaced file was taken for {e:?}"),
+                        }
+                    }
+                    reads
+                })
+            })
+            .collect();
+        // Every store changes the length of the file under the same name.
+        for i in 0..1500u64 {
+            let times = Times {
+                stored_at: i + 2,
+                ..FRESH
+            };
+            let body = vec![0u8; 50 + (i as usize % 7) * 90];
+            app.store(answer("hot", &body, times)).unwrap();
+        }
+        done.store(true, Ordering::Release);
+        let reads: u32 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(reads > 0);
+        assert_eq!(host.counters("shop").unwrap().corrupt, 0);
     }
 
     #[test]

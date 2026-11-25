@@ -5,10 +5,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pingora::connectors::TransportConnector;
+use pingora::connectors::http::Connector;
 use wafio_domain::ip_address::{IpAddress, parse_ip_address};
 
 use super::*;
 use crate::config::{AppSpec, build_route};
+use crate::edge_stats::EdgeStats;
+use crate::static_files::DiskGate;
 
 struct Dir(PathBuf);
 
@@ -1002,6 +1006,13 @@ fn what_is_not_kept_is_counted_where_the_dashboard_has_a_line_and_marks_the_key_
         "a server error may pass"
     );
     assert_eq!(mark_seconds(NotKept::Status, &r(503, &[])), None);
+    for status in [304, 412] {
+        assert_eq!(
+            mark_seconds(NotKept::Status, &r(status, &[])),
+            None,
+            "{status} answers a condition and says nothing of the page"
+        );
+    }
     assert_eq!(
         mark_seconds(NotKept::Cookie, &plain),
         None,
@@ -1046,4 +1057,93 @@ fn a_request_that_is_not_filled_is_asked_for_what_it_needs_and_a_signed_in_get_s
     // It carries the purge count the app had when the request came.
     let (_, app) = s.route.cache_active().unwrap();
     assert_eq!(a.purge_gen, app.purge_count());
+}
+
+#[test]
+fn a_refresh_in_the_background_ends_at_the_upstream_timeout_or_after_a_minute_when_there_is_none() {
+    let bounded = site(
+        Some(CacheSpec::default()),
+        r#"{"timeouts":{"upstream_ms":4000}}"#,
+        &[],
+    );
+    assert_eq!(refresh::limit(&bounded.route), Duration::from_secs(4));
+    let unlimited = site(
+        Some(CacheSpec::default()),
+        r#"{"timeouts":{"upstream_ms":-1}}"#,
+        &[],
+    );
+    assert_eq!(refresh::limit(&unlimited.route), Duration::from_secs(60));
+}
+
+#[tokio::test]
+async fn a_request_that_leads_keeps_the_copy_enter_read_and_reads_nothing_again() {
+    let Site {
+        route,
+        _host: host,
+        _dir: dir,
+    } = site(Some(CacheSpec::default()), "", &[]);
+    host.commit(&[CacheLimits {
+        app_id: "t".into(),
+        disk_bytes: 1 << 20,
+        memory_bytes: 0,
+        stale_if_error_s: 0,
+    }]);
+    assert!(host.wait_writable(Duration::from_secs(5)));
+    let route = Arc::new(route);
+    let req = get("/p", "");
+    let ask = ask(plan(&route, &req, "allow", false, &client()));
+    let (settings, app) = route.cache_active().unwrap();
+    // A copy that ended its life a minute ago and has a tag to ask about.
+    let past = answer(
+        200,
+        &[("Cache-Control", "max-age=30"), ("ETag", "\"v1\"")],
+        b"body",
+    );
+    let p = decide(settings, &ask, &req, &past, store::now() - 90).unwrap();
+    let path = format::path_of(&dir.0.join("t"), &p.id);
+    app.store(Store {
+        purge_gen: ask.purge_gen,
+        id: p.id,
+        primary: p.primary,
+        key: p.key,
+        primary_len: p.primary_len,
+        names: p.names,
+        head: p.head,
+        body: past.body.clone(),
+        times: p.times,
+    })
+    .unwrap();
+    let shared = Arc::new(Shared {
+        decisions: Arc::new(|_| {}),
+        ip_rep: None,
+        good_bots: None,
+        captcha: None,
+        connector: Connector::new(None),
+        transport: TransportConnector::new(None),
+        book: Arc::default(),
+        edge: EdgeStats::default(),
+        disk: DiskGate::new(4, Duration::from_secs(5)),
+        cache: None,
+    });
+    let peer = client();
+    let cx = Ctx {
+        shared: &shared,
+        route: &route,
+        req: &req,
+        peer: &peer,
+        remote: "203.0.113.9",
+    };
+    let Entered::Go(mut pending) = enter(&cx, &ask).await else {
+        panic!("a copy past its life is not an answer");
+    };
+    assert!(pending.validator().is_some());
+    // The file is damaged after `enter` read it: a second read would find it and count it.
+    let mut bytes = std::fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(take_turn(&cx, &ask, &mut pending).await.is_none());
+    assert!(pending.guard.is_some(), "it leads");
+    assert!(pending.validator().is_some(), "and asks about what it read");
+    assert_eq!(host.counters("t").unwrap().corrupt, 0, "nothing was read");
+    assert_eq!(app.usage().0, 1);
 }

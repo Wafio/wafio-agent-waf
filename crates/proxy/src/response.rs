@@ -178,9 +178,12 @@ impl OutboundResponse {
     /// `Trailer`, `Upgrade`), the length it sent and what is made again for each answer: `Date`,
     /// `Age`, `X-Cache`. `None` when the answer carries a cookie, which is never stored.
     pub(crate) fn stored_lines(&self) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-        if !self.cookies.is_empty() {
-            return None;
-        }
+        self.cookies.is_empty().then(|| self.plain_lines())
+    }
+
+    /// [`OutboundResponse::stored_lines`] without the check for a cookie, for an answer that is
+    /// made from a copy and is not stored.
+    pub(crate) fn plain_lines(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let named: Vec<Vec<u8>> = self
             .values(b"Connection")
             .flat_map(|v| v.split(|&c| c == b','))
@@ -213,7 +216,14 @@ impl OutboundResponse {
             lines.push((b"Content-Encoding".to_vec(), ce.clone()));
         }
         lines.extend(self.header_lines.iter().filter(|(n, _)| !own(n)).cloned());
-        Some(lines)
+        lines
+    }
+
+    /// The `Set-Cookie` lines of the answer.
+    pub(crate) fn cookie_lines(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
+        self.cookies
+            .iter()
+            .map(|value| (b"Set-Cookie".to_vec(), value.clone()))
     }
 
     /// A challenge-handler page.

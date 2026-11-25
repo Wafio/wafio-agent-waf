@@ -206,6 +206,9 @@ pub(crate) enum ReadError {
     /// It is not a file the agent wrote whole: a link, a size or a check sum that differs, a key
     /// that is not the one asked for. The caller deletes it.
     Corrupt,
+    /// A store put a newer file under the name after the index named the one to read: there is
+    /// nothing wrong with either, and the caller leaves the entry as it is.
+    Replaced,
     /// Any other error of the disk.
     Io,
 }
@@ -323,9 +326,37 @@ fn make_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Writes the answer under its name. The file is created whole in `tmp/` and renamed; every
-/// failure removes what was made. Returns the size of the file.
-pub(crate) fn write(
+/// An answer written whole in `tmp/` that is not under its name yet.
+pub(crate) struct Written {
+    temp: PathBuf,
+    to: PathBuf,
+    size: u64,
+}
+
+impl Written {
+    /// The size the file has under its name.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Puts the file under its name, over the file of that name if there is one, in one step. A
+    /// failure removes what was written.
+    pub fn place(self) -> io::Result<()> {
+        std::fs::rename(&self.temp, &self.to).inspect_err(|_| {
+            let _ = std::fs::remove_file(&self.temp);
+        })
+    }
+
+    /// Throws the file away.
+    pub fn discard(self) {
+        let _ = std::fs::remove_file(&self.temp);
+    }
+}
+
+/// Writes the answer whole into `tmp/`. [`Written::place`] gives it its name, so that the caller
+/// can do that while it holds the index: a reader that opens the new file then finds the new
+/// entry. Every failure removes what was made.
+pub(crate) fn write_temp(
     app_dir: &Path,
     id: &FileId,
     primary_len: usize,
@@ -333,7 +364,7 @@ pub(crate) fn write(
     head: &[u8],
     body: &[u8],
     times: Times,
-) -> io::Result<u64> {
+) -> io::Result<Written> {
     let name = hex(id);
     make_dir(app_dir)?;
     let tmp_dir = app_dir.join(TMP_DIR);
@@ -355,15 +386,35 @@ pub(crate) fn write(
         file.write_all(&header(primary_len, key, head, body, times))?;
         file.write_all(key)?;
         file.write_all(head)?;
-        file.write_all(body)?;
-        drop(file);
-        std::fs::rename(&temp, shard.join(&name))
+        file.write_all(body)
     })();
+    drop(file);
     if let Err(e) = done {
         let _ = std::fs::remove_file(&temp);
         return Err(e);
     }
-    Ok(file_len(key, head, body))
+    Ok(Written {
+        temp,
+        to: shard.join(&name),
+        size: file_len(key, head, body),
+    })
+}
+
+/// Writes the answer under its name. Returns the size of the file.
+#[cfg(test)]
+pub(crate) fn write(
+    app_dir: &Path,
+    id: &FileId,
+    primary_len: usize,
+    key: &[u8],
+    head: &[u8],
+    body: &[u8],
+    times: Times,
+) -> io::Result<u64> {
+    let written = write_temp(app_dir, id, primary_len, key, head, body, times)?;
+    let size = written.size();
+    written.place()?;
+    Ok(size)
 }
 
 /// Removes the file of `id`; one that is not there is not an error.

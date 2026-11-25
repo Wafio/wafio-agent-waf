@@ -772,22 +772,28 @@ pub(crate) async fn handle(
         cache_plan.fills(),
     )
     .await;
+    // The application cannot answer and a copy may stand in for it, whether its error comes whole
+    // or in pieces: a stream is dropped unread.
+    if let Ok(forwarded) = &result {
+        let status = match forwarded {
+            Forwarded::Whole(r) => r.status,
+            Forwarded::Stream(s) => s.head.status,
+        };
+        if cache::is_failure(status)
+            && let Some(copy) = cache::on_error(&cx, &pending)
+        {
+            tracing::warn!(
+                "[inline-proxy] app={} {} answered {status}: a stored copy is sent",
+                route.app_id,
+                route.upstream
+            );
+            let stale = from_copy(route, copy, Label::Stale);
+            emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, stale.status);
+            return answer(stale);
+        }
+    }
     match result {
         Ok(Forwarded::Whole(mut resp)) => {
-            // The application cannot answer and a copy may stand in for it.
-            if cache::is_failure(resp.status)
-                && let Some(copy) = cache::on_error(&cx, &pending)
-            {
-                tracing::warn!(
-                    "[inline-proxy] app={} {} answered {}: a stored copy is sent",
-                    route.app_id,
-                    route.upstream,
-                    resp.status
-                );
-                let stale = from_copy(route, copy, Label::Stale);
-                emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, stale.status);
-                return answer(stale);
-            }
             // The application confirmed the copy it was asked about.
             if resp.status == 304
                 && let Plan::Lookup(ask) = &cache_plan
@@ -806,6 +812,10 @@ pub(crate) async fn handle(
                     cache::fill(shared, route, ask, &req, &resp, pending.take_guard());
                     if matches!(route.target, Target::Http(_)) {
                         crate::upstream::apply_response_header_rules(route, &mut resp);
+                    }
+                    // The visitor's own condition did not go to the application.
+                    if let Some(held) = cache::if_held(&req, &resp) {
+                        resp = held;
                     }
                 }
                 Plan::Lookup(ask) => cache::note_not_kept(route, ask),
@@ -870,8 +880,10 @@ fn from_copy(route: &Route, mut resp: OutboundResponse, label: Label) -> Outboun
 
 /// Sends the request to the application of the route and returns what it answered. `validator`
 /// makes it the question of the response cache (the stored copy's validators in place of the
-/// visitor's conditions), `keep_copy` leaves the answer without the response header rules, which
-/// run after the copy is made. The error is what the log says: how the request failed, and why.
+/// visitor's conditions). `keep_copy` says the answer may be kept: it is asked with no condition
+/// of the visitor's, whose `304` or `412` would be no answer to keep, and it is left without the
+/// response header rules, which run after the copy is made. The error is what the log says: how
+/// the request failed, and why.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_upstream(
     shared: &Shared,
@@ -884,6 +896,7 @@ pub(crate) async fn send_upstream(
     validator: Option<&cache::Validator>,
     keep_copy: bool,
 ) -> Result<Forwarded, (&'static str, String)> {
+    let validator = validator.or_else(|| keep_copy.then_some(&cache::NO_CONDITIONS));
     let target = upstream_target(route, req);
     match &route.target {
         Target::Fcgi(pool) => {

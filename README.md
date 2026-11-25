@@ -922,9 +922,10 @@ answered from the copy that comes in. The lock is taken once the folder of stati
 When the fetch ends with no copy made, every waiter is woken at once and goes to the application in parallel, and the key is marked as not kept
 for 30 seconds (the `max-age` of an answer that is `private` or `no-store`, at most 10 minutes), so the next requests take no lock. The marks
 are for an answer with no lifetime, a `Set-Cookie`, `private`, `no-store` or `no-cache`, a `Vary` that cannot be kept, an unparsed
-`Cache-Control`, a status that is not kept (not a 5xx, which may pass), an answer over `max_object_bytes`, an encoding the bucket does not name, and one
-sent in pieces. A refusal that depends on the visitor (a request with a cookie that gets an answer that is not marked public) does not mark. A
-process that cannot store (a reload's successor) takes no lock. A purge clears the marks.
+`Cache-Control`, a status that is not kept (not a 5xx, which may pass, and not a `304` or `412`, which answer a condition and say nothing of the
+page), an answer over `max_object_bytes`, an encoding the bucket does not name, and one sent in pieces. A refusal that depends on the visitor (a
+request with a cookie that gets an answer that is not marked public) does not mark. A process that cannot store (a reload's successor) takes no
+lock. A purge clears the marks.
 
 **A copy that is past its life** is read and used in this order. Within the `stale-while-revalidate` of its answer it is sent at once as `STALE`
 and one request in the background (the lock again, so one at a time) fetches the page and makes the copy fresh; only a request that may fill
@@ -932,11 +933,16 @@ starts it. Past that, a request that may fill and finds a copy with an `ETag` or
 with `If-None-Match` and `If-Modified-Since` of the copy in place of the visitor's own conditions, and a `304` renews the copy with the headers
 it carries (not `Content-Type`, `Content-Encoding`, `Content-Length`, `Content-Range`, `Transfer-Encoding` or `Vary`) and its new lifetime; it is the
 answer, as `MISS`. A `200` is a new answer and replaces the copy as any other. A `304` that sets a cookie, or whose new headers say the answer is
-not to be kept, removes the copy. A request that cannot fill goes on as it is, with no question of the cache's. When the application cannot
-answer (it is down, times out, or says 500, 502, 503 or 504), a copy within the `stale-if-error` of its answer, else `stale_if_error_s`, is sent as
-`STALE`, with the decision event of a request answered with it. An answer with `must-revalidate`, `proxy-revalidate` or `s-maxage` is never sent
-stale unless it names its own `stale-while-revalidate` or `stale-if-error`, and then only for the window it names. A copy that can neither be
-confirmed nor stand in for the application (no validator, no window left) is not read at all: the request is a miss.
+not to be kept, removes the copy; the visitor still gets the answer with the cookie. A request that may fill goes to the application with none of the
+visitor's own `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since` and `If-Range`: the application is asked for the page to keep,
+and a `304` or `412` for the visitor's condition would be no page. The answer is then held against the visitor's `If-None-Match` and
+`If-Modified-Since` as a copy's is: `304` when the visitor holds that page, else the whole page. A request that cannot fill goes on as it is, with no question of the cache's and with its own conditions. When the
+application cannot answer (it is down, times out, or says 500, 502, 503 or 504, with a length or in pieces), a copy within the `stale-if-error` of its
+answer, else `stale_if_error_s`, is sent as `STALE`, with the decision event of a request answered with it. An answer with `must-revalidate`,
+`proxy-revalidate` or `s-maxage` is never sent stale unless it names its own `stale-while-revalidate` or `stale-if-error`, and then only for the
+window it names. A copy that can neither be confirmed nor stand in for the application (no `ETag` and no `Last-Modified`, no window left) is read
+once, by the first request that finds it, and removed: that request is a miss, and no later one reads it. The refresh in the background ends at the
+upstream timeout of the app, or after 60 seconds when the app has none, and gives up the lock then.
 
 **Purge.** `CachePurge` removes copies from both tiers: `url` the copies of one address (every bucket and `Vary` variant), `prefix` those whose
 path starts with the text, `app` everything. An address that starts with `/` names every host of the app, an absolute `http://` or `https://` URL

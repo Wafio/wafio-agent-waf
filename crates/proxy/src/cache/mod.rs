@@ -52,7 +52,7 @@ use store::{Skip, Store};
 pub use host::{CacheRefusal, CacheRefusalCode, HostFacts};
 pub(crate) use key::StaticFile;
 pub use purge::PurgeScope;
-pub(crate) use refresh::Validator;
+pub(crate) use refresh::{NO_CONDITIONS, Validator};
 pub(crate) use statics::{StaticKey, StaticMemory, static_memory};
 pub use stats::{CacheCounters, CacheTotals};
 pub(crate) use store::AppCache;
@@ -571,11 +571,12 @@ fn skipped(why: NotKept) -> Option<Count> {
 /// How long the key of an answer that is not kept is marked, so that the next requests do not
 /// queue behind a fetch that will not help them: 30 seconds, or the `max-age` of an answer that
 /// says it is private or not to be stored (at most ten minutes). `None` for a refusal that is
-/// about the visitor, or for an error of the application, which may pass.
+/// about the visitor, for an error of the application, which may pass, and for a `304` or `412`,
+/// which answer a condition and say nothing of the page.
 fn mark_seconds(why: NotKept, resp: &OutboundResponse) -> Option<u64> {
     match why {
         NotKept::Cookie => None,
-        NotKept::Status if resp.status >= 500 => None,
+        NotKept::Status if resp.status >= 500 || matches!(resp.status, 304 | 412) => None,
         NotKept::Private => {
             let cc = CacheControl::parse(resp.values(b"Cache-Control"));
             Some(match cc.max_age {
@@ -867,11 +868,14 @@ async fn settle(cx: &Ctx<'_>, ask: &Ask, app: &Arc<AppCache>, first: bool) -> Se
     }
     let windows = Windows::of(&copy.loaded, app.stale_if_error_s());
     let late = now - copy.loaded.times.fresh_until;
-    let validator = ask.fillable.then(|| Validator::of(&copy.loaded)).flatten();
-    // A copy that can neither be confirmed nor stand in for the application is of no use.
-    if validator.is_none() && late >= windows.revalidate.max(windows.error) {
+    let confirmable = Validator::of(&copy.loaded);
+    // A copy that can neither be confirmed nor stand in for the application is of no use, to this
+    // request or to any other: it was read once and goes.
+    if confirmable.is_none() && late >= windows.revalidate.max(windows.error) {
+        app.forget(&copy.id, copy.loaded.size, copy.loaded.times);
         return Settled::Old(None);
     }
+    let validator = confirmable.filter(|_| ask.fillable);
     let old = Old {
         id: copy.id,
         validator,
@@ -909,8 +913,8 @@ pub(crate) async fn enter(cx: &Ctx<'_>, ask: &Ask) -> Entered {
 
 /// The turn of a request for its key, before it asks the application: the one that may fill
 /// fetches, the others wait up to five seconds for it and look again, so one request at a time
-/// goes to the application for a key that has no copy. A copy that came in meanwhile is the
-/// answer.
+/// goes to the application for a key that has no copy. A copy that came in while a request waited
+/// is the answer.
 pub(crate) async fn take_turn(
     cx: &Ctx<'_>,
     ask: &Ask,
@@ -920,19 +924,18 @@ pub(crate) async fn take_turn(
     // Only the process that writes fetches for others: one that cannot store has nothing to give
     // those who wait.
     let lead = ask.fillable && app.can_store();
-    let guard = match app.fills().turn(ask.primary_id, lead, store::now()) {
-        Turn::Free => return None,
-        Turn::Lead(guard) => Some(guard),
+    match app.fills().turn(ask.primary_id, lead, store::now()) {
+        Turn::Free => {}
+        // `enter` looked a moment ago and read the copy it found: no second read.
+        Turn::Lead(guard) => pending.guard = Some(guard),
         Turn::Wait(rx) => {
             fills::wait(rx).await;
-            None
+            match settle(cx, ask, app, false).await {
+                Settled::Answer(answer, label) => return Some((answer, label)),
+                Settled::Old(old) => pending.old = old.or(pending.old.take()),
+            }
         }
-    };
-    match settle(cx, ask, app, false).await {
-        Settled::Answer(answer, label) => return Some((answer, label)),
-        Settled::Old(old) => pending.old = old.or(pending.old.take()),
     }
-    pending.guard = guard;
     None
 }
 
@@ -964,11 +967,9 @@ pub(crate) fn revalidated(
     let old = pending.old.as_ref().filter(|o| o.validator.is_some())?;
     let (settings, app) = cx.route.cache_active()?;
     let now = store::now();
-    let Some((head, merged)) = refresh::merged(&old.copy, answer) else {
-        // It brought a cookie: the copy is not to be kept.
-        app.drop_entry(&old.id);
-        return Some(old.copy.clone());
-    };
+    // A cookie of the `304` is in `merged`, which `decide` then refuses: no copy is kept, and this
+    // visitor still gets the cookie.
+    let (head, merged) = refresh::merged(&old.copy, answer);
     let prepared = decide(settings, ask, cx.req, &merged, now);
     let times = prepared.as_ref().map_or(
         Times {
@@ -989,9 +990,29 @@ pub(crate) fn revalidated(
         Ok(p) if app.can_store() => keep(cx.shared, app, ask.purge_gen, p, merged.body, guard),
         Ok(_) => {}
         // The new headers say it is not to be kept: it goes, and still answers this request.
-        Err(_) => app.drop_entry(&old.id),
+        Err(_) => {
+            app.forget(&old.id, old.copy.size, old.copy.times);
+        }
     }
     Some(loaded)
+}
+
+/// The visitor of a fetch asked the application with none of its own conditions. `304` when the
+/// answer it got is the page the visitor holds, which is what the application would have said;
+/// `None` for any other answer, one with a cookie included.
+pub(crate) fn if_held(req: &InboundRequest, resp: &OutboundResponse) -> Option<OutboundResponse> {
+    if resp.status != 200
+        || (req.peek("If-None-Match").is_empty() && req.peek("If-Modified-Since").is_empty())
+    {
+        return None;
+    }
+    let head = StoredHead {
+        status: 200,
+        http10: false,
+        reason: Vec::new(),
+        lines: resp.stored_lines()?,
+    };
+    hit::not_modified_answer(req, &head)
 }
 
 /// The answer a copy gives to the request.

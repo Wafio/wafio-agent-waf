@@ -46,6 +46,9 @@ pub(crate) struct Found {
     /// The whole key (primary and variant), which the file must hold.
     pub key: Vec<u8>,
     pub size: u64,
+    /// The times the entry had when it was found; with the size, they tell the entry from one a
+    /// store put in its place.
+    pub times: Times,
     /// The hits of the entry, this one included.
     pub hits: u32,
     pub mem: Option<Arc<Loaded>>,
@@ -104,6 +107,14 @@ impl Index {
         self.entries.contains_key(id)
     }
 
+    /// Whether the entry of `id` is still the one with this size and these times, and not one a
+    /// store put in its place.
+    pub fn holds(&self, id: &FileId, size: u64, times: Times) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|e| e.size == size && e.times == times)
+    }
+
     /// The `Vary` names of a primary key, when it has an entry.
     #[cfg(test)]
     pub fn names(&self, primary: &PrimaryId) -> Option<&[Vec<u8>]> {
@@ -160,6 +171,7 @@ impl Index {
                 id,
                 key,
                 size: entry.size,
+                times: entry.times,
                 hits: entry.hits,
                 mem: entry.mem.clone(),
             },

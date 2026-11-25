@@ -153,6 +153,87 @@ async fn a_visitor_who_cannot_have_a_copy_made_waits_for_the_fetch_and_gets_the_
     assert_eq!(s.up.count(), 1);
 }
 
+/// An application that answers `304` to a visitor's `If-None-Match` and `412` to an `If-Match`, as
+/// one does that finds the condition not met, and `200` to anything else.
+async fn conditional() -> TestUpstream {
+    raw_upstream(|seen| {
+        if seen.header("if-none-match").is_some() {
+            return (
+                b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\r\n".to_vec(),
+                false,
+            );
+        }
+        if seen.header("if-match").is_some() {
+            return (
+                b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                false,
+            );
+        }
+        (
+            reply_to(
+                seen,
+                "200 OK",
+                "Content-Type: text/html\r\nETag: \"v1\"\r\nCache-Control: public, max-age=600\r\n",
+                b"page",
+            ),
+            false,
+        )
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_condition_of_the_visitor_on_a_page_with_no_copy_does_not_keep_it_out_of_the_cache() {
+    let s = site(conditional().await, spec(), |_| {}).await;
+    // The first visitor holds the page already and says so in every way a request can.
+    let first = fetch(
+        s.addr,
+        &with(
+            "/a",
+            &[
+                "If-None-Match: *",
+                "If-Match: \"other\"",
+                "If-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT",
+                "If-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT",
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(
+        (first.status, x_cache(&first), first.body.len()),
+        (304, "MISS", 0),
+        "the application was asked for the page, and the visitor holds it"
+    );
+    let asked = s.up.last();
+    for name in [
+        "if-none-match",
+        "if-match",
+        "if-modified-since",
+        "if-unmodified-since",
+    ] {
+        assert!(asked.header(name).is_none(), "{name} was sent on");
+    }
+    // The page was kept: a burst makes no request to the application and every answer is a copy.
+    let burst = burst(s.addr, 20, get("/a")).await;
+    assert_eq!(labelled(&burst, "HIT"), 20);
+    assert_eq!(s.up.count(), 1);
+    // A visitor whose tag is not the page's gets the page, and it is kept as well.
+    let other = fetch(s.addr, &with("/c", &["If-None-Match: \"old\""])).await;
+    assert_eq!(
+        (other.status, x_cache(&other), other.text().as_str()),
+        (200, "MISS", "page")
+    );
+    assert_eq!(x_cache(&fetch(s.addr, &get("/c")).await), "HIT");
+    // A visitor who may not fill still asks with its own condition, and gets what the application said.
+    let signed_in = one(
+        s.addr,
+        &with("/b", &["Cookie: sessionid=abc", "If-None-Match: \"v1\""]),
+    )
+    .await;
+    assert_eq!(signed_in.status, 304);
+    assert_eq!(s.up.last().header("if-none-match"), Some("\"v1\""));
+}
+
 #[tokio::test]
 async fn an_answer_that_is_not_kept_marks_its_key_but_an_error_of_the_application_does_not() {
     let (up, arrivals) = slow_upstream(Duration::from_millis(250), |seen| {
@@ -255,6 +336,25 @@ async fn a_request_that_cannot_fill_gets_a_stale_copy_and_starts_no_refresh() {
     assert_eq!((ranged.status, x_cache(&ranged)), (206, "STALE"));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(s.up.count(), 1, "no refresh for either");
+}
+
+#[tokio::test]
+async fn the_refresh_in_the_background_does_not_replay_the_conditions_of_the_visitor() {
+    // The copy has no tag and no date, so there is nothing to ask about; the visitor's own
+    // condition is not the cache's question.
+    let s = numbering("public, max-age=1, stale-while-revalidate=60", spec()).await;
+    assert_eq!(x_cache(&fetch(s.addr, &get("/a")).await), "MISS");
+    tokio::time::sleep(SECOND).await;
+    let r = one(s.addr, &with("/a", &["If-None-Match: *"])).await;
+    assert_eq!((r.status, x_cache(&r)), (304, "STALE"));
+    assert!(until(|| s.up.count() >= 2).await, "the refresh was made");
+    assert!(s.up.last().header("if-none-match").is_none());
+    copies_written(s.addr).await;
+    let fresh = fetch(s.addr, &get("/a")).await;
+    assert_eq!(
+        (x_cache(&fresh), fresh.text().as_str()),
+        ("HIT", "answer 2")
+    );
 }
 
 /// An application that numbers its answers with `ETag: "v1"`, says `304` to that tag and counts
@@ -362,6 +462,46 @@ async fn an_answer_that_changed_replaces_the_copy_and_a_last_modified_asks_too()
 }
 
 #[tokio::test]
+async fn a_cookie_on_the_304_reaches_the_visitor_and_leaves_no_copy() {
+    let up = raw_upstream(|seen| {
+        if seen.header("if-none-match") == Some("\"v1\"") {
+            return (
+                b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nCache-Control: public, max-age=600\r\nSet-Cookie: sid=renewed; Path=/\r\n\r\n".to_vec(),
+                false,
+            );
+        }
+        (
+            reply_to(
+                seen,
+                "200 OK",
+                "Content-Type: text/html\r\nETag: \"v1\"\r\nCache-Control: public, max-age=1\r\n",
+                b"page",
+            ),
+            false,
+        )
+    })
+    .await;
+    let s = site(up, spec(), |_| {}).await;
+    assert_eq!(x_cache(&fetch(s.addr, &get("/a")).await), "MISS");
+    tokio::time::sleep(SECOND).await;
+    let r = fetch(s.addr, &get("/a")).await;
+    assert_eq!(
+        (r.status, x_cache(&r), r.text().as_str()),
+        (200, "MISS", "page")
+    );
+    assert_eq!(r.header("set-cookie"), Some("sid=renewed; Path=/"));
+    assert!(answer_files(&s.dir.0).is_empty(), "no copy of it is kept");
+    assert_eq!(s.up.count(), 2);
+    // The same for a visitor who holds the page: the 304 it gets carries the cookie too.
+    assert_eq!(x_cache(&fetch(s.addr, &get("/a")).await), "MISS");
+    tokio::time::sleep(SECOND).await;
+    let held = fetch(s.addr, &with("/a", &["If-None-Match: \"v1\""])).await;
+    assert_eq!(held.status, 304);
+    assert_eq!(held.header("set-cookie"), Some("sid=renewed; Path=/"));
+    assert!(answer_files(&s.dir.0).is_empty());
+}
+
+#[tokio::test]
 async fn only_a_request_that_may_fill_asks_the_application_about_a_copy() {
     let s = site(
         confirming("public, max-age=1", "public, max-age=600").await,
@@ -413,6 +553,44 @@ async fn a_stored_copy_is_sent_when_the_application_is_down_or_answers_a_server_
         (200, "STALE", "answer 1")
     );
     assert!(s.up.count() >= 2);
+}
+
+#[tokio::test]
+async fn a_server_error_that_comes_in_pieces_is_covered_by_a_stored_copy_too() {
+    let n = Arc::new(AtomicUsize::new(0));
+    let up = raw_upstream(move |seen| {
+        if n.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                reply_to(
+                    seen,
+                    "200 OK",
+                    "Content-Type: text/html\r\nCache-Control: public, max-age=1\r\n",
+                    b"good",
+                ),
+                false,
+            );
+        }
+        // No length: chunked, as the default error page of many frameworks is.
+        (
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndown\r\n0\r\n\r\n".to_vec(),
+            false,
+        )
+    })
+    .await;
+    let s = site(up, spec(), |_| {}).await;
+    assert_eq!(fetch(s.addr, &get("/a")).await.text(), "good");
+    tokio::time::sleep(SECOND).await;
+    let r = fetch(s.addr, &get("/a")).await;
+    assert_eq!(
+        (r.status, x_cache(&r), r.text().as_str()),
+        (200, "STALE", "good")
+    );
+    assert_eq!(s.up.count(), 2, "the application was asked");
+    assert_eq!(s.h.last_event().status, 200, "the visitor got the copy");
+    // A page with no copy gets the error as the application said it. `Connection: close`: the
+    // answer has no end of its own but the connection's.
+    let none = fetch(s.addr, &with("/other", &["Connection: close"])).await;
+    assert_eq!((none.status, x_cache(&none)), (503, "MISS"));
 }
 
 #[tokio::test]
@@ -529,6 +707,39 @@ async fn a_copy_that_cannot_be_asked_about_or_used_is_not_read_for_nothing() {
     tokio::time::sleep(SECOND).await;
     let r = fetch(s.addr, &get("/a")).await;
     assert_eq!((x_cache(&r), r.text().as_str()), ("MISS", "answer 2"));
+}
+
+#[tokio::test]
+async fn a_copy_with_no_use_left_is_read_once_and_removed() {
+    // The application stops sending answers that may be kept.
+    let n = Arc::new(AtomicUsize::new(0));
+    let up = raw_upstream(move |seen| {
+        let control = if n.fetch_add(1, Ordering::SeqCst) == 0 {
+            "public, max-age=1"
+        } else {
+            "private"
+        };
+        (
+            reply_to(
+                seen,
+                "200 OK",
+                &format!("Content-Type: text/html\r\nCache-Control: {control}\r\n"),
+                b"page",
+            ),
+            false,
+        )
+    })
+    .await;
+    let s = site(up, with_error_window(0), |_| {}).await;
+    assert_eq!(x_cache(&fetch(s.addr, &get("/a")).await), "MISS");
+    assert_eq!(s.host.counters("shop").unwrap().objects, 1);
+    tokio::time::sleep(SECOND).await;
+    let r = fetch(s.addr, &get("/a")).await;
+    assert_eq!((x_cache(&r), r.text().as_str()), ("MISS", "page"));
+    // The request that found it dead took it out, and the answer was not kept: no file is left
+    // for the next request to read and throw away.
+    assert_eq!(s.host.counters("shop").unwrap().objects, 0);
+    assert!(answer_files(&s.dir.0).is_empty());
 }
 
 // A purge.

@@ -1,12 +1,15 @@
 //! A copy past its life: the question the cache asks the application to see whether it still
 //! holds, the headers a `304` brings, and the fetch in the background that makes a stale copy fresh.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use pingora::http::RequestHeader;
 use wafio_domain::Headers;
 
 use super::format::{Loaded, StoredHead};
 use super::{Ask, Ctx, Old, Pending};
+use crate::config::Route;
 use crate::response::OutboundResponse;
 use crate::upstream::Forwarded;
 
@@ -35,6 +38,13 @@ pub(crate) struct Validator {
     etag: Option<Vec<u8>>,
     last_modified: Option<Vec<u8>>,
 }
+
+/// What a request that may fill sends when there is no copy to ask about: no condition at all. The
+/// answer is for the cache, so a `304` or `412` to the visitor's own condition would be none.
+pub(crate) static NO_CONDITIONS: Validator = Validator {
+    etag: None,
+    last_modified: None,
+};
 
 impl Validator {
     /// `None` for an answer that has neither an `ETag` nor a `Last-Modified`.
@@ -85,12 +95,11 @@ impl Validator {
 
 /// The copy's head with the headers a `304` brought in place of the ones of the same name, and the
 /// answer that head and the copy's body make, which carries the `Date` and `Age` of the `304` so
-/// that its lifetime is read as that of a new answer. `None` when the `304` carries a cookie.
-pub(super) fn merged(
-    old: &Loaded,
-    answer: &OutboundResponse,
-) -> Option<(StoredHead, OutboundResponse)> {
-    let brought = answer.stored_lines()?;
+/// that its lifetime is read as that of a new answer. A cookie the `304` sets is in both: no copy
+/// is made of an answer that has one, and the visitor still gets it.
+pub(super) fn merged(old: &Loaded, answer: &OutboundResponse) -> (StoredHead, OutboundResponse) {
+    let mut brought = answer.plain_lines();
+    brought.extend(answer.cookie_lines());
     let mut lines = old.head.lines.clone();
     let mut done: Vec<Vec<u8>> = Vec::new();
     for (name, _) in &brought {
@@ -120,12 +129,26 @@ pub(super) fn merged(
             resp.set(name, value);
         }
     }
-    Some((head, resp))
+    (head, resp)
+}
+
+/// The longest a refresh in the background holds the fill lock on a route with no upstream
+/// timeout.
+const UNLIMITED_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long a refresh in the background may take: the route's upstream timeout, else
+/// [`UNLIMITED_LIMIT`].
+pub(super) fn limit(route: &Route) -> Duration {
+    if route.upstream_unlimited {
+        UNLIMITED_LIMIT
+    } else {
+        route.upstream_timeout
+    }
 }
 
 /// Fetches the page again behind the visitor who was sent the stale copy. `guard` is the fill
 /// lock, so there is one fetch at a time for a key; the copy stays as it was when the application
-/// fails or answers in pieces.
+/// fails, answers in pieces or does not answer within [`limit`], which frees the lock.
 pub(super) fn spawn(cx: &Ctx<'_>, ask: &Ask, old: Old, guard: super::FillGuard) {
     let shared = cx.shared.clone();
     let route = cx.route.clone();
@@ -133,6 +156,7 @@ pub(super) fn spawn(cx: &Ctx<'_>, ask: &Ask, old: Old, guard: super::FillGuard) 
     let peer = cx.peer.clone();
     let remote = cx.remote.to_owned();
     let ask = ask.clone();
+    let limit = limit(&route);
     tokio::spawn(async move {
         let cx = Ctx {
             shared: &shared,
@@ -141,7 +165,8 @@ pub(super) fn spawn(cx: &Ctx<'_>, ask: &Ask, old: Old, guard: super::FillGuard) 
             peer: &peer,
             remote: &remote,
         };
-        run(&cx, &ask, old, guard).await;
+        // Dropping the future drops the lock it holds.
+        let _ = tokio::time::timeout(limit, run(&cx, &ask, old, guard)).await;
     });
 }
 
@@ -284,7 +309,7 @@ mod tests {
         brought.add(b"Link", b"</c>; rel=z");
         brought.add(b"Date", b"Sun, 06 Nov 1994 08:49:37 GMT");
         brought.add(b"Age", b"7");
-        let (head, resp) = merged(&old, &brought).unwrap();
+        let (head, resp) = merged(&old, &brought);
         let get = |name: &str| {
             head.lines
                 .iter()
@@ -317,9 +342,47 @@ mod tests {
             Some(&b"Sun, 06 Nov 1994 08:49:37 GMT"[..])
         );
         assert_eq!(resp.peek(b"Age"), Some(&b"7"[..]));
-        // A cookie on the 304: the copy is not to be kept.
+    }
+
+    #[test]
+    fn a_cookie_on_the_304_is_in_the_answer_and_makes_it_one_that_is_not_stored() {
+        let old = copy(&[("Cache-Control", "max-age=10"), ("ETag", "\"v1\"")]);
         let mut cookie = OutboundResponse::new(304);
         cookie.add(b"Set-Cookie", b"a=b");
-        assert!(merged(&old, &cookie).is_none());
+        cookie.add(b"Set-Cookie", b"c=d");
+        let (head, resp) = merged(&old, &cookie);
+        let sent: Vec<_> = head
+            .lines
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(b"Set-Cookie"))
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        assert_eq!(sent, [&b"a=b"[..], b"c=d"]);
+        assert_eq!(resp.cookie_lines().count(), 2);
+        assert!(resp.stored_lines().is_none(), "nothing is made of it");
+    }
+
+    #[test]
+    fn no_conditions_removes_those_of_the_visitor_and_adds_none() {
+        let mut head = RequestHeader::build("GET", b"/a", None).unwrap();
+        for (k, val) in [
+            ("If-None-Match", "*"),
+            ("If-Modified-Since", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            ("If-Match", "\"m\""),
+            ("If-Unmodified-Since", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            ("Accept", "text/html"),
+        ] {
+            head.append_header(k, val).unwrap();
+        }
+        NO_CONDITIONS.apply_http(&mut head);
+        let names: Vec<_> = head.headers.keys().map(|k| k.as_str().to_owned()).collect();
+        assert_eq!(names, ["accept"]);
+        let mut map = Headers::new();
+        map.insert(b"if-none-match".to_vec(), vec![b"*".to_vec()]);
+        map.insert(b"If-Unmodified-Since".to_vec(), vec![b"x".to_vec()]);
+        map.insert(b"Accept".to_vec(), vec![b"x".to_vec()]);
+        NO_CONDITIONS.apply_map(&mut map);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&b"Accept"[..]));
     }
 }

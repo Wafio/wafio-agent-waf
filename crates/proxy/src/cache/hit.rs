@@ -68,13 +68,16 @@ fn if_range_holds(header: &[u8], head: &StoredHead) -> bool {
         && value(head, b"Last-Modified").map(<[u8]>::trim_ascii) == Some(header)
 }
 
-/// The headers a `304` carries: the ones RFC 9110 says it must, and `Last-Modified`.
-const NOT_MODIFIED_HEADERS: [&[u8]; 6] = [
+/// The headers a `304` carries: the ones RFC 9110 says it must, and `Last-Modified`. `Set-Cookie`
+/// is one too: a stored head never has it, but the head of a copy that the application confirmed
+/// with a cookie does, and the visitor must get that cookie.
+const NOT_MODIFIED_HEADERS: [&[u8]; 7] = [
     b"Cache-Control",
     b"Content-Location",
     b"ETag",
     b"Expires",
     b"Last-Modified",
+    b"Set-Cookie",
     b"Vary",
 ];
 
@@ -92,21 +95,31 @@ fn body_of(loaded: Arc<Loaded>) -> Vec<u8> {
     Arc::try_unwrap(loaded).map_or_else(|shared| shared.body.clone(), |own| own.body)
 }
 
-/// The answer to `req` from the copy, without `X-Cache` (the caller says what the cache did).
-/// `GET` and `HEAD` only.
-pub(crate) fn answer(req: &InboundRequest, loaded: Arc<Loaded>, now: u64) -> OutboundResponse {
-    let aged = age(&loaded, now);
-    let mut resp = if not_modified(req, &loaded.head) {
+/// `304` with the headers a `304` carries when `req` already holds the answer `head` is the head of.
+pub(crate) fn not_modified_answer(
+    req: &InboundRequest,
+    head: &StoredHead,
+) -> Option<OutboundResponse> {
+    not_modified(req, head).then(|| {
         let mut r = OutboundResponse::new(304);
-        for name in NOT_MODIFIED_HEADERS {
-            if let Some(v) = value(&loaded.head, name) {
+        for (name, v) in &head.lines {
+            if NOT_MODIFIED_HEADERS
+                .iter()
+                .any(|kept| name.eq_ignore_ascii_case(kept))
+            {
                 r.add(name, v);
             }
         }
         r
-    } else {
-        whole_or_part(req, loaded)
-    };
+    })
+}
+
+/// The answer to `req` from the copy, without `X-Cache` (the caller says what the cache did).
+/// `GET` and `HEAD` only.
+pub(crate) fn answer(req: &InboundRequest, loaded: Arc<Loaded>, now: u64) -> OutboundResponse {
+    let aged = age(&loaded, now);
+    let mut resp =
+        not_modified_answer(req, &loaded.head).unwrap_or_else(|| whole_or_part(req, loaded));
     resp.set(b"Age", aged.to_string().as_bytes());
     resp
 }
@@ -233,6 +246,21 @@ mod tests {
         );
         // A clock that went back does not give a negative age.
         assert_eq!(age(&copy(200, &[]), 10), 5);
+    }
+
+    #[test]
+    fn a_cookie_in_the_head_of_a_confirmed_copy_goes_with_the_200_and_with_the_304() {
+        let held = copy(200, &[("Set-Cookie", "sid=new"), ("Set-Cookie", "csrf=2")]);
+        for (head, status) in [("", 200), ("If-None-Match: \"v1\"\r\n", 304)] {
+            let r = answer(&request("GET", head), &held, 1000);
+            assert_eq!(r.status, status);
+            let cookies: Vec<_> = r.cookie_lines().map(|(_, v)| v).collect();
+            assert_eq!(
+                cookies,
+                [b"sid=new".to_vec(), b"csrf=2".to_vec()],
+                "{status}"
+            );
+        }
     }
 
     #[test]
