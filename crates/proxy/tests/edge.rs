@@ -45,11 +45,13 @@ async fn the_upstream_sees_the_path_without_the_prefix_and_the_decision_keeps_th
             "the event keeps the public target"
         );
     }
-    // A request that asks for an upgrade is sent as it came.
-    let h2c = "GET /shop/x HTTP/1.1\r\nHost: app.test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n";
+    // A request that asks for an upgrade loses the prefix like any other: the client does not
+    // decide which path the application sees.
+    let h2c = "GET /shop/x?a=1 HTTP/1.1\r\nHost: app.test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n";
     let r = c.send(h2c.as_bytes()).await.unwrap();
     assert_eq!(r.status, 200);
-    assert_eq!(up.last().line, "GET /shop/x HTTP/1.1");
+    assert_eq!(up.last().line, "GET /x?a=1 HTTP/1.1");
+    assert_eq!(s(&h.last_event().uri), "/shop/x?a=1");
 }
 
 /// A path outside the prefix is not the application's. Forwarded, it would reach a page that is

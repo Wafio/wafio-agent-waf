@@ -700,7 +700,7 @@ other `tls` check; an empty one means no redirect.
   left out for 443.
 - The redirect comes after the verdict and after the WebSocket handshake takeover: a request that is blocked is never redirected, a
   WebSocket handshake is handled by its own takeover, and a request that asks for an upgrade (`Upgrade:`) is sent to the application
-  as it is. A path outside the app's path prefix (below) is `404` under every host name and is not redirected. The decision event of a redirect carries the verdict action and the status `308`, like the event of a request that was
+  under the host name it came with, without a redirect. A path outside the app's path prefix (below) is `404` under every host name and is not redirected. The decision event of a redirect carries the verdict action and the status `308`, like the event of a request that was
   forwarded.
 - Browsers keep a `308`. A main host that is changed later may keep sending returning visitors to the old name for a while.
 - It works for an app the agent serves over HTTPS. For an app behind a proxy the server in front of the agent does it.
@@ -719,7 +719,9 @@ segments, with no empty segment, no `.` or `..` segment and no trailing `/`, in 
   `/admin` is not forwarded to the page that is public at `/shop/admin`. It comes after the verdict, so a request that a rule blocks
   is still blocked and counted, and its decision event carries the status `404`. The challenge verify endpoint and the answers
   of the plain HTTP listener (certificate validation, the redirect to HTTPS) do not depend on the prefix.
-- A request that asks for an upgrade, a WebSocket handshake included, keeps the public path when it goes to the application.
+- Every request that goes to the application loses the prefix, a request with an `Upgrade` line included: a WebSocket handshake
+  under `/shop` dials `/ws` for `/shop/ws`, and a request with `Upgrade: h2c` is sent as any other. The client never decides which
+  path the application sees.
 - `Location` headers and links that the application writes are not rewritten. They must include the prefix.
 
 ## Compression
@@ -1101,9 +1103,12 @@ received (`body_decompress_error`).
 `WAFIO_BODY_DECODE_BUDGET_BYTES` (default 64 MiB, 0 disables) caps the memory of decodes in flight; a body that does not
 fit is inspected as received (`body_decompress_budget`).
 
-The only C code in the binary is the TLS provider (`ring`) and the allocator (`mimalloc`). `cargo tree` still lists
-`zstd-sys` and `libz-ng-sys` under `pingora-core`; nothing calls them and the linker drops them. On a release binary,
-`nm wafio-waf-agent-open | grep -E 'zng_|ZSTD_'` prints nothing.
+The C code in the binary is the TLS provider (`ring`), the allocator (`mimalloc`) and zlib-ng. `pingora-core` switches the
+zlib-ng backend of `flate2` on, and `crates/proxy/src/compress.rs` uses it to encode gzip answers (see "Compression"), so zlib-ng
+compresses bytes that an application sent. It only compresses: the decoding of request and response bodies above is Rust. A
+pure Rust encoder (`miniz_oxide`) would remove it; the agent does not use one yet. `cargo tree` also lists `zstd-sys` under
+`pingora-core`; nothing calls it and the linker drops it. On a binary, `nm wafio-waf-agent-open | grep zng_` lists the zlib-ng
+deflate functions (`zng_deflate` and the ones it calls) and `nm wafio-waf-agent-open | grep ZSTD_` prints nothing.
 
 ## Protocol file
 
