@@ -104,11 +104,12 @@ pub(crate) fn app_path<'a>(route: &Route, req: &'a InboundRequest) -> &'a [u8] {
 
 /// The request target the upstream gets: the public one, with the route's path prefix taken off
 /// when the path equals it or goes on with `/` (`/` when nothing is left). The prefix is matched
-/// on the decoded path, dot segments already resolved. A request that asks for an upgrade is not
-/// changed. A path outside the prefix never gets here (`outside_prefix`); it is left as it is.
+/// on the decoded path, dot segments already resolved. Every request gets the short path, one
+/// that asks for an upgrade included: the client never decides which path the application sees.
+/// A path outside the prefix never gets here (`outside_prefix`); it is left as it is.
 pub(crate) fn upstream_target<'a>(route: &Route, req: &'a InboundRequest) -> Cow<'a, [u8]> {
     let prefix = route.proxy_config.strip_path_prefix.as_bytes();
-    if prefix.is_empty() || req.has_upgrade() {
+    if prefix.is_empty() {
         return Cow::Borrowed(&req.forward_request_target);
     }
     let Some(rest) = below_prefix(prefix, &req.forward_path) else {
@@ -387,21 +388,27 @@ mod tests {
     }
 
     #[test]
-    fn no_prefix_and_an_upgrade_request_keep_the_public_target() {
+    fn no_prefix_keeps_the_public_target_and_an_upgrade_request_loses_the_prefix_too() {
         let plain = request("a.test", "/shop/cart?a=1");
         assert_eq!(target("{}", &plain), "/shop/cart?a=1");
         assert_eq!(
             target(r#"{"strip_path_prefix":""}"#, &plain),
             "/shop/cart?a=1"
         );
-        let upgrade = InboundRequest::from_head(
-            b"GET /shop/ws HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
-        );
-        assert!(upgrade.has_upgrade() && !plain.has_upgrade());
-        assert_eq!(
-            target(r#"{"strip_path_prefix":"/shop"}"#, &upgrade),
-            "/shop/ws"
-        );
+        let cfg = r#"{"strip_path_prefix":"/shop"}"#;
+        for upgrade in ["websocket", "h2c"] {
+            let head = format!(
+                "GET /shop/ws?a=1 HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\n\r\n"
+            );
+            let req = InboundRequest::from_head(head.as_bytes());
+            assert!(req.has_upgrade() && !plain.has_upgrade());
+            assert_eq!(target(cfg, &req), "/ws?a=1", "{upgrade}");
+            assert_eq!(
+                String::from_utf8(app_path(&route(cfg, None), &req).to_vec()).unwrap(),
+                "/ws",
+                "{upgrade}"
+            );
+        }
     }
 
     #[test]

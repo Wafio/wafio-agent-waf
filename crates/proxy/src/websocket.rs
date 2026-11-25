@@ -251,9 +251,10 @@ pub(crate) fn hook(
     let Target::Http(t) = &route.target else {
         unreachable!("ws_handshake_for_route excludes FastCGI")
     };
-    // The dial target: the forwarded path and the raw query.
+    // The dial target: the path the application sees (the route's path prefix taken off, as for
+    // any forwarded request) and the raw query.
     let mut request_uri = Vec::new();
-    crate::request::push_escaped_path(&mut request_uri, &req.forward_path);
+    crate::request::push_escaped_path(&mut request_uri, crate::redirect::app_path(route, req));
     if !req.query.is_empty() {
         request_uri.push(b'?');
         request_uri.extend_from_slice(&req.query);
