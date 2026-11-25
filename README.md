@@ -948,11 +948,14 @@ upstream timeout of the app, or after 60 seconds when the app has none, and give
 
 **Purge.** `CachePurge` removes copies from both tiers: `url` the copies of one address (every bucket and `Vary` variant), `prefix` those whose
 path starts with the text, `app` everything. An address that starts with `/` names every host of the app, an absolute `http://` or `https://` URL
-that host only (either scheme; the host is lower case). `url` is compared byte for byte with the stored request target, query included, and
-`prefix` with its path alone. Every purge raises the app's purge count, and an answer whose fetch began before the raise is not stored, so a page
+that host only (either scheme; the host is lower case). The agent reads the address as it reads the request target of a request before it keys a
+copy: the path is decoded, `.` and `..` segments are resolved and the path is escaped again with upper-case hex, so `/wiki/Foo_(bar)`,
+`/wiki/Foo_%28bar%29` and `/wiki/./Foo_%28bar%29` name one copy, and so do `/a%2db`, `/a%2Db` and `/a-b`. The query is kept byte for byte, except that `"`,
+`<` and `>` are written `%22`, `%3C` and `%3E`; it is not sorted and its escapes are not changed, so `?a=1&b=2` and `?b=2&a=1` are two copies. `url`
+is then compared byte for byte with the stored request target, query included, and `prefix` with its path alone. Every purge raises the app's purge count, and an answer whose fetch began before the raise is not stored, so a page
 that was being fetched while the purge ran cannot bring the old copy back. The purge is acked once the index holds none of the copies and their files are
 deleted (`not_in_bundle` for an app the bundle does not name, `cache_off` for one whose cache does not run, `invalid` for a scope or address that is not
-accepted). A process that does not hold the lock of the cache directory (a reload's successor) acks `busy`: it cannot delete files, and the control
+accepted: not a path or an `http(s)` URL, a `%` in the path with no two hex digits after it, or a space or control byte). A process that does not hold the lock of the cache directory (a reload's successor) acks `busy`: it cannot delete files, and the control
 plane asks again.
 
 **Disk and memory.** A file holds a 64-byte header (magic, version, lengths, CRC-32, times), the key, the head and the body. It is

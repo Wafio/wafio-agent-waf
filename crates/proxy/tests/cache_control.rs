@@ -800,6 +800,51 @@ async fn a_purge_by_address_removes_every_variant_of_it_in_both_tiers_and_no_oth
 }
 
 #[tokio::test]
+async fn a_purge_names_an_address_as_the_browser_bar_shows_it() {
+    let s = numbering("public, max-age=600", spec()).await;
+    kept(
+        &s,
+        &[
+            "/wiki/Foo_(bar)",
+            "/a-b",
+            "/a/b",
+            "/wiki/Foo_(baz)",
+            "/keep",
+        ],
+    )
+    .await;
+    // The stored target has the parentheses escaped, and no dot segment.
+    s.host
+        .purge("shop", PurgeScope::Url("/wiki/Foo_(bar)"))
+        .unwrap();
+    assert_eq!(
+        x_cache(&fetch(s.addr, &get("/wiki/Foo_(bar)")).await),
+        "MISS"
+    );
+    s.host.purge("shop", PurgeScope::Url("/a%2db")).unwrap();
+    assert_eq!(x_cache(&fetch(s.addr, &get("/a-b")).await), "MISS");
+    s.host.purge("shop", PurgeScope::Url("/a/./b")).unwrap();
+    assert_eq!(x_cache(&fetch(s.addr, &get("/a/b")).await), "MISS");
+    s.host
+        .purge("shop", PurgeScope::Prefix("/wiki/Foo_(ba"))
+        .unwrap();
+    assert_eq!(
+        x_cache(&fetch(s.addr, &get("/wiki/Foo_(baz)")).await),
+        "MISS"
+    );
+    assert!(is_hit(&s, "/keep").await, "no other copy went");
+    assert_eq!(
+        s.host.purge("shop", PurgeScope::Url("/a%zz")),
+        Err(PurgeError::Invalid)
+    );
+    assert_eq!(
+        s.host.purge("shop", PurgeScope::Prefix("/a b")),
+        Err(PurgeError::Invalid)
+    );
+    assert!(is_hit(&s, "/keep").await, "a refused purge removes nothing");
+}
+
+#[tokio::test]
 async fn a_purge_by_prefix_names_the_path_and_a_purge_of_the_app_removes_everything() {
     let s = numbering("public, max-age=600", spec()).await;
     kept(&s, &["/p/1", "/p/2?q=1", "/q/1", "/other?next=/p/1"]).await;
