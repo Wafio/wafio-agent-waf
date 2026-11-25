@@ -398,31 +398,33 @@ pub async fn run_waf_agent(
 
     // agent.Run: IP jail, startup executor, inline proxy (IP reputation, good bots, observer).
     let env = OsEnv;
+    // The enforcer is built whenever a jail URL is set: the agent-wide threshold (default off) and an
+    // app's block policy with target "kernel" both push through it.
     let mut jail: Option<Arc<JailTracker>> = None;
-    if f.jail_threshold > 0 {
-        let token_file = f.jail_token_file(&env);
-        match wafio_agent_io::ip_jail::jail_enforcer_from_config(&token_file, &f.jail_url) {
-            Some(enforce) => {
-                let window = if f.jail_window_sec > 0 {
-                    Duration::from_secs(f.jail_window_sec as u64)
-                } else {
-                    Duration::from_secs(60)
-                };
-                let duration = if f.jail_duration_sec > 0 {
-                    Duration::from_secs(f.jail_duration_sec as u64)
-                } else {
-                    Duration::from_secs(3600)
-                };
-                jail = Some(Arc::new(JailTracker::new(
-                    f.jail_threshold,
-                    window,
-                    duration,
-                    65536,
-                    Some(enforce),
-                )));
+    let token_file = f.jail_token_file(&env);
+    match wafio_agent_io::ip_jail::jail_enforcer_from_config(&token_file, &f.jail_url) {
+        Some(enforce) => {
+            let window = if f.jail_window_sec > 0 {
+                Duration::from_secs(f.jail_window_sec as u64)
+            } else {
+                Duration::from_secs(60)
+            };
+            let duration = if f.jail_duration_sec > 0 {
+                Duration::from_secs(f.jail_duration_sec as u64)
+            } else {
+                Duration::from_secs(3600)
+            };
+            jail = Some(Arc::new(JailTracker::new(
+                f.jail_threshold,
+                window,
+                duration,
+                65536,
+                Some(enforce),
+            )));
+            if f.jail_threshold > 0 {
                 match wafio_agent_io::ip_jail::check_host_agent_token(false, &token_file) {
                     Err(e) => info!(
-                        "WARNING: IP jail inactive: host-agent local API token unreadable ({e}); jail pushes are skipped until it is readable — set WAFIO_LOCAL_API_TOKEN_GROUP to this agent's group in /etc/wafio/host-agent.env and restart the host agent"
+                        "WARNING: IP jail inactive: host-agent local API token unreadable ({e}); jail pushes are skipped until it is readable; set WAFIO_LOCAL_API_TOKEN_GROUP to this agent's group in /etc/wafio/host-agent.env and restart the host agent"
                     ),
                     Ok(()) => info!(
                         "IP jail active: {} blocks/{} → XDP jail {}",
@@ -431,10 +433,15 @@ pub async fn run_waf_agent(
                         whole_seconds_text(duration)
                     ),
                 }
+            } else {
+                info!(
+                    "IP jail threshold off; a block policy with target kernel still jails at {}",
+                    f.jail_url
+                )
             }
-            None => {
-                info!("IP jail disabled: no in-process eBPF manager and no --jail-url configured")
-            }
+        }
+        None => {
+            info!("IP jail disabled: no in-process eBPF manager and no --jail-url configured")
         }
     }
     let stores = Stores::new();

@@ -39,7 +39,7 @@ fn parse(args: &[&str]) -> AgentArgs {
 #[test]
 fn defaults_match_documented_values() {
     let f = parse(&[]);
-    assert_eq!(f.jail_threshold, 5);
+    assert_eq!(f.jail_threshold, 0);
     assert_eq!(f.jail_window_sec, 60);
     assert_eq!(f.jail_duration_sec, 3600);
     assert_eq!(f.jail_url, "http://127.0.0.1:18089/api/ebpf/blocklist");

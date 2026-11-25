@@ -192,8 +192,8 @@ pub struct AgentArgs {
     )]
     pub iprep_level2_file: String,
 
-    /// WAF blocks within the window before an IP is jailed in the host-agent XDP blocklist (0 = disabled)
-    #[arg(allow_hyphen_values = true, long = "jail-threshold", default_value = "5", value_parser = parse_int_flag)]
+    /// WAF blocks within the window before an IP is jailed in the host-agent XDP blocklist on every app (default 0 = off; an app's block policy with target "kernel" jails without it)
+    #[arg(allow_hyphen_values = true, long = "jail-threshold", default_value = "0", value_parser = parse_int_flag)]
     pub jail_threshold: i64,
     /// jail sliding window in seconds
     #[arg(allow_hyphen_values = true, long = "jail-window-sec", default_value = "60", value_parser = parse_int_flag)]

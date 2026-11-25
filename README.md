@@ -494,6 +494,33 @@ unit file lists, with what stays writable. The Rust
 agent has not been started under the unit on a real systemd yet: test a start, a reload and a script rule on a test host
 before a production host.
 
+## Block policy and the host firewall
+
+The `block_policy` of an app's `rules_json` counts blocks per client and opens a block window (`block_after_n_blocks`
+blocks, `block_duration_sec` long). Its `target` says where the window applies:
+
+- `"waf"` (the default, also when `target` is missing or empty): the agent refuses the client's requests while the window
+  is open, and nothing else happens.
+- `"kernel"`: the agent also pushes the client address to the host agent's XDP jail for the time left in the window (at
+  least one second), so the kernel drops its packets on every port of the host. A window is pushed once. An app in
+  monitor mode never pushes.
+
+Any other value is refused when the rules load: `block_policy.target must be waf or kernel`.
+
+The address is the client address of the request. If it came from forwarded headers, it is pushed only when the TCP peer
+is loopback (a web server on the same host). Behind any other proxy the push is skipped and counted as
+`forwarded_remote_peer` in `wafio_waf_jail_refused`. The other refusals of the jail (loopback, an address of this host,
+the control plane, a trusted proxy, link-local) apply as well.
+
+The push goes to the host agent at `--jail-url` (default `http://127.0.0.1:18089/api/ebpf/blocklist`) with the token in
+`--jail-token-file` (`WAFIO_LOCAL_API_TOKEN_FILE`, default `/run/wafio/host-agent.token`), which is read on every push. With an
+empty `--jail-url` the agent logs once that the kernel target has nothing to push to, and the WAF block still applies. With
+an unreadable token the pushes are skipped and the skip is logged every five minutes.
+
+`--jail-threshold N` is a separate, agent-wide jail: after N blocks of one address within `--jail-window-sec` (default
+60) it is jailed for `--jail-duration-sec` (default 3600) on every app, whatever the block policy says. It is off by default
+(0). Before v2.2.1 the default was 5.
+
 ## HTTPS from the agent
 
 By default an app listens on plain HTTP, where its bundle says, and a proxy or load balancer in front of the agent ends TLS. An

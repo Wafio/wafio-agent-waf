@@ -188,6 +188,87 @@ fn jail_hook_skips_forwarded_and_coverage_raised() {
     report_block_to_jail(None, "block", false, false, "203.0.113.51");
 }
 
+fn until_in(d: Duration) -> SystemTime {
+    SystemTime::now() + d
+}
+
+#[test]
+fn kernel_push_uses_the_time_left_of_the_window() {
+    let _g = clear_jail_guard();
+    let (enf, rx) = channel_enforce();
+    let j = JailTracker::new(0, MIN, HOUR, 1024, Some(enf));
+    report_kernel_block_to_jail(
+        Some(&j),
+        until_in(600 * Duration::from_secs(1)),
+        false,
+        false,
+        "203.0.113.60:5000",
+    );
+    let (ip, ttl) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(ip, "203.0.113.60");
+    assert!(
+        ttl <= Duration::from_secs(600) && ttl >= Duration::from_secs(595),
+        "{ttl:?}"
+    );
+    assert_eq!(j.count("203.0.113.60"), 0, "the flag jail is not involved");
+}
+
+#[test]
+fn kernel_push_is_at_least_one_second_and_once_per_window() {
+    let _g = clear_jail_guard();
+    let (enf, rx) = channel_enforce();
+    let j = JailTracker::new(0, MIN, HOUR, 1024, Some(enf));
+    let until = until_in(Duration::from_millis(10));
+    j.jail_until("203.0.113.61", until);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ("203.0.113.61".to_string(), Duration::from_secs(1))
+    );
+    j.jail_until("203.0.113.61", until);
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "pushed twice"
+    );
+    j.jail_until("203.0.113.61", until_in(MIN));
+    assert!(
+        rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "a later window is pushed"
+    );
+}
+
+#[test]
+fn kernel_push_forwarded_client_needs_a_loopback_peer() {
+    let _g = clear_jail_guard();
+    let (enf, rx) = channel_enforce();
+    let j = JailTracker::new(0, MIN, HOUR, 1024, Some(enf));
+    let before = jail_exemption_count(JAIL_EXEMPT_FORWARDED_REMOTE_PEER);
+    report_kernel_block_to_jail(Some(&j), until_in(MIN), true, false, "203.0.113.62");
+    assert_eq!(
+        jail_exemption_count(JAIL_EXEMPT_FORWARDED_REMOTE_PEER),
+        before + 1
+    );
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    report_kernel_block_to_jail(Some(&j), until_in(MIN), true, true, "203.0.113.62");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap().0,
+        "203.0.113.62"
+    );
+}
+
+#[test]
+fn kernel_push_keeps_the_guard_exemptions_and_survives_no_enforcer() {
+    let _g = clear_jail_guard();
+    let (enf, rx) = channel_enforce();
+    let j = JailTracker::new(0, MIN, HOUR, 1024, Some(enf));
+    let before = jail_exemption_count(JAIL_EXEMPT_LOOPBACK);
+    report_kernel_block_to_jail(Some(&j), until_in(MIN), false, true, "127.0.0.1:4000");
+    assert_eq!(jail_exemption_count(JAIL_EXEMPT_LOOPBACK), before + 1);
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    let bare = JailTracker::new(0, MIN, HOUR, 1024, None);
+    report_kernel_block_to_jail(Some(&bare), until_in(MIN), false, false, "203.0.113.63");
+    report_kernel_block_to_jail(None, until_in(MIN), false, false, "203.0.113.63");
+}
+
 fn scratch_file(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("wafio-agent-io-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
