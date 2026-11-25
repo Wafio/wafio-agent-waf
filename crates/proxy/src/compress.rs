@@ -25,7 +25,7 @@ pub(crate) const MAX_BODY: usize = 8 << 20;
 const INLINE_MAX: usize = 64 << 10;
 const BROTLI_QUALITY: u32 = 4;
 const BROTLI_WINDOW: u32 = 22;
-const GZIP_LEVEL: u32 = 5;
+const GZIP_LEVEL: u8 = 5;
 /// What is read of `Accept-Encoding`: the first KiB, the first 16 tokens.
 const ACCEPT_ENCODING_BYTES: usize = 1024;
 const ACCEPT_ENCODING_TOKENS: usize = 16;
@@ -218,9 +218,12 @@ fn encode(encoding: Encoding, body: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(body.len() / 3 + 64);
     match encoding {
         Encoding::Gzip => {
-            let mut w = flate2::write::GzEncoder::new(out, flate2::Compression::new(GZIP_LEVEL));
-            w.write_all(body).ok()?;
-            w.finish().ok()
+            // One member: header (no flags, no mtime, OS unknown), raw deflate, CRC-32 and size.
+            out.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]);
+            out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(body, GZIP_LEVEL));
+            out.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            Some(out)
         }
         Encoding::Brotli => {
             {
@@ -578,6 +581,66 @@ mod tests {
         }
         let gzip = encode(Encoding::Gzip, b"x").unwrap();
         assert_eq!(&gzip[..2], &[0x1f, 0x8b], "a gzip member, not raw deflate");
+    }
+
+    /// CRC-32 by its bitwise definition, so the trailer is not checked with the code that wrote it.
+    fn crc32_bitwise(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn gzip_member_is_read_by_another_decoder() {
+        let mut text = Vec::new();
+        for i in 0..40_000u32 {
+            text.extend_from_slice(format!("line {i} of some <b>text</b>\n").as_bytes());
+        }
+        // Bytes that do not compress, so the deflate stream holds stored or near-stored blocks.
+        let mut noise = Vec::new();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        while noise.len() < 300_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            noise.extend_from_slice(&state.to_le_bytes());
+        }
+        let big = [text, noise].concat();
+        assert!(big.len() > 1 << 20);
+        for body in [&b""[..], b"a", b"hello hello hello hello", &big] {
+            let packed = encode(Encoding::Gzip, body).unwrap();
+            let (head, rest) = packed.split_at(10);
+            let (deflated, trailer) = rest.split_at(rest.len() - 8);
+            assert_eq!(
+                head,
+                [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff],
+                "{}",
+                body.len()
+            );
+            assert_eq!(
+                trailer[..4],
+                crc32_bitwise(body).to_le_bytes(),
+                "CRC-32 of {}",
+                body.len()
+            );
+            assert_eq!(
+                trailer[4..],
+                (body.len() as u32).to_le_bytes(),
+                "ISIZE of {}",
+                body.len()
+            );
+            let mut raw = Vec::new();
+            flate2::read::DeflateDecoder::new(deflated)
+                .read_to_end(&mut raw)
+                .unwrap();
+            assert_eq!(raw, body, "deflate part of {}", body.len());
+            assert_eq!(decode(Encoding::Gzip, &packed), body, "{}", body.len());
+        }
     }
 
     fn request(head: &str) -> InboundRequest {
