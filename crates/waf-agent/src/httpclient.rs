@@ -396,26 +396,70 @@ pub struct RequestOptions<'a> {
 
 /// How a request reaches its server.
 struct Plan {
-    peer: HttpPeer,
+    /// Every address of the server's name, tried in the order it resolved; a tunnel has one.
+    peers: Vec<HttpPeer>,
     /// The request line carries the absolute URI (plain HTTP through an HTTP proxy).
     absolute: bool,
     /// `Proxy-Authorization` for that proxy.
     proxy_auth: Option<String>,
 }
 
-/// `host:port` resolved by the system (blocking lookup off the runtime).
-async fn lookup(host: &str, port: u16, what: &'static str) -> Result<std::net::SocketAddr, String> {
+/// Every address of `host:port`, in the order the system resolved them (blocking lookup off the
+/// runtime).
+async fn lookup(
+    host: &str,
+    port: u16,
+    what: &'static str,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     let addr = proxy_env::format_host_port(host, &port.to_string());
     let host = host.to_string();
     tokio::task::spawn_blocking(move || {
         use std::net::ToSocketAddrs;
-        addr.to_socket_addrs()
+        let addrs: Vec<_> = addr
+            .to_socket_addrs()
             .map_err(|e| format!("{what}: resolve {host}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("{what}: resolve {host}: no address found"))
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("{what}: resolve {host}: no address found"));
+        }
+        Ok(addrs)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The first of `peers` that `connect` reaches. Only a failed connect moves on to the next address
+/// (a host whose IPv6 route is broken still answers on IPv4); a TLS or later error is the answer,
+/// and so is the error of the last address tried.
+async fn first_connected<T, F, Fut>(
+    peers: &[HttpPeer],
+    deadline: tokio::time::Instant,
+    mut connect: F,
+) -> Result<T, String>
+where
+    F: FnMut(HttpPeer) -> Fut,
+    Fut: std::future::Future<Output = pingora::Result<T>>,
+{
+    let mut last = "connect: no address".to_string();
+    for p in peers {
+        match connect(p.clone()).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = e.to_string();
+                let not_reached = matches!(
+                    e.etype(),
+                    pingora::ErrorType::ConnectTimedout
+                        | pingora::ErrorType::ConnectRefused
+                        | pingora::ErrorType::ConnectNoRoute
+                        | pingora::ErrorType::ConnectError
+                );
+                if !not_reached || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last)
 }
 
 fn peer(addr: std::net::SocketAddr, tls: bool, sni: &str) -> HttpPeer {
@@ -428,9 +472,9 @@ fn peer(addr: std::net::SocketAddr, tls: bool, sni: &str) -> HttpPeer {
 async fn plan(t: &Target, ua: &str, proxies: &ProxyConfig) -> Result<Plan, String> {
     let scheme = if t.tls { "https" } else { "http" };
     let Some(p) = proxies.proxy_for(scheme, &t.host, &t.port_text)? else {
-        let addr = lookup(&t.host, t.port, "connect").await?;
+        let addrs = lookup(&t.host, t.port, "connect").await?;
         return Ok(Plan {
-            peer: peer(addr, t.tls, &t.host),
+            peers: addrs.into_iter().map(|a| peer(a, t.tls, &t.host)).collect(),
             absolute: false,
             proxy_auth: None,
         });
@@ -442,11 +486,14 @@ async fn plan(t: &Target, ua: &str, proxies: &ProxyConfig) -> Result<Plan, Strin
             .port
             .parse()
             .unwrap_or(if p.scheme == "https" { 443 } else { 80 });
-        let addr = lookup(&p.host, port, "connect")
+        let addrs = lookup(&p.host, port, "connect")
             .await
             .map_err(|e| format!("connect to proxy: {e}"))?;
         return Ok(Plan {
-            peer: peer(addr, p.scheme == "https", &p.host),
+            peers: addrs
+                .into_iter()
+                .map(|a| peer(a, p.scheme == "https", &p.host))
+                .collect(),
             absolute: true,
             proxy_auth: p.basic_authorization(),
         });
@@ -457,7 +504,7 @@ async fn plan(t: &Target, ua: &str, proxies: &ProxyConfig) -> Result<Plan, Strin
     let mut peer = peer(([0, 0, 0, 0], 0).into(), t.tls, &t.host);
     peer.options.custom_l4 = Some(Arc::new(Tunnel(std::sync::Mutex::new(Some(stream)))));
     Ok(Plan {
-        peer,
+        peers: vec![peer],
         absolute: false,
         proxy_auth: None,
     })
@@ -611,10 +658,11 @@ async fn once(
     let t = parse(url)?;
     let plan = plan(&t, ua, proxies).await?;
     let connector = Connector::new(None);
-    let (mut s, _) = connector
-        .get_http_session(&plan.peer)
-        .await
-        .map_err(|e| e.to_string())?;
+    let c = &connector;
+    let (mut s, _) = first_connected(&plan.peers, deadline, |p| async move {
+        c.get_http_session(&p).await
+    })
+    .await?;
     // Whatever is left of the one deadline the whole exchange shares.
     let timeout = deadline
         .saturating_duration_since(tokio::time::Instant::now())
@@ -843,6 +891,49 @@ pub(crate) fn block_on<T>(f: impl std::future::Future<Output = T>) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_address_moves_on_to_the_next_and_a_tls_error_does_not() {
+        let peers: Vec<HttpPeer> = (1..=2)
+            .map(|i| peer(([127, 0, 0, i], 443).into(), true, "h"))
+            .collect();
+        fn fail<T>(t: pingora::ErrorType) -> pingora::Result<T> {
+            Err(pingora::Error::explain(t, "test"))
+        }
+        let later = tokio::time::Instant::now() + Duration::from_secs(60);
+        let run = |first: pingora::ErrorType, deadline| {
+            let mut tried = 0;
+            let got = block_on(first_connected(&peers, deadline, |_| {
+                tried += 1;
+                std::future::ready(if tried == 1 {
+                    fail(first.clone())
+                } else {
+                    Ok(tried)
+                })
+            }));
+            (got.map_err(|e| e.contains("test")), tried)
+        };
+        assert_eq!(run(pingora::ErrorType::ConnectRefused, later), (Ok(2), 2));
+        assert_eq!(run(pingora::ErrorType::ConnectTimedout, later), (Ok(2), 2));
+        assert_eq!(run(pingora::ErrorType::ConnectNoRoute, later), (Ok(2), 2));
+        assert_eq!(
+            run(pingora::ErrorType::TLSHandshakeFailure, later),
+            (Err(true), 1)
+        );
+        assert_eq!(run(pingora::ErrorType::InvalidCert, later), (Err(true), 1));
+        let past = tokio::time::Instant::now();
+        assert_eq!(
+            run(pingora::ErrorType::ConnectRefused, past),
+            (Err(true), 1)
+        );
+        let mut tried = 0;
+        let all_refused = block_on(first_connected(&peers, later, |_| {
+            tried += 1;
+            std::future::ready(fail::<()>(pingora::ErrorType::ConnectRefused))
+        }));
+        assert!(all_refused.unwrap_err().contains("test"));
+        assert_eq!(tried, 2);
+    }
 
     #[test]
     fn url_parts_and_redirects() {
