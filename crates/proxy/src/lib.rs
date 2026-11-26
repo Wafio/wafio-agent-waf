@@ -8,38 +8,54 @@
 //! WebSocket frames, own SIGUSR2 handover (`upgrade`).
 //!
 //! Entry points for the binary: [`Proxy::new`], [`Proxy::apply`] (a bundle's apps, atomically),
-//! [`Proxy::shutdown`], [`Proxy::handover_fds`], [`runtime_builder`], the decision sink in
-//! [`ProxyOptions`] and the counters in [`metrics`].
+//! [`Proxy::certificates`] (what the TLS listeners serve), [`Proxy::shutdown`],
+//! [`Proxy::handover_fds`], [`runtime_builder`], the decision sink in [`ProxyOptions`] and the
+//! counters in [`metrics`].
 
 // One audited `unsafe` site in this crate carries `#[allow(unsafe_code)]`; anything new needs the same, with its reason.
 #![deny(unsafe_code)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod body_reader;
+mod cache;
+pub mod cert_store;
+pub mod client_hello;
+mod compress;
 pub mod config;
 pub mod decision;
+mod edge_stats;
 pub mod fastcgi;
 pub mod head_parser;
+pub(crate) mod https;
 pub mod listeners;
 pub(crate) mod maintenance;
 pub mod metrics;
 pub mod pipeline;
 pub mod proxy;
+mod redirect;
 pub mod request;
 pub mod response;
 pub mod route;
 pub mod siem;
+mod signed_in;
 pub mod sniff;
+mod static_files;
 #[doc(hidden)]
 pub mod testing;
 pub mod upgrade;
 pub mod upstream;
 pub mod websocket;
 
-pub use config::{AppAnalysisSetup, AppSpec};
+pub use cache::{
+    AppMetrics, CacheCounters, CacheHost, CacheLimits, CacheRefusal, CacheRefusalCode, CacheRule,
+    CacheSpec, CacheTotals, HostFacts, PurgeError, PurgeScope, valid_app_id,
+};
+pub use config::{AppAnalysisSetup, AppSpec, CompressionSpec, MAX_MIN_COMPRESS_BYTES, TlsSite};
 pub use decision::{DecisionEvent, DecisionSink};
+pub use edge_stats::CompressionCounters;
 pub use proxy::{Proxy, ProxyOptions};
 pub use siem::{SiemEvent, SiemEventSender};
+pub use static_files::{MAX_BROWSER_CACHE_S, RefusalCode, StaticRefusal, StaticSpec};
 
 use std::cell::Cell;
 
@@ -204,13 +220,15 @@ pub fn set_block_in_place(on: bool) {
 /// threads and the per-request memory stay bounded; the rest wait here, holding no thread.
 fn detection_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SLOTS.get_or_init(|| {
-        let workers = match WORKERS.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => std::thread::available_parallelism().map_or(1, usize::from),
-            n => n,
-        };
-        tokio::sync::Semaphore::new(workers.max(2))
-    })
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(worker_count().max(2)))
+}
+
+/// The worker threads of the runtime, or the CPUs when it was not built by [`runtime_builder`].
+fn worker_count() -> usize {
+    match WORKERS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => std::thread::available_parallelism().map_or(1, usize::from),
+        n => n,
+    }
 }
 
 /// [`run_detection`] for a request of `weight` bytes (its body): a big one first waits for one of

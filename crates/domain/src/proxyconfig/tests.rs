@@ -224,3 +224,62 @@ fn decoder_semantics() {
         "proxy_config: timeouts.connect_ms: expected an integer, got a string"
     );
 }
+
+#[test]
+fn strip_path_prefix_table() {
+    let long_ok = format!("/{}", "a".repeat(255));
+    let long_bad = format!("/{}", "a".repeat(256));
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("empty means none", "", None),
+        ("one segment", "/shop", None),
+        ("two segments", "/a/b", None),
+        ("dots and dashes inside a name", "/v1.2/my-app_x", None),
+        ("longest", &long_ok, None),
+        (
+            "over the limit",
+            &long_bad,
+            Some("is longer than 256 bytes"),
+        ),
+        ("no leading slash", "shop", Some("must start with /")),
+        ("only a slash", "/", Some("must not end with /")),
+        ("trailing slash", "/shop/", Some("must not end with /")),
+        ("empty segment", "/a//b", Some("has an empty segment")),
+        ("dot segment", "/a/./b", Some("has a . or .. segment")),
+        ("dot dot segment", "/a/..", Some("has a . or .. segment")),
+        ("a name that only starts with dots", "/..a", None),
+    ];
+    for (name, prefix, want) in cases {
+        assert_eq!(strip_path_prefix_fault(prefix), *want, "{name}");
+    }
+    for bad in [
+        "/a b",
+        "/a?b",
+        "/a#b",
+        "/a%2Fb",
+        "/a\\b",
+        "/a\tb",
+        "/caf\u{e9}",
+        "/a\u{7f}",
+    ] {
+        assert!(
+            strip_path_prefix_fault(bad).is_some_and(|why| why.starts_with("holds a space")),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn strip_path_prefix_is_read_checked_and_defaults_to_none() {
+    assert_eq!(parse_proxy_config(b"{}").unwrap().strip_path_prefix, "");
+    let pc = parse_proxy_config(br#"{"Strip_Path_Prefix":"/shop"}"#).unwrap();
+    assert_eq!(pc.strip_path_prefix, "/shop");
+    pc.validate().unwrap();
+    let pc = parse_proxy_config(br#"{"strip_path_prefix":null}"#).unwrap();
+    assert_eq!(pc.strip_path_prefix, "");
+    assert!(parse_proxy_config(br#"{"strip_path_prefix":7}"#).is_err());
+    let pc = parse_proxy_config(br#"{"strip_path_prefix":"/a/../b"}"#).unwrap();
+    assert_eq!(
+        pc.validate().unwrap_err().0,
+        "strip_path_prefix has a . or .. segment"
+    );
+}

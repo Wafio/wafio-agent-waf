@@ -192,8 +192,8 @@ pub struct AgentArgs {
     )]
     pub iprep_level2_file: String,
 
-    /// WAF blocks within the window before an IP is jailed in the host-agent XDP blocklist (0 = disabled)
-    #[arg(allow_hyphen_values = true, long = "jail-threshold", default_value = "5", value_parser = parse_int_flag)]
+    /// WAF blocks within the window before an IP is jailed in the host-agent XDP blocklist on every app (default 0 = off; an app's block policy with target "kernel" jails without it)
+    #[arg(allow_hyphen_values = true, long = "jail-threshold", default_value = "0", value_parser = parse_int_flag)]
     pub jail_threshold: i64,
     /// jail sliding window in seconds
     #[arg(allow_hyphen_values = true, long = "jail-window-sec", default_value = "60", value_parser = parse_int_flag)]
@@ -233,6 +233,14 @@ pub struct AgentArgs {
         hide_default_value = true
     )]
     pub engine_lib: String,
+    /// the ACME directory certificates are ordered from for apps served over HTTPS (https only; env WAFIO_ACME_DIRECTORY; default Let's Encrypt)
+    #[arg(
+        allow_hyphen_values = true,
+        long = "acme-directory",
+        default_value = "",
+        hide_default_value = true
+    )]
+    pub acme_directory: String,
     /// age after which a cached bundle is reported stale in the heartbeat (still applied; env WAFIO_BUNDLE_CACHE_MAX_AGE)
     #[arg(allow_hyphen_values = true, long = "bundle-cache-max-age", default_value = "168h0m0s", value_parser = parse_duration_flag)]
     pub bundle_cache_max_age: i64,
@@ -307,6 +315,13 @@ impl AgentArgs {
         fill(&mut self.bot_ja3_file, "WAFIO_JA3_BLACKLIST_FILE");
         fill(&mut self.iprep_level1_file, "WAFIO_IPREP_LEVEL1_FILE");
         fill(&mut self.iprep_level2_file, "WAFIO_IPREP_LEVEL2_FILE");
+        fill(&mut self.acme_directory, "WAFIO_ACME_DIRECTORY");
+        if !env.get("WAFIO_TLS_SITES_FILE").is_empty() {
+            logs.push(
+                "[wafio-waf-agent] WARNING: WAFIO_TLS_SITES_FILE is no longer read: the HTTPS settings of an app come from the dashboard"
+                    .to_string(),
+            );
+        }
         self.state_dir = choose_state_dir(
             &self.state_dir,
             &env.get("WAFIO_STATE_DIR"),
@@ -385,6 +400,25 @@ impl AgentArgs {
             }
         }
         Ok(())
+    }
+
+    /// The ACME directory the agent orders from: the one named, or the production one of Let's
+    /// Encrypt. The agent signs its requests with its account key and the issued chain comes back
+    /// the same way, so only an https address is accepted.
+    pub fn resolved_acme_directory(&self) -> Result<String, String> {
+        let url = self.acme_directory.trim();
+        if url.is_empty() {
+            return Ok(crate::tls::acme::DEFAULT_DIRECTORY.to_owned());
+        }
+        match url.get(..8) {
+            Some(scheme) if scheme.eq_ignore_ascii_case("https://") && url.len() > 8 => {
+                Ok(url.to_owned())
+            }
+            _ => Err(format!(
+                "--acme-directory: {} is not an https address",
+                wafio_domain::text_helpers::quote(url.as_bytes())
+            )),
+        }
     }
 
     /// The security-data directory: `--security-data-dir` (or its env), else the one the deprecated

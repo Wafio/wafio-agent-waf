@@ -22,3 +22,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 prost.workspace = true
+# start_paused: the retry waits are minutes long.
+tokio = { workspace = true, features = ["test-util"] }

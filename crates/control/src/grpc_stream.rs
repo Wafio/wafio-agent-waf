@@ -1,8 +1,12 @@
 //! The WAF agent's mTLS gRPC stream to the control plane (`AgentControl.Stream`). Its state lives
 //! in one [`ControlLink`] per process.
 
-use crate::bundle_cache::BUNDLE_SOURCE_LIVE;
+use crate::bundle_cache::{
+    BUNDLE_SOURCE_LIVE, CacheStart, CacheWrite, CacheWriter, CachedBundle, save_bundle_cache,
+};
 use crate::bundle_puller::{BundleError, BundleProbe, BundleSink, is_management_only};
+use crate::certificates::{AckCode, CertificateSink, run_install};
+use crate::edge::{EdgeSink, PurgeCode};
 use crate::grpc_reconnect::{
     GRPC_CLIENT_KEEPALIVE_TIME, GRPC_CLIENT_KEEPALIVE_TIMEOUT, ReconnectBackoff, jitter,
 };
@@ -23,11 +27,14 @@ use wafio_proto::v1::agent_control_client::AgentControlClient;
 use wafio_proto::v1::agent_message::Kind as Out;
 use wafio_proto::v1::server_message::Kind as In;
 use wafio_proto::v1::{
-    AgentMessage, BundleUpdate, CommandAck, FetchSecurityData, Heartbeat, Hello,
+    AgentMessage, BundleUpdate, CachePurge, CertificateInstall, CertificateStatus, CommandAck,
+    FetchSecurityData, Heartbeat, Hello,
 };
 
 /// Heartbeat period; `Welcome.heartbeat_seconds` is ignored.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the edge statuses go out again, with fresh counters.
+const EDGE_STATUS_INTERVAL: Duration = Duration::from_secs(60);
 /// Bound on the initial handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Connect timeout.
@@ -37,10 +44,12 @@ const STREAM_SEND_BUFFER: usize = 16;
 /// Default security-data base directory.
 pub const DEFAULT_SECURITY_DATA_DIR: &str = "/etc/wafio/security-data";
 
-/// Retry bounds for a WAF configuration bundle whose apply failed.
+/// Retry bounds for a WAF configuration bundle whose apply failed. The longest wait is also the
+/// fixed wait of a bundle whose address cannot be bound.
 pub(crate) const WAF_BUNDLE_RETRY_MIN: Duration = Duration::from_secs(2);
-pub(crate) const WAF_BUNDLE_RETRY_MAX: Duration = Duration::from_secs(60);
-/// About 8 minutes of retries; a bundle refused for good must not cost a rebuild forever.
+pub const WAF_BUNDLE_RETRY_MAX: Duration = Duration::from_secs(60);
+/// About 8 minutes of retries; a bundle refused for good must not cost a rebuild forever. A bundle
+/// refused because an address is taken is another case: it retries without a limit.
 pub(crate) const WAF_BUNDLE_RETRY_ATTEMPTS: u32 = 10;
 
 /// The security-data components of the agent profile.
@@ -173,6 +182,8 @@ pub trait AgentStats: Send + Sync + 'static {
 /// The agent-side pieces the link calls into.
 pub struct Hooks {
     pub bundles: Arc<dyn BundleSink>,
+    pub certificates: Arc<dyn CertificateSink>,
+    pub edge: Arc<dyn EdgeSink>,
     pub stats: Arc<dyn AgentStats>,
     pub security_data: Arc<dyn SecurityData>,
     pub redact: Redactor,
@@ -270,6 +281,17 @@ fn ack(command_id: String, ok: bool, error: String) -> AgentMessage {
     }
 }
 
+/// The ack of an install: empty `error` on success, else the code's contract string.
+fn install_ack(command_id: String, res: Result<(), AckCode>) -> AgentMessage {
+    ack(
+        command_id,
+        res.is_ok(),
+        res.err()
+            .map(|c| c.as_str().to_string())
+            .unwrap_or_default(),
+    )
+}
+
 pub(crate) async fn send_bundle_ack(
     send: &StreamSender,
     command_id: &str,
@@ -293,12 +315,30 @@ pub struct ControlLink {
     active: Mutex<Option<StreamSender>>,
     telemetry: Telemetry,
     malware_lock: tokio::sync::Mutex<()>,
+    /// The latest certificate status of each app that the stream has not taken yet.
+    statuses: Mutex<BTreeMap<String, CertificateStatus>>,
+    /// Wakes the status task; one pending wake-up is enough, as it drains `statuses`.
+    status_wake: mpsc::Sender<()>,
+    /// Wakes the task that sends the edge statuses; one pending wake-up is enough.
+    edge_wake: mpsc::Sender<()>,
+    /// Orders the applies and retries of bundles, the cached one at start included, so a retry
+    /// never lands after a newer bundle.
+    bundle_retry: Arc<BundleRetry>,
+    /// Writes the bundle cache after the bundle is acked.
+    pub(crate) cache_writer: CacheWriter,
 }
 
 impl ControlLink {
-    /// Arms the link and starts the decision drainer. Call inside a Tokio runtime, before
-    /// the proxy emits decisions.
+    /// Arms the link and starts the decision drainer and the certificate status task. Call inside
+    /// a Tokio runtime, before the proxy emits decisions.
     pub fn new(cfg: ControlConfig, hooks: Hooks) -> Arc<Self> {
+        Self::with_cache_write(cfg, hooks, Arc::new(save_bundle_cache))
+    }
+
+    /// [`ControlLink::new`] with `write` as the way a bundle reaches the cache directory.
+    pub fn with_cache_write(cfg: ControlConfig, hooks: Hooks, write: CacheWrite) -> Arc<Self> {
+        let (status_wake, status_wake_rx) = mpsc::channel(1);
+        let (edge_wake, edge_wake_rx) = mpsc::channel(1);
         let link = Arc::new(ControlLink {
             control_config: Mutex::new(cfg),
             hooks,
@@ -307,11 +347,21 @@ impl ControlLink {
             active: Mutex::new(None),
             telemetry: Telemetry::new(),
             malware_lock: tokio::sync::Mutex::const_new(()),
+            statuses: Mutex::new(BTreeMap::new()),
+            status_wake,
+            edge_wake,
+            bundle_retry: Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX)),
+            cache_writer: CacheWriter::new(write),
         });
         (link.hooks.on_dial)(&link.config().server_address);
         if let Some(rx) = link.telemetry.rx.lock().unwrap().take() {
             tokio::spawn(flush_decision_queue(Arc::downgrade(&link), rx));
         }
+        tokio::spawn(send_certificate_statuses(
+            Arc::downgrade(&link),
+            status_wake_rx,
+        ));
+        tokio::spawn(send_edge_statuses(Arc::downgrade(&link), edge_wake_rx));
         link
     }
 
@@ -346,6 +396,26 @@ impl ControlLink {
         self.telemetry.emit(ev);
     }
 
+    /// Hands a certificate status to the stream without blocking, from any thread. A newer status
+    /// of the same app replaces one that has not gone out yet, and a status reported while no
+    /// stream is up is dropped. When to report, and how often, is for the caller to decide.
+    pub fn report_certificate_status(&self, status: CertificateStatus) {
+        self.statuses
+            .lock()
+            .unwrap()
+            .insert(status.app_id.clone(), status);
+        // A full channel means a wake-up is already waiting.
+        let _ = self.status_wake.try_send(());
+    }
+
+    /// Asks for the edge statuses to go out now: the settings of an app or what the agent counts
+    /// changed. Without a stream nothing goes out; the next connect sends them. Callable from any
+    /// thread.
+    pub fn report_edge(&self) {
+        // A full channel means a wake-up is already waiting.
+        let _ = self.edge_wake.try_send(());
+    }
+
     /// One dial + Hello + Welcome within 12 s, so bad credentials fail the start instead of
     /// looping.
     pub async fn exchange_hello(&self) -> Result<(), LinkError> {
@@ -359,22 +429,33 @@ impl ControlLink {
         }
     }
 
-    /// Apply the cached bundle, then keep the stream up with backoff. Abort the handle to
-    /// stop.
+    /// Apply the cached bundle, then keep the stream up with backoff. A cached bundle that cannot
+    /// bind an address is applied again every minute until it binds or a live bundle arrives.
+    /// Abort the handle to stop: that ends every bundle retry too.
     pub fn start(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let link = self.clone();
         tokio::spawn(async move {
             let l = link.clone();
-            let _ = tokio::task::spawn_blocking(move || l.install_cached_bundle()).await;
-            link.run_stream_loop().await;
+            // Bundle retries outlive a stream and end with this task.
+            let mut retries = JoinSet::new();
+            if let Ok(CacheStart::Bind(cached)) =
+                tokio::task::spawn_blocking(move || l.install_cached_bundle()).await
+            {
+                let generation = cached.generation;
+                let attempt = link.cached_attempt(cached);
+                link.bundle_retry
+                    .retry_cached(generation, attempt, &mut retries)
+                    .await;
+            }
+            link.run_stream_loop(&mut retries).await;
         })
     }
 
-    async fn run_stream_loop(self: Arc<Self>) {
+    async fn run_stream_loop(self: Arc<Self>, retries: &mut JoinSet<()>) {
         let mut backoff = ReconnectBackoff::default();
         loop {
             let started = Instant::now();
-            let res = self.connect_and_serve().await;
+            let res = self.connect_and_serve(retries).await;
             let wait = backoff.delay(started.elapsed());
             if let Err(e) = res {
                 info!(
@@ -386,13 +467,16 @@ impl ControlLink {
         }
     }
 
-    async fn connect_and_serve(self: &Arc<Self>) -> Result<(), LinkError> {
+    async fn connect_and_serve(
+        self: &Arc<Self>,
+        retries: &mut JoinSet<()>,
+    ) -> Result<(), LinkError> {
         let cfg = self.config();
         (self.hooks.on_dial)(&cfg.server_address);
         let client = connect(&cfg).await?;
         let (tx, rx) = mpsc::channel(STREAM_SEND_BUFFER);
         let (send, alive) = StreamSender::new(tx);
-        let retry = Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX));
+        let retry = self.bundle_retry.clone();
 
         let known_gen = *self.last_gen.lock().unwrap();
         send.send(hello(&cfg, known_gen))
@@ -412,8 +496,11 @@ impl ControlLink {
             "[agent-grpc] connected to {} as {:?}",
             cfg.server_address, cfg.agent_name
         );
+        // The control plane may keep what it was told on the last stream, but the counters are
+        // fresh and the bundle in force may have changed while no stream was up.
+        self.report_edge();
 
-        // Everything this stream starts ends with it.
+        // Everything this stream starts ends with it, except a bundle retry.
         let mut tasks = JoinSet::new();
         tasks.spawn(self.clone().heartbeat_loop(send.clone()));
 
@@ -425,6 +512,7 @@ impl ControlLink {
             .into_inner();
         loop {
             while tasks.try_join_next().is_some() {}
+            while retries.try_join_next().is_some() {}
             let msg = match inbound.message().await {
                 Ok(Some(m)) => m,
                 Ok(None) => return Ok(()),
@@ -436,8 +524,11 @@ impl ControlLink {
                     tasks.spawn(self.clone().on_welcome(client.clone(), send.clone()));
                 }
                 Some(In::Bundle(bu)) => {
+                    // The retry outlives this stream: a reconnect does not wait for an address to
+                    // come free, and its ack on the closed stream is dropped (the next hello
+                    // carries the generation).
                     retry
-                        .handle(bu, self.bundle_attempt(), send.clone(), &mut tasks)
+                        .handle(bu, self.bundle_attempt(), send.clone(), retries)
                         .await
                 }
                 Some(In::KeyRotation(kr)) => {
@@ -470,9 +561,46 @@ impl ControlLink {
                         send.clone(),
                     ));
                 }
+                Some(In::CertificateInstall(ci)) => self.handle_install(ci, &send).await,
+                Some(In::CachePurge(cp)) => self.handle_purge(cp, &send).await,
                 None => {}
             }
         }
+    }
+
+    /// Runs the install and acks it before the next message is read, so an install and the
+    /// bundles around it are handled, and acked, in the order the stream delivered them.
+    async fn handle_install(&self, install: CertificateInstall, send: &StreamSender) {
+        // The ids only: the message itself is never formatted.
+        let (command_id, app_id, certificate_id) = (
+            install.command_id.clone(),
+            install.app_id.clone(),
+            install.certificate_id.clone(),
+        );
+        let res = run_install(self.hooks.certificates.clone(), install).await;
+        match res {
+            Ok(()) => info!(
+                "[agent-grpc] certificate installed app_id={app_id:?} certificate_id={certificate_id:?}"
+            ),
+            Err(code) => info!(
+                "[agent-grpc] certificate refused app_id={app_id:?} certificate_id={certificate_id:?}: {}",
+                code.as_str()
+            ),
+        }
+        let _ = send.send(install_ack(command_id, res)).await;
+    }
+
+    /// Runs the purge and acks it before the next message is read, as an install is.
+    async fn handle_purge(&self, purge: CachePurge, send: &StreamSender) {
+        // The ids only: the address stays out of the log.
+        let (command_id, app_id) = (purge.command_id.clone(), purge.app_id.clone());
+        let sink = self.hooks.edge.clone();
+        let res = tokio::task::spawn_blocking(move || sink.purge(&purge))
+            .await
+            .unwrap_or(Err(PurgeCode::Busy));
+        let code = res.err().map_or("", PurgeCode::as_str);
+        info!("[agent-grpc] cache purge command_id={command_id:?} app_id={app_id:?}: {code:?}");
+        let _ = send.send(ack(command_id, res.is_ok(), code.into())).await;
     }
 
     /// Host info on connect, then every 30 s.
@@ -535,9 +663,21 @@ impl ControlLink {
         Arc::new(move |bu: &BundleUpdate| link.apply_bundle_update(bu))
     }
 
-    /// Decodes and applies a bundle update, and on success records the generation, the
-    /// provenance and the cache. Returns whether a later attempt could succeed.
-    pub(crate) fn apply_bundle_update(&self, bu: &BundleUpdate) -> (bool, Result<(), String>) {
+    /// Applies the cached bundle `cached` again. It is the bundle the attempt carries, not the one
+    /// it is given.
+    fn cached_attempt(self: &Arc<Self>, cached: CachedBundle) -> Attempt {
+        let link = self.clone();
+        Arc::new(move |_| match link.apply_cached_bundle(&cached) {
+            Ok(()) => (Retry::No, Ok(())),
+            Err(BundleError::Bind(e)) => (Retry::UntilBound, Err(e)),
+            Err(e) => (Retry::No, Err(e.to_string())),
+        })
+    }
+
+    /// Decodes and applies a bundle update, and on success records the generation and the
+    /// provenance and queues the cache write. Returns whether and how a later attempt could
+    /// succeed.
+    pub(crate) fn apply_bundle_update(&self, bu: &BundleUpdate) -> (Retry, Result<(), String>) {
         let probe = match BundleProbe::parse(&bu.bundle_json) {
             Ok(p) => p,
             Err(e) => {
@@ -545,7 +685,7 @@ impl ControlLink {
                 // reads four fields only.
                 let e = self.sink().check(&bu.bundle_json).err().unwrap_or(e);
                 info!("[agent-grpc] decode bundle: {e}");
-                return (false, Err(e));
+                return (Retry::No, Err(e));
             }
         };
         // The control plane's generation wins over the embedded one.
@@ -554,20 +694,27 @@ impl ControlLink {
         } else {
             probe.generation
         };
-        match self.hand_bundle_to_sink(&bu.bundle_json, generation, &probe) {
+        let handed = self.hand_bundle_to_sink(&bu.bundle_json, generation, &probe);
+        if !probe.management_only {
+            self.hooks.certificates.bundle_finished();
+        }
+        match handed {
             Ok(()) => {}
             Err(BundleError::Decode(e)) => {
                 info!("[agent-grpc] decode bundle: {e}");
-                return (false, Err(e));
+                return (Retry::No, Err(e));
             }
-            Err(BundleError::Apply(e)) => return (!probe.management_only, Err(e)),
+            Err(BundleError::Apply(e)) if probe.management_only => return (Retry::No, Err(e)),
+            Err(BundleError::Apply(e)) => return (Retry::Backoff, Err(e)),
+            Err(BundleError::Bind(e)) => return (Retry::UntilBound, Err(e)),
         }
         if !probe.management_only {
             *self.last_gen.lock().unwrap() = generation;
             self.set_bundle_status(BUNDLE_SOURCE_LIVE, generation);
-            self.save_applied_bundle(&bu.bundle_json, generation);
+            self.queue_applied_bundle(&bu.bundle_json, generation);
+            self.report_edge();
         }
-        (false, Ok(()))
+        (Retry::No, Ok(()))
     }
 
     /// The observer, then the "applied" log line for configuration bundles.
@@ -728,6 +875,8 @@ fn kind_name(k: &Option<In>) -> &'static str {
         Some(In::KeyRotation(_)) => "*agentv1.ServerMessage_KeyRotation",
         Some(In::Ping(_)) => "*agentv1.ServerMessage_Ping",
         Some(In::FetchSecurityData(_)) => "*agentv1.ServerMessage_FetchSecurityData",
+        Some(In::CertificateInstall(_)) => "*agentv1.ServerMessage_CertificateInstall",
+        Some(In::CachePurge(_)) => "*agentv1.ServerMessage_CachePurge",
     }
 }
 
@@ -913,13 +1062,93 @@ async fn flush_decision_queue(
     }
 }
 
-/// One apply of a bundle: (retryable, result).
-pub(crate) type Attempt = Arc<dyn Fn(&BundleUpdate) -> (bool, Result<(), String>) + Send + Sync>;
+/// The single consumer of the certificate statuses: takes the pending ones one app at a time
+/// and waits for room in the stream, so a status that is replaced meanwhile goes out once, in
+/// its latest form. With no stream up the pending ones are dropped: the next live bundle makes
+/// the agent report again.
+async fn send_certificate_statuses(link: Weak<ControlLink>, mut wake: mpsc::Receiver<()>) {
+    while wake.recv().await.is_some() {
+        loop {
+            let Some(l) = link.upgrade() else { return };
+            let Some((app_id, status)) = l.statuses.lock().unwrap().pop_first() else {
+                break;
+            };
+            let Some(send) = l.active.lock().unwrap().clone() else {
+                l.statuses.lock().unwrap().clear();
+                break;
+            };
+            drop(l);
+            let msg = AgentMessage {
+                kind: Some(Out::CertificateStatus(status)),
+            };
+            if let Err(e) = send.send(msg).await {
+                info!("[agent-grpc] dropping certificate status of app {app_id:?}: {e}");
+            }
+        }
+    }
+}
 
-/// Re-applies the newest failed configuration bundle with backoff until
-/// it applies (then acks it ok under its command id), a newer bundle arrives, the attempts
-/// run out, or the stream ends (the retry runs in the stream's task set). Applies are
-/// serialised through `seq`, so a retry never lands after a newer bundle.
+/// Sends the edge statuses when woken and every minute while a stream is up. The agent builds
+/// them with counters as of the moment, so each send is fresh. A wake-up (a live bundle, a new
+/// stream) asks for every app, the minute tick only for the apps that have an edge part on. With
+/// no stream up the wake-up is dropped: the next connect wakes the task again.
+async fn send_edge_statuses(link: Weak<ControlLink>, mut wake: mpsc::Receiver<()>) {
+    let mut tick = tokio::time::interval(EDGE_STATUS_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick is due at once; a connect wakes the task, so skip it.
+    tick.tick().await;
+    loop {
+        let every_app = tokio::select! {
+            _ = tick.tick() => false,
+            woken = wake.recv() => {
+                if woken.is_none() {
+                    return;
+                }
+                true
+            }
+        };
+        let Some(l) = link.upgrade() else { return };
+        let Some(send) = l.active.lock().unwrap().clone() else {
+            continue;
+        };
+        let sink = l.hooks.edge.clone();
+        drop(l);
+        let statuses = tokio::task::spawn_blocking(move || sink.statuses(every_app))
+            .await
+            .unwrap_or_default();
+        for status in statuses {
+            let app_id = status.app_id.clone();
+            let msg = AgentMessage {
+                kind: Some(Out::EdgeStatus(status)),
+            };
+            if let Err(e) = send.send(msg).await {
+                info!("[agent-grpc] dropping edge status of app {app_id:?}: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// What follows a failed apply of a bundle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retry {
+    /// Nothing: the same bundle would fail the same way.
+    No,
+    /// Again with a growing wait, a limited number of times.
+    Backoff,
+    /// Again at the longest wait, without a limit: an address stays taken for as long as the
+    /// program that holds it runs.
+    UntilBound,
+}
+
+/// One apply of a bundle: (what follows a failure, result).
+pub(crate) type Attempt = Arc<dyn Fn(&BundleUpdate) -> (Retry, Result<(), String>) + Send + Sync>;
+
+/// Re-applies the newest failed configuration bundle with backoff until it applies (then acks it
+/// ok under its command id), a newer bundle arrives, the attempts run out, or the link stops: the
+/// retry runs in the task set of `start`, so a stream that ends does not end it. Applies are
+/// serialised through `seq`, so a retry never lands after a newer bundle. The cached bundle of
+/// the start is retried the same way, and a live bundle ends that retry.
 pub(crate) struct BundleRetry {
     seq: tokio::sync::Mutex<u64>,
     min_wait: Duration,
@@ -953,48 +1182,81 @@ impl BundleRetry {
             *seq += 1; // supersedes any pending retry
         }
         let my_seq = *seq;
-        let (retryable, res) = run_attempt(&attempt, &bu).await;
+        let (retry, res) = run_attempt(&attempt, &bu).await;
         drop(seq);
         send_bundle_ack(&send, &bu.command_id, &res).await;
         let Err(e) = res else { return };
-        if !retryable || management {
+        if retry == Retry::No || management {
             return;
         }
         info!(
             "[agent-grpc] WAF bundle generation {} not applied: {e} (retrying)",
             bu.generation
         );
-        tasks.spawn(self.clone().run_retries(bu, attempt, send, my_seq));
+        tasks.spawn(
+            self.clone()
+                .run_retries(bu, attempt, Some(send), my_seq, retry),
+        );
     }
 
+    /// Retries the cached bundle of `generation` that could not bind an address, without a limit.
+    /// `attempt` applies it. Call before the stream starts: any bundle that arrives later ends
+    /// the retry.
+    pub(crate) async fn retry_cached(
+        self: &Arc<Self>,
+        generation: i64,
+        attempt: Attempt,
+        tasks: &mut JoinSet<()>,
+    ) {
+        let bu = Arc::new(BundleUpdate {
+            generation,
+            ..Default::default()
+        });
+        let my_seq = *self.seq.lock().await;
+        tasks.spawn(
+            self.clone()
+                .run_retries(bu, attempt, None, my_seq, Retry::UntilBound),
+        );
+    }
+
+    /// `send` is where the ack of a retry that applies goes; the cached bundle has none.
     async fn run_retries(
         self: Arc<Self>,
         bu: Arc<BundleUpdate>,
         attempt: Attempt,
-        send: StreamSender,
+        send: Option<StreamSender>,
         my_seq: u64,
+        mut retry: Retry,
     ) {
         let mut wait = self.min_wait;
         let mut n = 1;
         loop {
-            tokio::time::sleep(wait).await;
+            tokio::time::sleep(if retry == Retry::UntilBound {
+                self.max_wait
+            } else {
+                wait
+            })
+            .await;
             let seq = self.seq.lock().await;
             if *seq != my_seq {
                 return; // a newer bundle arrived
             }
-            let (retryable, res) = run_attempt(&attempt, &bu).await;
+            let (next, res) = run_attempt(&attempt, &bu).await;
             drop(seq);
+            retry = next;
             match res {
                 Ok(()) => {
                     info!(
                         "[agent-grpc] WAF bundle generation {} applied on retry",
                         bu.generation
                     );
-                    send_bundle_ack(&send, &bu.command_id, &Ok(())).await;
+                    if let Some(send) = &send {
+                        send_bundle_ack(send, &bu.command_id, &Ok(())).await;
+                    }
                     return;
                 }
-                Err(_) if !retryable => return,
-                Err(e) if n >= WAF_BUNDLE_RETRY_ATTEMPTS => {
+                Err(_) if retry == Retry::No => return,
+                Err(e) if retry == Retry::Backoff && n >= WAF_BUNDLE_RETRY_ATTEMPTS => {
                     info!(
                         "[agent-grpc] WAF bundle generation {} still not applied after {n} retries: {e} (giving up until the next bundle or reconnect)",
                         bu.generation
@@ -1003,18 +1265,20 @@ impl BundleRetry {
                 }
                 Err(_) => {}
             }
-            wait = (wait * 2).min(self.max_wait);
-            n += 1;
+            if retry == Retry::Backoff {
+                wait = (wait * 2).min(self.max_wait);
+                n += 1;
+            }
         }
     }
 }
 
 /// Runs the (blocking) apply off the async workers. A panicking sink is a retryable failure.
-async fn run_attempt(attempt: &Attempt, bu: &Arc<BundleUpdate>) -> (bool, Result<(), String>) {
+async fn run_attempt(attempt: &Attempt, bu: &Arc<BundleUpdate>) -> (Retry, Result<(), String>) {
     let (a, b) = (attempt.clone(), bu.clone());
     tokio::task::spawn_blocking(move || a(&b))
         .await
-        .unwrap_or_else(|_| (true, Err("bundle apply panicked".into())))
+        .unwrap_or_else(|_| (Retry::Backoff, Err("bundle apply panicked".into())))
 }
 
 #[derive(serde::Serialize)]
@@ -1177,9 +1441,12 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             if c.fetch_add(1, Ordering::SeqCst) < 2 {
-                (true, Err("WAF bundle observer is not ready".into()))
+                (
+                    Retry::Backoff,
+                    Err("WAF bundle observer is not ready".into()),
+                )
             } else {
-                (false, Ok(()))
+                (Retry::No, Ok(()))
             }
         });
         let r = Arc::new(BundleRetry::new(
@@ -1201,7 +1468,7 @@ mod tests {
         assert!(got[1].ok && got[1].command_id == "init-1");
     }
 
-    // A newer bundle supersedes the retry of an older one; a retry ends with the stream.
+    // A newer bundle supersedes the retry of an older one; a retry ends with its task set.
     #[tokio::test]
     async fn bundle_retry_superseded_and_stream_bound() {
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -1209,10 +1476,10 @@ mod tests {
         let attempt: Attempt = Arc::new(move |b: &BundleUpdate| {
             if b.command_id == "old" {
                 a.lock().unwrap().push("old-failed".to_string());
-                return (true, Err("bind failed".into()));
+                return (Retry::Backoff, Err("bind failed".into()));
             }
             a.lock().unwrap().push(b.command_id.clone());
-            (false, Ok(()))
+            (Retry::No, Ok(()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(5),
@@ -1231,7 +1498,7 @@ mod tests {
         let c = calls.clone();
         let failing: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("still failing".into()))
+            (Retry::Backoff, Err("still failing".into()))
         });
         let r2 = Arc::new(BundleRetry::new(
             Duration::from_millis(5),
@@ -1239,7 +1506,7 @@ mod tests {
         ));
         let mut tasks2 = JoinSet::new();
         r2.handle(bu("x", 3, "{}"), failing, s, &mut tasks2).await;
-        drop(tasks2); // stream ended
+        drop(tasks2); // the link stopped
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -1251,7 +1518,7 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("unsupported unblock command".into()))
+            (Retry::Backoff, Err("unsupported unblock command".into()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(1),
@@ -1277,7 +1544,7 @@ mod tests {
         let c = calls.clone();
         let attempt: Attempt = Arc::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
-            (true, Err("port taken".into()))
+            (Retry::Backoff, Err("port taken".into()))
         });
         let r = Arc::new(BundleRetry::new(
             Duration::from_millis(1),
@@ -1292,6 +1559,179 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1 + WAF_BUNDLE_RETRY_ATTEMPTS);
+    }
+
+    /// An address that stays taken is tried again every minute and never given up on, long past
+    /// the ten attempts of any other refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_bind_failure_retries_every_minute_without_a_limit() {
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (t, b) = (times.clone(), bound.clone());
+        let attempt: Attempt = Arc::new(move |_| {
+            t.lock().unwrap().push(tokio::time::Instant::now());
+            if b.load(Ordering::SeqCst) {
+                (Retry::No, Ok(()))
+            } else {
+                (
+                    Retry::UntilBound,
+                    Err("failed to bind WAF route listener".into()),
+                )
+            }
+        });
+        let r = Arc::new(BundleRetry::new(WAF_BUNDLE_RETRY_MIN, WAF_BUNDLE_RETRY_MAX));
+        let (s, _alive, mut rx) = sender();
+        let mut tasks = JoinSet::new();
+        r.handle(bu("g", 9, "{}"), attempt, s, &mut tasks).await;
+        assert_eq!(times.lock().unwrap().len(), 1);
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(times.lock().unwrap().len(), 1, "not before a minute");
+        tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+        let tried = times.lock().unwrap().clone();
+        assert!(
+            tried.len() > 1 + WAF_BUNDLE_RETRY_ATTEMPTS as usize,
+            "still trying after half an hour: {} attempts",
+            tried.len()
+        );
+        assert!(
+            tried
+                .windows(2)
+                .all(|w| w[1] - w[0] >= Duration::from_secs(60)),
+            "no attempt sooner than a minute after the one before"
+        );
+        assert!(!tasks.is_empty(), "the retry is still waiting");
+
+        bound.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let got = acks(&mut rx);
+        assert!(
+            got.last().is_some_and(|a| a.ok && a.command_id == "g"),
+            "{got:?}"
+        );
+    }
+
+    struct BindSink;
+    impl BundleSink for BindSink {
+        fn apply(&self, _: &[u8], _: i64) -> Result<(), BundleError> {
+            Err(BundleError::Bind(
+                "failed to bind WAF route listener".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bind_error_of_the_sink_is_retried_until_it_binds() {
+        let l = bare_link_with(Arc::new(BindSink));
+        let (retry, res) = l.apply_bundle_update(&bu("g", 7, "{}"));
+        assert_eq!(retry, Retry::UntilBound);
+        assert_eq!(res.unwrap_err(), "failed to bind WAF route listener");
+        assert_eq!(*l.last_gen.lock().unwrap(), 0);
+    }
+
+    /// Cannot bind for its first `bind_failures` applies, then applies.
+    struct BindThenOk {
+        calls: AtomicU32,
+        bind_failures: u32,
+    }
+
+    impl BundleSink for BindThenOk {
+        fn apply(&self, _: &[u8], _: i64) -> Result<(), BundleError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.bind_failures {
+                Err(BundleError::Bind(
+                    "failed to bind WAF route listener".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A link not yet started, whose state directory holds a cached bundle of `generation`.
+    fn link_with_cache(
+        tag: &str,
+        sink: Arc<BindThenOk>,
+        generation: i64,
+    ) -> (Arc<ControlLink>, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("wafio-cache-retry-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = format!(r#"{{"agent_id":"a","generation":{generation},"apps":[]}}"#);
+        crate::bundle_cache::save_bundle_cache(
+            &dir,
+            bundle.as_bytes(),
+            generation,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let link = bare_link_with(sink);
+        link.control_config.lock().unwrap().state_dir = dir.to_string_lossy().into_owned();
+        (link, dir)
+    }
+
+    /// With the control plane out of reach and another program on the address, the agent still
+    /// comes up from its cache once the address is free.
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_bundle_that_cannot_bind_is_applied_every_minute_until_it_binds() {
+        let sink = Arc::new(BindThenOk {
+            calls: AtomicU32::new(0),
+            bind_failures: 2,
+        });
+        let (l, dir) = link_with_cache("until-bound", sink.clone(), 5);
+        let task = l.start();
+        let calls = || sink.calls.load(Ordering::SeqCst);
+
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert_eq!(calls(), 1, "the start applies it once, the retry waits");
+        assert_eq!(l.bundle_status(), (String::new(), 0));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(calls(), 2);
+        assert_eq!(l.bundle_status(), (String::new(), 0));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(calls(), 3, "bound at about 120 seconds");
+        assert_eq!(l.bundle_status(), ("cache".to_string(), 5));
+        assert_eq!(*l.last_gen.lock().unwrap(), 5);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(calls(), 3, "applied once, not again");
+        task.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_bundle_ends_the_retry_of_the_cached_one() {
+        let sink = Arc::new(BindThenOk {
+            calls: AtomicU32::new(0),
+            bind_failures: 2,
+        });
+        let (l, dir) = link_with_cache("superseded", sink.clone(), 5);
+        let task = l.start();
+        let calls = || sink.calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(calls(), 2);
+
+        let (s, _alive, _rx) = sender();
+        let mut tasks = JoinSet::new();
+        l.bundle_retry
+            .handle(bu("live", 9, "{}"), l.bundle_attempt(), s, &mut tasks)
+            .await;
+        assert_eq!(calls(), 3);
+        assert_eq!(l.bundle_status(), ("live".to_string(), 9));
+
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            calls(),
+            3,
+            "the cached bundle is not applied after a live one"
+        );
+        assert_eq!(l.bundle_status(), ("live".to_string(), 9));
+        task.abort();
+        // The live bundle's cache write runs on its own thread: wait for it before the directory goes.
+        l.cache_writer.finish();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -1374,6 +1814,12 @@ mod tests {
             Vec::new()
         }
     }
+    struct NoCerts;
+    impl CertificateSink for NoCerts {
+        fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
+            Err(AckCode::NotInBundle)
+        }
+    }
     struct NoSec;
     impl SecurityData for NoSec {
         fn replace_malware_snapshot(&self, _: &Path, _: Vec<u8>) -> Result<(), String> {
@@ -1388,47 +1834,336 @@ mod tests {
     // provenance; a heartbeat without samples carries samples=0 and no percentiles.
     #[tokio::test]
     async fn negative_ack_keeps_generation_and_no_percentiles_without_samples() {
-        let cfg = ControlConfig {
-            server_address: "127.0.0.1:1".into(),
-            server_name: String::new(),
-            cert_pem: Vec::new(),
-            key_pem: Vec::new(),
-            ca_pem: Vec::new(),
-            agent_name: "a".into(),
-            hostname: String::new(),
-            version: "wafio-waf-agent/test".into(),
-            host_key: String::new(),
-            features: Vec::new(),
-            state_dir: String::new(),
-            bundle_cache_max_age: Duration::ZERO,
-            security_data_dir: String::new(),
-            component_paths: BTreeMap::new(),
-        };
-        let hooks = Hooks {
-            bundles: Arc::new(FailSink),
-            stats: Arc::new(ZeroStats),
-            security_data: Arc::new(NoSec),
-            redact: |_| {},
-            on_dial: |_| {},
-        };
-        let l = ControlLink::new(cfg, hooks);
+        let l = bare_link();
         *l.last_gen.lock().unwrap() = 5;
-        let (retryable, res) = l.apply_bundle_update(&bu("failed", 999, "{}"));
-        assert!(retryable && res.is_err());
+        let (retry, res) = l.apply_bundle_update(&bu("failed", 999, "{}"));
+        assert!(retry == Retry::Backoff && res.is_err());
         assert_eq!(*l.last_gen.lock().unwrap(), 5);
         assert_eq!(l.bundle_status(), (String::new(), 0));
-        let (retryable, res) = l.apply_bundle_update(&bu("bad", 1, "{"));
+        let (retry, res) = l.apply_bundle_update(&bu("bad", 1, "{"));
         assert!(
-            !retryable && res.is_err(),
+            retry == Retry::No && res.is_err(),
             "a decode error is never retried"
         );
-        let (retryable, _) = l.apply_bundle_update(&bu("u", 0, r#"{"management_only":true}"#));
-        assert!(!retryable, "a management command is never retried");
+        let (retry, _) = l.apply_bundle_update(&bu("u", 0, r#"{"management_only":true}"#));
+        assert!(retry == Retry::No, "a management command is never retried");
 
         let hb = l.heartbeat(None);
         assert_eq!(hb.analyze_latency_samples, Some(0));
         assert!(hb.analyze_latency_p50_us.is_none() && hb.analyze_latency_p95_us.is_none());
         assert!(hb.analyze_latency_p99_us.is_none());
         assert_eq!(hb.decisions_total, 0);
+    }
+
+    /// Answers the bundles it is given from a script, and counts the bundles the link reports.
+    struct Scripted(Mutex<Vec<Result<(), BundleError>>>);
+    impl BundleSink for Scripted {
+        fn apply(&self, _: &[u8], _: i64) -> Result<(), BundleError> {
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+    impl CertificateSink for Counting {
+        fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
+            Err(AckCode::NotInBundle)
+        }
+        fn bundle_finished(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    // The certificate sink hears of each live configuration bundle however it ended, on the first
+    // try and on a retry, and of nothing else.
+    #[tokio::test]
+    async fn the_certificate_sink_hears_of_every_live_configuration_bundle_and_of_no_other() {
+        let script = vec![
+            Ok(()),
+            Err(BundleError::Apply("invalid app route in WAF bundle".into())),
+            Err(BundleError::Bind(
+                "failed to bind WAF route listener".into(),
+            )),
+            Err(BundleError::Decode("bad".into())),
+            Ok(()),
+            Ok(()),
+            Ok(()),
+        ];
+        let certs = Arc::new(Counting::default());
+        let l = bare_link_with_certificates(Arc::new(Scripted(Mutex::new(script))), certs.clone());
+        let heard = || certs.0.load(std::sync::atomic::Ordering::Relaxed);
+
+        let cases = [
+            ("ok", Retry::No, true),
+            ("refused", Retry::Backoff, false),
+            ("unbound", Retry::UntilBound, false),
+            ("undecodable", Retry::No, false),
+        ];
+        for (n, (id, want_retry, want_ok)) in cases.into_iter().enumerate() {
+            let (retry, res) = l.apply_bundle_update(&bu(id, n as i64 + 1, "{}"));
+            assert_eq!((retry, res.is_ok()), (want_retry, want_ok), "{id}");
+            assert_eq!(heard(), n + 1, "{id}");
+        }
+        // A retry is another call of the same function, so it is heard too.
+        let (_, res) = l.apply_bundle_update(&bu("retry", 4, "{}"));
+        assert!(res.is_ok());
+        assert_eq!(heard(), 5);
+
+        // Not a management command, not a document the probe cannot read, not the cached bundle.
+        let (_, res) = l.apply_bundle_update(&bu("m", 0, r#"{"management_only":true}"#));
+        assert!(res.is_ok());
+        let (_, res) = l.apply_bundle_update(&bu("bad", 1, "{"));
+        assert!(res.is_err());
+        let cached = CachedBundle {
+            bundle: b"{}".to_vec(),
+            generation: 9,
+            saved_at: Timestamp::from_system(SystemTime::now()),
+        };
+        l.apply_cached_bundle(&cached).unwrap();
+        assert_eq!(heard(), 5);
+    }
+
+    fn bare_link() -> Arc<ControlLink> {
+        bare_link_with(Arc::new(FailSink))
+    }
+
+    fn bare_link_with(bundles: Arc<dyn BundleSink>) -> Arc<ControlLink> {
+        bare_link_with_certificates(bundles, Arc::new(NoCerts))
+    }
+
+    fn bare_link_with_certificates(
+        bundles: Arc<dyn BundleSink>,
+        certificates: Arc<dyn CertificateSink>,
+    ) -> Arc<ControlLink> {
+        bare_link_with_edge(bundles, certificates, Arc::new(crate::edge::NoEdge))
+    }
+
+    fn bare_link_with_edge(
+        bundles: Arc<dyn BundleSink>,
+        certificates: Arc<dyn CertificateSink>,
+        edge: Arc<dyn EdgeSink>,
+    ) -> Arc<ControlLink> {
+        ControlLink::new(
+            ControlConfig {
+                server_address: "127.0.0.1:1".into(),
+                server_name: String::new(),
+                cert_pem: Vec::new(),
+                key_pem: Vec::new(),
+                ca_pem: Vec::new(),
+                agent_name: "a".into(),
+                hostname: String::new(),
+                version: "wafio-waf-agent/test".into(),
+                host_key: String::new(),
+                features: Vec::new(),
+                state_dir: String::new(),
+                bundle_cache_max_age: Duration::ZERO,
+                security_data_dir: String::new(),
+                component_paths: BTreeMap::new(),
+            },
+            Hooks {
+                bundles,
+                certificates,
+                edge,
+                stats: Arc::new(ZeroStats),
+                security_data: Arc::new(NoSec),
+                redact: |_| {},
+                on_dial: |_| {},
+            },
+        )
+    }
+
+    /// An edge sink that writes down what it was asked for.
+    #[derive(Default)]
+    struct AskedEdge(Mutex<Vec<bool>>);
+
+    impl EdgeSink for AskedEdge {
+        fn statuses(&self, every_app: bool) -> Vec<wafio_proto::v1::EdgeStatus> {
+            self.0.lock().unwrap().push(every_app);
+            Vec::new()
+        }
+
+        fn purge(&self, _: &CachePurge) -> Result<(), PurgeCode> {
+            Err(PurgeCode::CacheOff)
+        }
+    }
+
+    // A wake-up (a live bundle, a new stream) asks the sink for every app of the bundle; the minute
+    // tick only for the apps that have an edge part on.
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_up_asks_for_every_app_and_the_minute_tick_for_the_apps_with_a_part_on() {
+        let sink = Arc::new(AskedEdge::default());
+        let l = bare_link_with_edge(Arc::new(FailSink), Arc::new(NoCerts), sink.clone());
+        let (tx, _rx) = mpsc::channel(8);
+        let (s, _alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s);
+        l.report_edge();
+        until("the sink to be asked after the wake-up", || {
+            sink.0.lock().unwrap().len() == 1
+        })
+        .await;
+        tokio::time::sleep(EDGE_STATUS_INTERVAL + Duration::from_secs(1)).await;
+        until("the sink to be asked on the tick", || {
+            sink.0.lock().unwrap().len() == 2
+        })
+        .await;
+        assert_eq!(*sink.0.lock().unwrap(), [true, false]);
+    }
+
+    fn status(app: &str, state: &str) -> CertificateStatus {
+        CertificateStatus {
+            app_id: app.into(),
+            source: "acme".into(),
+            state: state.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The (app, state) of a status message.
+    fn status_of(m: AgentMessage) -> (String, String) {
+        match m.kind {
+            Some(Out::CertificateStatus(s)) => (s.app_id, s.state),
+            other => panic!("expected a certificate status, got {other:?}"),
+        }
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    // With no stream up a status is dropped, not kept for the next one; any thread may report.
+    #[tokio::test]
+    async fn statuses_reported_with_no_stream_up_are_dropped() {
+        let l = bare_link();
+        l.report_certificate_status(status("a", "pending"));
+        let from_thread = l.clone();
+        std::thread::spawn(move || {
+            from_thread.report_certificate_status(status("b", "pending"));
+            from_thread.report_certificate_status(status("c", "failed"));
+        })
+        .join()
+        .unwrap();
+        until("the status task to drop them", || {
+            l.statuses.lock().unwrap().is_empty()
+        })
+        .await;
+
+        // A stream that comes up afterwards gets only what is reported after it.
+        let (tx, mut rx) = mpsc::channel(8);
+        let (s, _alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s);
+        l.report_certificate_status(status("d", "active"));
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status_of(first), ("d".into(), "active".into()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "nothing else was kept");
+    }
+
+    // While the stream is full a newer state of an app replaces the older one that waits, and
+    // nothing is lost when room comes: each app goes out once, with its latest state.
+    #[tokio::test]
+    async fn a_status_task_keeps_the_latest_state_per_app_and_waits_for_room() {
+        let l = bare_link();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (s, _alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s.clone());
+        // One message fills the stream, so the task blocks on the first status it sends.
+        s.send(AgentMessage::default()).await.unwrap();
+        l.report_certificate_status(status("z", "pending"));
+        until("the task to take the first status", || {
+            l.statuses.lock().unwrap().is_empty()
+        })
+        .await;
+
+        l.report_certificate_status(status("a", "pending"));
+        l.report_certificate_status(status("a", "active"));
+        l.report_certificate_status(status("b", "failed"));
+        l.report_certificate_status(status("a", "failed"));
+
+        let next = async |rx: &mut mpsc::Receiver<AgentMessage>| {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            next(&mut rx).await.kind.is_none(),
+            "the message that filled it"
+        );
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(status_of(next(&mut rx).await));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("z".to_string(), "pending".to_string()),
+                ("a".to_string(), "failed".to_string()),
+                ("b".to_string(), "failed".to_string()),
+            ]
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "the replaced states never went out");
+    }
+
+    // A status that cannot be sent because the stream ended is dropped, and the task goes on.
+    #[tokio::test]
+    async fn a_status_for_a_stream_that_ended_is_dropped() {
+        let l = bare_link();
+        let (tx, rx) = mpsc::channel(1);
+        let (s, alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s);
+        drop(alive);
+        l.report_certificate_status(status("a", "pending"));
+        until("the status to be taken", || {
+            l.statuses.lock().unwrap().is_empty()
+        })
+        .await;
+        drop(rx);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (s, _alive) = StreamSender::new(tx);
+        *l.active.lock().unwrap() = Some(s);
+        l.report_certificate_status(status("b", "active"));
+        let m = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status_of(m), ("b".into(), "active".into()));
+    }
+
+    #[test]
+    fn an_install_ack_carries_the_code_and_nothing_else() {
+        let Some(Out::Ack(ok)) = install_ack("c1".into(), Ok(())).kind else {
+            panic!("not an ack")
+        };
+        assert_eq!(
+            (
+                ok.command_id.as_str(),
+                ok.ok,
+                ok.error.as_str(),
+                ok.payload.len()
+            ),
+            ("c1", true, "", 0)
+        );
+        let Some(Out::Ack(no)) = install_ack("c2".into(), Err(AckCode::LeafMismatch)).kind else {
+            panic!("not an ack")
+        };
+        assert_eq!(
+            (
+                no.command_id.as_str(),
+                no.ok,
+                no.error.as_str(),
+                no.payload.len()
+            ),
+            ("c2", false, "leaf_mismatch", 0)
+        );
     }
 }

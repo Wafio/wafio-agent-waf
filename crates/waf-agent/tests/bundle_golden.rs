@@ -11,6 +11,10 @@ use wafio_waf_agent::agent::Agent;
 use wafio_waf_agent::bundle::decode_bundle;
 use wafio_waf_agent::executor::{Stores, startup_executor};
 use wafio_waf_agent::ready::{Ready, ReadyActions};
+use wafio_waf_agent::tls::dir::KeyDir;
+
+mod common;
+use common::free_port;
 
 fn exec_dump(e: &wafio_proxy::AppAnalysisSetup) -> Value {
     let c = &e.analyze;
@@ -65,28 +69,46 @@ fn state(a: &Agent, p: &wafio_proxy::Proxy, prev: &mut Prev) -> Value {
             .unwrap_or_default();
         listeners.insert(addr, json!(app));
     }
-    json!({
+    let mut state = json!({
         "generation": generation,
         "agent_id": agent_id,
         "shared": a.shared_executor().map(|e| exec_dump(&e)),
         "apps": apps,
         "listeners": listeners,
-    })
+    });
+    // Only while some app is served over HTTPS, so the scenarios without one keep their records.
+    let tls: Vec<Value> = a
+        .tls_apps()
+        .into_iter()
+        .map(|(app_id, s, served)| {
+            json!({
+                "app_id": app_id,
+                "listen": s.listen,
+                "redirect_listen": s.redirect_listen,
+                "hosts": s.hosts,
+                "source": format!("{:?}", s.source),
+                "certificate_id": s.certificate.map(|c| c.id),
+                "request_id": s.request_id,
+                "served": served,
+            })
+        })
+        .collect();
+    if !tls.is_empty() {
+        state["tls"] = json!(tls);
+    }
+    state
 }
 
 /// The listen ports the fixture was recorded with (fixed numbers).
 const FIXTURE_PORTS: [&str; 5] = ["41871", "41872", "41873", "41874", "41875"];
 
 /// Free loopback ports standing in for [`FIXTURE_PORTS`]: a fixed port failed the test with
-/// "failed to bind WAF route listener" whenever another run on the host held it.
+/// "failed to bind WAF route listener" whenever another run on the host held it. They stay
+/// reserved until the process ends, so no other test takes one before the proxy binds it.
 fn free_ports() -> Vec<String> {
     loop {
-        let held: Vec<_> = (0..FIXTURE_PORTS.len())
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        let ports: Vec<String> = held
-            .iter()
-            .map(|l| l.local_addr().unwrap().port().to_string())
+        let ports: Vec<String> = (0..FIXTURE_PORTS.len())
+            .map(|_| free_port().to_string())
             .collect();
         // A substituted number must not contain another fixture port.
         if !ports
@@ -115,19 +137,26 @@ fn bundle_application_matches_the_recorded_snapshot() {
     let rt = wafio_proxy::runtime_builder().build().unwrap();
     let _g = rt.enter();
     let mut got = Vec::new();
-    for sc in scenarios.as_array().unwrap() {
+    for (n, sc) in scenarios.as_array().unwrap().iter().enumerate() {
         let stores = Stores::new();
         let base = startup_executor(&stores, "", None).unwrap();
         let proxy = Arc::new(wafio_proxy::Proxy::new(wafio_proxy::ProxyOptions::new(
             Arc::new(|_| {}),
         )));
-        let agent = Agent::new(
+        let mut agent = Agent::new(
             base,
             stores,
             proxy.clone(),
             Arc::new(VerifiedBotChecker::new()),
             Arc::new(Ready::new(ReadyActions::default())),
         );
+        // A scenario has a key directory unless it says it has none.
+        let keys =
+            std::env::temp_dir().join(format!("wafio-golden-keys-{}-{n}", std::process::id()));
+        if sc["key_dir"].as_bool().unwrap_or(true) {
+            let dir = KeyDir::open(&keys, nix::unistd::geteuid().as_raw()).unwrap();
+            agent = agent.with_key_dir(dir);
+        }
         let mut prev = Prev::new();
         for (i, step) in sc["steps"].as_array().unwrap().iter().enumerate() {
             let mut rec =
@@ -148,6 +177,8 @@ fn bundle_application_matches_the_recorded_snapshot() {
             got.push(rec);
         }
         rt.block_on(proxy.shutdown(false));
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&keys);
     }
     // Back to the recorded addresses (the listeners map is the only place a port shows up).
     let mut text = serde_json::to_string(&got).unwrap();

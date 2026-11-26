@@ -4,10 +4,21 @@
 //! string, decoded path, re-quoted forward target) and the lower-cased host. Pingora forwards raw
 //! request-targets; every path the pipeline matches or forwards comes from here.
 
+use std::sync::Arc;
+
 use wafio_domain::Headers;
 use wafio_engine_rules::decode_forwarded_path;
 
 use crate::head_parser;
+
+/// What the agent learned from the TLS handshake of a connection it terminated itself.
+#[derive(Debug)]
+pub struct TlsClient {
+    /// The SNI name, lower case.
+    pub server_name: String,
+    /// The JA4 of the ClientHello; `None` when the hello could not be read (one split over records).
+    pub ja4: Option<String>,
+}
 
 /// One request head as the handlers see it.
 #[derive(Clone, Debug, Default)]
@@ -53,6 +64,8 @@ pub struct InboundRequest {
     pub cookies: Vec<(Vec<u8>, Vec<u8>)>,
     /// Length of the raw head (request line + headers + CRLF).
     pub head_len: usize,
+    /// Set when the agent terminated TLS for the connection; `None` on a plain one.
+    pub tls: Option<Arc<TlsClient>>,
 }
 
 /// RFC 9110 tchar.
@@ -188,6 +201,18 @@ pub fn push_forward_query(dst: &mut Vec<u8>, query: &[u8]) {
     }
 }
 
+/// The request target an upstream receives, and the cache keys a copy by: the re-quoted
+/// `forward_path`, then `?` and the forwarded `query` when there is one.
+pub(crate) fn forward_target(forward_path: &[u8], query: &[u8]) -> Vec<u8> {
+    let mut target = Vec::with_capacity(forward_path.len() + query.len() + 1);
+    push_escaped_path(&mut target, forward_path);
+    if !query.is_empty() {
+        target.push(b'?');
+        push_forward_query(&mut target, query);
+    }
+    target
+}
+
 /// Removes every line named `key` by swapping it with the last one, so each delete reorders the
 /// lines that follow it (two lines of one name come out the other way round).
 pub(crate) fn remove_all_lines_named(h: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8]) {
@@ -206,7 +231,7 @@ pub(crate) fn remove_all_lines_named(h: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8]
 
 /// The path and query of the URI the handler sees: `uri` is the request-target with an
 /// absolute-form scheme and authority already taken off.
-fn split_path_query(uri: &[u8]) -> (&[u8], &[u8]) {
+pub(crate) fn split_path_query(uri: &[u8]) -> (&[u8], &[u8]) {
     let q = uri.iter().position(|&c| c == b'?');
     let f = uri.iter().position(|&c| c == b'#');
     match (q, f) {
@@ -293,11 +318,7 @@ impl InboundRequest {
         req.original_path = path_original.to_vec();
         req.query = query.to_vec();
         req.forward_path = decode_forwarded_path(&req.request_target).0;
-        push_escaped_path(&mut req.forward_request_target, &req.forward_path);
-        if !req.query.is_empty() {
-            req.forward_request_target.push(b'?');
-            push_forward_query(&mut req.forward_request_target, &req.query);
-        }
+        req.forward_request_target = forward_target(&req.forward_path, &req.query);
         // The header map: the Host header as written (not the URI host), Content-Length,
         // Content-Type, User-Agent, Trailer, Cookie, the other lines in order (every non-close
         // Connection line, Transfer-Encoding, the body's trailer lines), then Connection: close
@@ -359,6 +380,13 @@ impl InboundRequest {
             .iter()
             .find(|(k, _)| k == name)
             .map_or(&[][..], |(_, v)| v.as_slice())
+    }
+
+    /// Whether the request has an `Upgrade` line: a WebSocket handshake, or `h2c`.
+    pub fn has_upgrade(&self) -> bool {
+        self.lines
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(b"upgrade"))
     }
 
     pub fn is_get_method(&self) -> bool {

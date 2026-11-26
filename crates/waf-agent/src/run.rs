@@ -17,13 +17,18 @@ use wafio_agent_pages::iprep::{
     AddressRange, FIREHOL_LEVEL1_LIST_URL, FIREHOL_LEVEL2_LIST_URL, IPREP_USER_AGENT,
     ReputationChecker, parse_netset_partial,
 };
-use wafio_control::{AgentStats, ControlConfig, ControlLink, HeartbeatCounters, Hooks};
+use wafio_control::{
+    AckCode, AgentStats, CacheWrite, CertificateInstall, CertificateSink, ControlConfig,
+    ControlLink, HeartbeatCounters, Hooks, NoEdge,
+};
 
-use crate::agent::{Agent, Sink};
+use crate::agent::{Agent, Certificates, Edge, Sink};
 use crate::executor::{Stores, startup_executor};
 use crate::flags::{AgentArgs, OsEnv};
 use crate::ready::{Ready, ReadyActions};
 use crate::reload::{UpgradeState, spawn_successor};
+use crate::tls::dir::KeyDir;
+use crate::tls::pacer::{self, Statuses};
 
 /// The control link, once created (the proxy's decision sink exists before it).
 static LINK: OnceLock<Arc<ControlLink>> = OnceLock::new();
@@ -32,10 +37,26 @@ static LINK: OnceLock<Arc<ControlLink>> = OnceLock::new();
 const READY_FALLBACK: Duration = Duration::from_secs(20);
 /// Store cleaner period.
 const CLEANUP_EVERY: Duration = Duration::from_secs(120);
+/// How often a process that is waiting for the key directory lock tries to take it.
+const KEY_LOCK_POLL: Duration = Duration::from_millis(200);
+/// How often the response cache looks at the free space of its file system.
+const CACHE_TICK: Duration = Duration::from_secs(60);
 /// FireHOL refresh period.
 const IPREP_REFRESH: Duration = Duration::from_secs(24 * 3600);
 /// The `Hello.features` entry of an agent that serves the maintenance page.
 const FEATURE_MAINTENANCE_MODE: &str = "maintenance_mode";
+/// The `Hello.features` entry of an agent that serves apps over HTTPS from its key directory: it
+/// takes `CertificateInstall` and sends `CertificateStatus`.
+pub const FEATURE_TLS_CERTIFICATES: &str = "tls_certificates";
+/// The `Hello.features` entries of an agent that applies the main host name and the path prefix of
+/// an app, and compresses its answers, and says so in `EdgeStatus`.
+const FEATURE_EDGE_REDIRECTS: &str = "edge_redirects";
+const FEATURE_EDGE_COMPRESSION: &str = "edge_compression";
+const FEATURE_EDGE_STATIC_FILES: &str = "edge_static_files";
+/// The agent keeps the response cache of an app, purges it on request and says in `EdgeStatus`
+/// what became of it. An agent whose cache directory cannot be used sends it too, and says so for
+/// each app: a missing feature would read as an agent too old for the cache.
+const FEATURE_EDGE_CACHE: &str = "edge_cache";
 
 struct Stats;
 
@@ -91,13 +112,57 @@ pub fn test_hooks() -> Hooks {
             Ok(())
         }
     }
+    struct NoCertificates;
+    impl CertificateSink for NoCertificates {
+        fn install(&self, _: &mut CertificateInstall) -> Result<(), AckCode> {
+            Err(AckCode::NotInBundle)
+        }
+    }
     Hooks {
         bundles: Arc::new(AcceptAll),
+        certificates: Arc::new(NoCertificates),
+        edge: Arc::new(NoEdge),
         stats: Arc::new(Stats),
         security_data: Arc::new(crate::security_data::AgentSecurityData),
         redact: crate::redact::mask_decision_event,
         on_dial,
     }
+}
+
+/// Waits for the queued bundle cache write once the runtime is gone. An apply that ran when the
+/// stream was cut finishes during the runtime drop, after the last wait in [`run_waf_agent`], and
+/// the end of the process does not wait for the writer thread.
+pub(crate) fn finish_cache_write_blocking() {
+    if let Some(link) = LINK.get() {
+        link.finish_cache_write_blocking();
+    }
+}
+
+/// How the link writes the bundle cache.
+#[cfg(not(feature = "test-cache-delay"))]
+fn cache_write() -> CacheWrite {
+    Arc::new(wafio_control::save_bundle_cache)
+}
+
+/// A build with `test-cache-delay` waits `WAFIO_TEST_CACHE_WRITE_DELAY_MS` milliseconds before each
+/// cache write, so a test can signal the agent while a write is still pending. No release build
+/// enables it.
+#[cfg(feature = "test-cache-delay")]
+fn cache_write() -> CacheWrite {
+    fn delayed(
+        dir: &std::path::Path,
+        bundle: &[u8],
+        generation: i64,
+        now: std::time::SystemTime,
+    ) -> Result<(), String> {
+        let delay = std::env::var("WAFIO_TEST_CACHE_WRITE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(delay));
+        wafio_control::save_bundle_cache(dir, bundle, generation, now)
+    }
+    Arc::new(delayed)
 }
 
 /// The link's `on_dial` hook: resolves the control-plane address for the jail in the background.
@@ -248,7 +313,12 @@ fn apply_challenge_limit(name: &str, parse: fn(&str) -> (i64, bool), set: fn(i64
 }
 
 /// Everything after flag validation and the engine environment export. Runs inside the Tokio runtime.
-pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), String> {
+/// `keys` is the key directory, opened at start; without one the apps' `tls` objects are ignored.
+pub async fn run_waf_agent(
+    f: AgentArgs,
+    metrics_addr: String,
+    keys: Option<KeyDir>,
+) -> Result<(), String> {
     // Successor side of an upgrade: take the predecessor's sockets before anything else
     // (it waits on the handover while this process does its first handshake).
     let mut inherited: HashMap<String, StdListener> =
@@ -273,7 +343,16 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
     cfg.features = vec![
         crate::script_rules::FEATURE_SCRIPT_RULES.into(),
         FEATURE_MAINTENANCE_MODE.into(),
+        FEATURE_EDGE_REDIRECTS.into(),
+        FEATURE_EDGE_COMPRESSION.into(),
+        FEATURE_EDGE_STATIC_FILES.into(),
+        FEATURE_EDGE_CACHE.into(),
     ];
+    // Only an agent that could use its key directory at start takes certificates: without one the
+    // `tls` objects of its bundles are ignored, and the control plane must not send a key.
+    if keys.is_some() {
+        cfg.features.push(FEATURE_TLS_CERTIFICATES.into());
+    }
     if !wafio_engine_api::engine().info().installed {
         cfg.features
             .push(crate::gaps::FEATURE_NO_SEMANTIC_ENGINE.into());
@@ -319,31 +398,33 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
 
     // agent.Run: IP jail, startup executor, inline proxy (IP reputation, good bots, observer).
     let env = OsEnv;
+    // The enforcer is built whenever a jail URL is set: the agent-wide threshold (default off) and an
+    // app's block policy with target "kernel" both push through it.
     let mut jail: Option<Arc<JailTracker>> = None;
-    if f.jail_threshold > 0 {
-        let token_file = f.jail_token_file(&env);
-        match wafio_agent_io::ip_jail::jail_enforcer_from_config(&token_file, &f.jail_url) {
-            Some(enforce) => {
-                let window = if f.jail_window_sec > 0 {
-                    Duration::from_secs(f.jail_window_sec as u64)
-                } else {
-                    Duration::from_secs(60)
-                };
-                let duration = if f.jail_duration_sec > 0 {
-                    Duration::from_secs(f.jail_duration_sec as u64)
-                } else {
-                    Duration::from_secs(3600)
-                };
-                jail = Some(Arc::new(JailTracker::new(
-                    f.jail_threshold,
-                    window,
-                    duration,
-                    65536,
-                    Some(enforce),
-                )));
+    let token_file = f.jail_token_file(&env);
+    match wafio_agent_io::ip_jail::jail_enforcer_from_config(&token_file, &f.jail_url) {
+        Some(enforce) => {
+            let window = if f.jail_window_sec > 0 {
+                Duration::from_secs(f.jail_window_sec as u64)
+            } else {
+                Duration::from_secs(60)
+            };
+            let duration = if f.jail_duration_sec > 0 {
+                Duration::from_secs(f.jail_duration_sec as u64)
+            } else {
+                Duration::from_secs(3600)
+            };
+            jail = Some(Arc::new(JailTracker::new(
+                f.jail_threshold,
+                window,
+                duration,
+                65536,
+                Some(enforce),
+            )));
+            if f.jail_threshold > 0 {
                 match wafio_agent_io::ip_jail::check_host_agent_token(false, &token_file) {
                     Err(e) => info!(
-                        "WARNING: IP jail inactive: host-agent local API token unreadable ({e}); jail pushes are skipped until it is readable — set WAFIO_LOCAL_API_TOKEN_GROUP to this agent's group in /etc/wafio/host-agent.env and restart the host agent"
+                        "WARNING: IP jail inactive: host-agent local API token unreadable ({e}); jail pushes are skipped until it is readable; set WAFIO_LOCAL_API_TOKEN_GROUP to this agent's group in /etc/wafio/host-agent.env and restart the host agent"
                     ),
                     Ok(()) => info!(
                         "IP jail active: {} blocks/{} → XDP jail {}",
@@ -352,10 +433,15 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
                         whole_seconds_text(duration)
                     ),
                 }
+            } else {
+                info!(
+                    "IP jail threshold off; a block policy with target kernel still jails at {}",
+                    f.jail_url
+                )
             }
-            None => {
-                info!("IP jail disabled: no in-process eBPF manager and no --jail-url configured")
-            }
+        }
+        None => {
+            info!("IP jail disabled: no in-process eBPF manager and no --jail-url configured")
         }
     }
     let stores = Stores::new();
@@ -369,7 +455,13 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
     } else {
         inherited.remove(&metrics_addr)
     };
+    // The response cache directory is checked and opened once, here: the proxy keeps the copies in
+    // it and the agent reports it. An unusable one is logged and leaves the cache off.
+    let cache = crate::cache::open();
     let mut opts = wafio_proxy::ProxyOptions::new(Arc::new(emit_decision));
+    if let crate::cache::CacheSetup::Ready(host) = &cache {
+        opts.cache = Some(host.clone());
+    }
     opts.ip_rep = Some(iprep.clone());
     opts.good_bots = Some(good_bots.clone());
     opts.captcha = Some(Arc::new(Captcha {
@@ -377,25 +469,50 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
     }));
     opts.inherited = inherited;
     let proxy = Arc::new(wafio_proxy::Proxy::new(opts));
-    let agent = Arc::new(Agent::new(
+    let (statuses, offers) = Statuses::channel();
+    let mut agent = Agent::new(
         base,
         stores,
         proxy.clone(),
         good_bots.clone(),
         ready.clone(),
-    ));
+    )
+    .with_statuses(statuses)
+    .with_cache(cache);
+    let ordering = keys.is_some();
+    if let Some(dir) = keys {
+        agent = agent.with_key_dir(dir);
+    }
+    let agent = Arc::new(agent);
+    if ordering {
+        let directory = f.resolved_acme_directory()?;
+        info!("[acme] certificates are ordered from {directory}");
+        agent.start_acme(
+            Arc::new(crate::tls::acme::instant::InstantAcme::new(
+                crate::tls::acme::http::Http::new(),
+            )),
+            directory,
+        );
+    }
 
-    let link = ControlLink::new(
+    let link = ControlLink::with_cache_write(
         cfg,
         Hooks {
             bundles: Arc::new(Sink(agent.clone())),
+            certificates: Arc::new(Certificates(agent.clone())),
+            edge: Arc::new(Edge(agent.clone())),
             stats: Arc::new(Stats),
             security_data: Arc::new(crate::security_data::AgentSecurityData),
             redact: crate::redact::mask_decision_event,
             on_dial,
         },
+        cache_write(),
     );
     let _ = LINK.set(link.clone());
+    let status_link = link.clone();
+    tokio::spawn(pacer::run(offers, move |status| {
+        status_link.report_certificate_status(status)
+    }));
 
     // Probe the control plane: credential errors exit; an outage starts from the cache.
     if let Err(e) = link.exchange_hello().await {
@@ -426,7 +543,12 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
         None
     } else {
         let reg = wafio_agent_io::metrics::Registry::new();
-        crate::metrics::register_agent_metrics(&reg, link.clone());
+        crate::metrics::register_agent_metrics(
+            &reg,
+            link.clone(),
+            &agent.tls_metrics(),
+            agent.cache_host(),
+        );
         let ln = match metrics_inherited {
             Some(s) => {
                 s.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -475,6 +597,19 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
             .await;
         }
     });
+    // The response cache looks at the free space of its file system every minute.
+    if agent.cache_host().is_some() {
+        let a = agent.clone();
+        tokio::spawn(async move {
+            let mut t =
+                tokio::time::interval_at(tokio::time::Instant::now() + CACHE_TICK, CACHE_TICK);
+            loop {
+                t.tick().await;
+                let a = a.clone();
+                let _ = tokio::task::spawn_blocking(move || a.cache_tick()).await;
+            }
+        });
+    }
     let gb = good_bots.clone();
     tokio::spawn(async move {
         loop {
@@ -491,6 +626,48 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
             tokio::time::sleep(IPREP_REFRESH).await;
         }
     });
+
+    // A process that finds the key directory lock taken (the one it replaces holds it until it has
+    // stopped accepting) takes it as soon as it is free.
+    if agent.waits_for_keys() {
+        info!(
+            "[tls] another process holds the key directory lock: this one reads what that one wrote and writes nothing in it until that one lets go"
+        );
+        let a = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(KEY_LOCK_POLL).await;
+                let a = a.clone();
+                if tokio::task::spawn_blocking(move || a.take_over_keys())
+                    .await
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    // The same for the cache directory lock: a successor reads the copies the old process made and
+    // writes none until the old one lets go.
+    if agent.waits_for_cache() {
+        info!(
+            "[cache] another process holds the cache directory lock: this one serves the copies it reads and stores none until that one lets go"
+        );
+        let a = agent.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(KEY_LOCK_POLL).await;
+                let a = a.clone();
+                if tokio::task::spawn_blocking(move || a.take_over_cache())
+                    .await
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
+        });
+    }
 
     let stream = link.start();
     let upgrade = UpgradeState::default();
@@ -511,6 +688,9 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
                 if crate::engine_lib::loaded().is_some() {
                     env.push((crate::engine_lib::ENV_REQUIRED.to_string(), "1".to_string()));
                 }
+                agent.pause_orders();
+                // The successor reads the bundle cache as it starts.
+                link.finish_cache_write().await;
                 match spawn_successor(fds, &crate::reload::run_dir(), crate::reload::HANDOVER_TIMEOUT, env).await {
                     Ok(pid) => {
                         upgrade.finish(true);
@@ -519,6 +699,7 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
                     }
                     Err(e) => {
                         upgrade.finish(false);
+                        agent.resume_orders();
                         info!("[tableflip] upgrade failed: {e}");
                     }
                 }
@@ -531,7 +712,17 @@ pub async fn run_waf_agent(f: AgentArgs, metrics_addr: String) -> Result<(), Str
         info!("[wafio-waf-agent] shutdown signal — stopping");
     }
     stream.abort();
+    // The next start reads the bundle cache, and so does a successor that is still starting up.
+    link.finish_cache_write().await;
     agent.close();
+    // A successor writes in the key directory from the moment this process no longer accepts.
+    proxy.stop_accepting(handed_over).await;
+    let a = agent.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        a.release_keys();
+        a.release_cache();
+    })
+    .await;
     proxy.shutdown(handed_over).await;
     Ok(())
 }

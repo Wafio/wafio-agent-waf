@@ -32,6 +32,62 @@ pub fn count_agent_panic() {
 /// Requests answered with the maintenance page.
 pub static MAINTENANCE_RESPONSES: AtomicU64 = AtomicU64::new(0);
 
+/// Answers sent compressed, by encoding.
+pub static COMPRESSED_GZIP: AtomicU64 = AtomicU64::new(0);
+pub static COMPRESSED_BROTLI: AtomicU64 = AtomicU64::new(0);
+/// Bytes of the compressed answers before compression and as sent.
+pub static COMPRESSION_BYTES_IN: AtomicU64 = AtomicU64::new(0);
+pub static COMPRESSION_BYTES_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// Why an answer that could have been compressed was not: it came in pieces, it was over the
+/// largest size, no compression slot was free, or the compressed form was not smaller.
+pub const COMPRESSION_SKIP_REASONS: [&str; 4] = ["streamed", "too_large", "busy", "grew"];
+pub(crate) const SKIP_STREAMED: usize = 0;
+pub(crate) const SKIP_TOO_LARGE: usize = 1;
+pub(crate) const SKIP_BUSY: usize = 2;
+pub(crate) const SKIP_GREW: usize = 3;
+pub static COMPRESSION_SKIPPED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn count_compression_skipped(reason: usize) {
+    COMPRESSION_SKIPPED[reason].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The statuses a folder of static files answers, one counter each: the file (`200`), a part of it
+/// (`206`), not modified (`304`), the directory's slash (`308`), a range outside the file (`416`)
+/// and, for an app that answers its own misses, `404`, `405` and `503` (the disk is busy).
+pub const STATIC_STATUSES: [u16; 8] = [200, 206, 304, 308, 404, 405, 416, 503];
+pub static STATIC_RESPONSES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Looks and reads of a folder that were not made because every disk slot was taken, or that did
+/// not return in time (a disk that does not answer).
+pub static STATIC_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+/// Bytes of the bodies of those answers, as sent.
+pub static STATIC_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a static answer of `status` with `bytes` of body already in hand; a body that is read
+/// from a file as it is sent is counted by [`count_static_bytes`].
+pub(crate) fn count_static(status: u16, bytes: u64) {
+    if let Some(i) = STATIC_STATUSES.iter().position(|&s| s == status) {
+        STATIC_RESPONSES[i].fetch_add(1, Ordering::Relaxed);
+    }
+    count_static_bytes(bytes);
+}
+
+pub(crate) fn count_static_bytes(bytes: u64) {
+    STATIC_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn count_static_unavailable() {
+    STATIC_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Copies of the response cache that failed their check when read (a size, a check sum or a key
+/// that differs) and were deleted.
+pub static CACHE_CORRUPT_FILES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn count_cache_corrupt() {
+    CACHE_CORRUPT_FILES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Most distinct coverage flags kept as labels; the rest count as "other".
 const COVERAGE_LABEL_CAP: usize = 32;
 

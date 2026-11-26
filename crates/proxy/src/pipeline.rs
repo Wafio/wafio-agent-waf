@@ -3,8 +3,8 @@
 //! challenge verify endpoint, path-encoding reject, IP reputation gate,
 //! challenge gate (skipped only for a WebSocket handshake this route takes over), decrypt field
 //! rules, body inspection, Analyze, verdict merge, block page / rule challenge / monitor, then
-//! WebSocket takeover, FastCGI or HTTP upstream. Detection runs via `run_detection` (16 MiB
-//! stack).
+//! WebSocket takeover, main host redirect, the app's folder of static files, FastCGI or HTTP
+//! upstream. Detection runs via `run_detection` (16 MiB stack).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -31,12 +31,15 @@ use wafio_bytetext::strings::trim_whitespace;
 use wafio_domain::ip_address::IpAddress;
 use wafio_domain::{AnalysisResult, IncomingRequest};
 
+use crate::cache::{self, Label, Plan};
+use crate::compress;
 use crate::config::{AppAnalysisSetup, Route, Target};
 use crate::decision::{
     AnalysisRequest, DecisionEvent, REQUEST_BODY_CAPTURE_LIMIT, Verdict, canonical_content_type,
     emit_decision_event, emit_upstream_error_event, first_header_value, now_unix,
 };
 use crate::proxy::Shared;
+use crate::redirect::{outside_prefix, upstream_target};
 use crate::request::InboundRequest;
 use crate::response::OutboundResponse;
 use crate::upstream::Forwarded;
@@ -48,6 +51,8 @@ pub(crate) enum Done {
     Respond(OutboundResponse),
     /// The head of a response whose body the route relays from the upstream as it arrives.
     Stream(Box<crate::upstream::Streamed>),
+    /// A file of the app's static folder that is sent from its open descriptor after the head.
+    File(Box<crate::static_files::FileAnswer>),
     /// WebSocket takeover: the session becomes the relay's client stream.
     Upgrade(Box<WsPlan>),
 }
@@ -102,8 +107,20 @@ fn rules_for_request_path(
         .collect()
 }
 
-/// JA4/JA3 from proxy headers.
-fn read_client_fingerprints(req: &InboundRequest) -> (Vec<u8>, Vec<u8>) {
+/// JA4 and JA3 of the client. The JA4 of a handshake the agent terminated wins; otherwise they
+/// come from the headers of a proxy in front. When the agent is the edge of the app, a client
+/// could write them itself, so they count only from a peer the route trusts as a proxy.
+fn read_client_fingerprints(
+    req: &InboundRequest,
+    route: &Route,
+    peer: &IpAddress,
+) -> (Vec<u8>, Vec<u8>) {
+    if let Some(ja4) = req.tls.as_ref().and_then(|t| t.ja4.as_ref()) {
+        return (ja4.clone().into_bytes(), Vec::new());
+    }
+    if route.edge && !route.proxy_config.may_supply_forwarded_headers(peer) {
+        return (Vec::new(), Vec::new());
+    }
     let first = |names: &[&str]| {
         names
             .iter()
@@ -138,8 +155,7 @@ fn challenge_request<'a>(
         sec_fetch_site: req.peek("Sec-Fetch-Site"),
         x_forwarded_proto: req.peek("X-Forwarded-Proto"),
         challenge_cookie: req.cookie(wafio_agent_pages::challenge::CHALLENGE_COOKIE.as_bytes()),
-        // Agent listeners are plain HTTP.
-        over_tls: false,
+        over_tls: req.tls.is_some(),
         local_socket_client: local,
         submitted_body: post_body,
     }
@@ -266,7 +282,7 @@ fn detect(
         skipped = bi.skipped;
         notes = bi.notes;
     }
-    let (ja4, ja3) = read_client_fingerprints(req);
+    let (ja4, ja3) = read_client_fingerprints(req, route, peer);
     let mut dreq = IncomingRequest {
         method: req.method.clone(),
         uri: req.request_target.clone(),
@@ -304,6 +320,24 @@ fn detect(
         dreq.client_forwarded,
         remote,
     );
+    // A block window of a kernel-target policy also reaches the host firewall, in block mode only.
+    if verdict.action == "block"
+        && route.mode == "block"
+        && let Some(until) = verdict.block_until
+        && exec
+            .analyze
+            .block_policy
+            .as_ref()
+            .is_some_and(|bp| bp.enabled && bp.targets_kernel())
+    {
+        wafio_agent_io::ip_jail::report_kernel_block_to_jail(
+            exec.jail.as_deref(),
+            until,
+            dreq.client_forwarded,
+            peer.is_loopback(),
+            remote,
+        );
+    }
     Detection {
         body: dreq.content_scan_body.take().unwrap_or_default(),
         raw_ct,
@@ -326,7 +360,7 @@ fn answer(r: OutboundResponse) -> pingora::Result<Done> {
 
 /// One request.
 pub(crate) async fn handle(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     route: &Arc<Route>,
     req: InboundRequest,
     body: Vec<u8>,
@@ -501,6 +535,7 @@ pub(crate) async fn handle(
 
     let field_rules = rules_for_request_path(&exec, &req.forward_path, &req.method);
     let weight = body.len();
+    let body_read = weight > 0;
     let det = crate::run_detection_async(weight, || {
         detect(route, &req, body, &field_rules, &remote, &peer)
     })
@@ -637,6 +672,14 @@ pub(crate) async fn handle(
         v.action = "monitor".into();
     }
 
+    // A path outside the app's path prefix is not the application's: `404`, for a WebSocket
+    // handshake too. Forwarded as it came it would reach the application under a path that no rule
+    // written for the public one covers (`/admin` for the page that is public at `/shop/admin`).
+    if outside_prefix(route, &req) {
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, 404);
+        return answer(OutboundResponse::error(404, "Not Found"));
+    }
+
     if ws {
         let mut wsv = verdict.clone();
         (wsv.score, wsv.categories, wsv.cwe, wsv.match_detail) = (
@@ -651,6 +694,79 @@ pub(crate) async fn handle(
         };
     }
 
+    // Another host name of the app is sent to its main host, after the verdict and the WebSocket
+    // takeover: a block is never redirected, and an upgrade request goes upstream untouched.
+    if v.action != "block"
+        && !req.has_upgrade()
+        && let Some(r) = route.main_host.as_ref().and_then(|m| m.answer(&req))
+    {
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, r.status);
+        return answer(r);
+    }
+
+    // The response cache, after the verdict: only an `allow` reads or fills it. A fresh copy is
+    // the answer, with the response header rules of the app applied as they are to every answer.
+    let cache_plan = cache::plan(route, &req, &v.action, body_read, &peer);
+    let cx = cache::Ctx {
+        shared,
+        route,
+        req: &req,
+        peer: &peer,
+        remote: &remote,
+    };
+    let mut pending = cache::Pending::default();
+    if let Plan::Lookup(ask) = &cache_plan {
+        match cache::enter(&cx, ask).await {
+            cache::Entered::Answer(copy, label) => {
+                let hit = from_copy(route, *copy, label);
+                emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, hit.status);
+                return answer(hit);
+            }
+            cache::Entered::Go(p) => pending = p,
+        }
+    }
+
+    // The app's folder of files answers `GET` and `HEAD` for a file it holds, after the verdict
+    // like everything that reaches the application. A request that asks for an upgrade is the
+    // application's. What the folder sends is not from the cache, and no cache counter has it.
+    // The response header rules of the app apply as they do to every answer, the stored copies of
+    // the folder's files included: they are made without them.
+    if let Some(folder) = &route.static_files
+        && !req.has_upgrade()
+        && let Some(mut done) = crate::static_files::serve(shared, route, folder, &req).await
+    {
+        let status = match &mut done {
+            Done::Respond(r) => {
+                crate::upstream::apply_response_header_rules(route, r);
+                if cache_plan.label().is_some() {
+                    cache::tag_static(r);
+                }
+                r.status
+            }
+            Done::File(f) => {
+                crate::upstream::apply_response_header_rules(route, &mut f.head);
+                if cache_plan.label().is_some() {
+                    cache::tag_static(&mut f.head);
+                }
+                f.head.status
+            }
+            Done::Stream(s) => s.head.status,
+            Done::Upgrade(_) => 101,
+        };
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, status);
+        return Ok(done);
+    }
+
+    // The request is the application's. The one that may fill takes its turn for the key, and the
+    // others wait for it; a copy that comes in meanwhile is the answer.
+    if let Plan::Lookup(ask) = &cache_plan
+        && let Some((copy, label)) = cache::take_turn(&cx, ask, &mut pending).await
+    {
+        let hit = from_copy(route, *copy, label);
+        emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, hit.status);
+        return answer(hit);
+    }
+
     // Allow (or monitor-mode block) → upstream, encrypt rules applied to what it receives.
     let (mut fbody, mut fct) = (det.body, det.raw_ct.clone());
     if !field_rules.is_empty() && !fbody.is_empty() {
@@ -663,83 +779,90 @@ pub(crate) async fn handle(
         (fbody, fct) = (enc, enc_ct);
     }
     let ct_override = (fct != det.raw_ct && !fct.is_empty()).then_some(fct.as_slice());
-    let result = match &route.target {
-        Target::Fcgi(pool) => {
-            let mut hm = req.headers.clone();
-            if let Some(ct) = ct_override {
-                hm.insert(b"Content-Type".to_vec(), vec![ct.to_vec()]);
-            }
-            // PHP sees the same client headers as an HTTP upstream.
-            // Every spelling that becomes the same CGI param (`X_Forwarded_For`, `X-Real_IP`) goes
-            // too: PHP-FPM keeps the last of a repeated param and the sorted map put such a
-            // spelling after ours, so a client could name its own address.
-            hm.retain(|k, _| {
-                !matches!(
-                    cgi_header_param(k).as_slice(),
-                    b"HTTP_X_REAL_IP" | b"HTTP_X_FORWARDED_FOR"
-                )
-            });
-            hm.insert(b"X-Real-IP".to_vec(), vec![remote.as_bytes().to_vec()]);
-            hm.insert(
-                b"X-Forwarded-For".to_vec(),
-                vec![outgoing_forwarded_for(
-                    &peer,
-                    &req.lines,
-                    &route.proxy_config,
-                )],
+    let result = send_upstream(
+        shared,
+        route,
+        &req,
+        &peer,
+        &remote,
+        &fbody,
+        ct_override,
+        pending.validator(),
+        // An answer that may be kept gets the header rules after its copy is made, so the copy
+        // holds what the application said and a change to the rules reaches it at once. A path
+        // that rewrites the body is never kept.
+        cache_plan.fills(),
+    )
+    .await;
+    // The application cannot answer and a copy may stand in for it, whether its error comes whole
+    // or in pieces: a stream is dropped unread.
+    if let Ok(forwarded) = &result {
+        let status = match forwarded {
+            Forwarded::Whole(r) => r.status,
+            Forwarded::Stream(s) => s.head.status,
+        };
+        if cache::is_failure(status)
+            && let Some(copy) = cache::on_error(&cx, &pending)
+        {
+            tracing::warn!(
+                "[inline-proxy] app={} {} answered {status}: a stored copy is sent",
+                route.app_id,
+                route.upstream
             );
-            crate::fastcgi::forward_fcgi(
-                pool,
-                &req.method,
-                &req.forward_request_target,
-                &req.host,
-                &remote,
-                &hm,
-                &fbody,
-            )
-            .await
-            .map(Forwarded::Whole)
-            .map_err(|e| ("fastcgi ", e))
+            let stale = from_copy(route, copy, Label::Stale);
+            emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, stale.status);
+            return answer(stale);
         }
-        Target::Http(t) => match crate::upstream::upstream_request(
-            route,
-            t,
-            &req,
-            &peer,
-            &remote,
-            &fbody,
-            ct_override,
-        ) {
-            Err(e) => Err(("", e.to_string())),
-            Ok(head) => {
-                let rewrites = crate::upstream::rewrites_response_body(route, &req.forward_path);
-                crate::upstream::forward_http(shared, route, t, head, &fbody, !rewrites)
-                    .await
-                    .map(|f| match f {
-                        Forwarded::Whole(mut r) => {
-                            crate::upstream::apply_response_rules(
-                                route,
-                                &req.forward_path,
-                                &req.request_target,
-                                &mut r,
-                            );
-                            Forwarded::Whole(r)
-                        }
-                        Forwarded::Stream(mut s) => {
-                            crate::upstream::apply_response_header_rules(route, &mut s.head);
-                            Forwarded::Stream(s)
-                        }
-                    })
-                    .map_err(|e| ("", e))
-            }
-        },
-    };
+    }
     match result {
-        Ok(Forwarded::Whole(resp)) => {
+        Ok(Forwarded::Whole(mut resp)) => {
+            // The application confirmed the copy it was asked about.
+            if resp.status == 304
+                && let Plan::Lookup(ask) = &cache_plan
+                && let Some(copy) = cache::revalidated(&cx, ask, &mut pending, &resp)
+            {
+                let kept = from_copy(route, cache::answer_of(&cx, copy), Label::Miss);
+                emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, kept.status);
+                return answer(kept);
+            }
+            if let Some(spec) = &route.compression {
+                let stats = shared.edge.app(&route.app_id);
+                compress::apply(&stats, spec, &req, &route.session, &mut resp).await;
+            }
+            match &cache_plan {
+                Plan::Lookup(ask) if cache_plan.fills() => {
+                    cache::fill(shared, route, ask, &req, &resp, pending.take_guard());
+                    crate::upstream::apply_response_header_rules(route, &mut resp);
+                    // The visitor's own condition did not go to the application.
+                    if let Some(held) = cache::if_held(&req, &resp) {
+                        resp = held;
+                    }
+                }
+                _ => {}
+            }
+            cache::drop_copies(shared, route, &req, &peer, resp.status).await;
+            if let Some(label) = cache_plan.label() {
+                cache::tag(route, &mut resp, label);
+            }
             emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, resp.status);
             answer(resp)
         }
-        Ok(Forwarded::Stream(s)) => {
+        Ok(Forwarded::Stream(mut s)) => {
+            if route.compression.is_some() {
+                compress::note_streamed(
+                    &shared.edge.app(&route.app_id),
+                    &req,
+                    &route.session,
+                    &s.head,
+                );
+            }
+            if let Plan::Lookup(ask) = &cache_plan {
+                cache::note_streamed(route, ask);
+            }
+            cache::drop_copies(shared, route, &req, &peer, s.head.status).await;
+            if let Some(label) = cache_plan.label() {
+                cache::tag(route, &mut s.head, label);
+            }
             emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, s.head.status);
             Ok(Done::Stream(s))
         }
@@ -749,12 +872,264 @@ pub(crate) async fn handle(
                 route.app_id,
                 route.upstream
             );
+            if let Some(copy) = cache::on_error(&cx, &pending) {
+                let stale = from_copy(route, copy, Label::Stale);
+                emit_decision_event(sink, &route.app_id, mode, &areq, &v, latency, stale.status);
+                return answer(stale);
+            }
             emit_upstream_error_event(sink, &route.app_id, mode, &areq, latency);
-            answer(OutboundResponse::with(
-                502,
-                "application/json",
-                UPSTREAM_UNAVAILABLE,
-            ))
+            let mut resp = OutboundResponse::with(502, "application/json", UPSTREAM_UNAVAILABLE);
+            if let Some(label) = cache_plan.label() {
+                cache::tag(route, &mut resp, label);
+            }
+            answer(resp)
         }
+    }
+}
+
+/// An answer made from a stored copy: the response header rules of the app apply as they do to
+/// every answer, then `X-Cache` says what the cache did.
+fn from_copy(route: &Route, mut resp: OutboundResponse, label: Label) -> OutboundResponse {
+    crate::upstream::apply_response_header_rules(route, &mut resp);
+    cache::tag(route, &mut resp, label);
+    resp
+}
+
+/// Sends the request to the application of the route and returns what it answered. `validator`
+/// makes it the question of the response cache (the stored copy's validators in place of the
+/// visitor's conditions). `keep_copy` says the answer may be kept: it is asked with no condition
+/// of the visitor's, whose `304` or `412` would be no answer to keep, and with the one coding the
+/// copy is made in (`Accept-Encoding`), so that an application that compresses by itself answers
+/// in it. It is left without the response header rules, which run after the copy is made. The
+/// error is what the log says: how the request failed, and why.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_upstream(
+    shared: &Shared,
+    route: &Route,
+    req: &InboundRequest,
+    peer: &IpAddress,
+    remote: &str,
+    fbody: &[u8],
+    ct_override: Option<&[u8]>,
+    validator: Option<&cache::Validator>,
+    keep_copy: bool,
+) -> Result<Forwarded, (&'static str, String)> {
+    let validator = validator.or_else(|| keep_copy.then_some(&cache::NO_CONDITIONS));
+    let target = upstream_target(route, req);
+    match &route.target {
+        Target::Fcgi(pool) => {
+            let mut hm = req.headers.clone();
+            if let Some(ct) = ct_override {
+                hm.insert(b"Content-Type".to_vec(), vec![ct.to_vec()]);
+            }
+            // PHP sees the same client headers as an HTTP upstream.
+            // Every spelling that becomes the same CGI param (`X_Forwarded_For`, `X-Real_IP`) goes
+            // too: PHP-FPM keeps the last of a repeated param and the sorted map put such a
+            // spelling after ours, so a client could name its own address.
+            // With the cache on, what an untrusted peer says in the headers that are not part of
+            // the key is not sent on. `X-Forwarded-Proto` goes on as a trusted proxy wrote it, and
+            // from any other peer as the key reads it, with the cache on or off: `https` over TLS
+            // or when the first value says so, nothing otherwise, so a front proxy that ends TLS
+            // still tells PHP, and a value of any other form cannot make a third kind of answer.
+            let drop_unkeyed = cache::drops_unkeyed_inputs(route, peer);
+            // The host is the agent's word too, as on the HTTP path, from every peer: a trusted
+            // proxy that passes the client's `X-Forwarded-Host` on would make the application
+            // write it into its links, and the key does not hold it.
+            let cache_on = route.cache_active().is_some();
+            hm.retain(|k, _| {
+                if crate::cache::forwarded_proto(k)
+                    || (drop_unkeyed && crate::cache::unkeyed_input(k))
+                {
+                    return false;
+                }
+                if cache_on && crate::cache::forwarded_host(k) {
+                    return false;
+                }
+                !matches!(
+                    cgi_header_param(k).as_slice(),
+                    b"HTTP_X_REAL_IP" | b"HTTP_X_FORWARDED_FOR" | b"HTTP_X_FORWARDED_PROTO"
+                )
+            });
+            if let Some(scheme) = cache::forwarded_scheme(req, cache::trusts(route, peer)) {
+                hm.insert(b"X-Forwarded-Proto".to_vec(), vec![scheme.to_vec()]);
+            }
+            if cache_on {
+                hm.insert(b"X-Forwarded-Host".to_vec(), vec![req.host.clone()]);
+            }
+            hm.insert(b"X-Real-IP".to_vec(), vec![remote.as_bytes().to_vec()]);
+            hm.insert(
+                b"X-Forwarded-For".to_vec(),
+                vec![outgoing_forwarded_for(
+                    peer,
+                    &req.lines,
+                    &route.proxy_config,
+                )],
+            );
+            if keep_copy {
+                hm.retain(|k, _| cgi_header_param(k) != b"HTTP_ACCEPT_ENCODING");
+                hm.insert(
+                    b"Accept-Encoding".to_vec(),
+                    vec![cache::upstream_encoding(route, req).to_vec()],
+                );
+            }
+            if let Some(v) = validator {
+                v.apply_map(&mut hm);
+            }
+            crate::fastcgi::forward_fcgi(pool, &req.method, &target, &req.host, remote, &hm, fbody)
+                .await
+                .map(|mut r| {
+                    if !keep_copy {
+                        crate::upstream::apply_response_rules(
+                            route,
+                            &req.forward_path,
+                            &req.request_target,
+                            &mut r,
+                        );
+                    }
+                    Forwarded::Whole(r)
+                })
+                .map_err(|e| ("fastcgi ", e))
+        }
+        Target::Http(t) => {
+            let mut head = crate::upstream::upstream_request(
+                route,
+                t,
+                req,
+                &target,
+                peer,
+                remote,
+                fbody,
+                ct_override,
+            )
+            .map_err(|e| ("", e.to_string()))?;
+            if keep_copy {
+                // The value is one of three fixed tokens, which http never refuses.
+                let _ = head.insert_header("Accept-Encoding", cache::upstream_encoding(route, req));
+            }
+            if let Some(v) = validator {
+                v.apply_http(&mut head);
+            }
+            let rewrites = crate::upstream::rewrites_response_body(route, &req.forward_path);
+            crate::upstream::forward_http(shared, route, t, head, fbody, !rewrites)
+                .await
+                .map(|f| match f {
+                    Forwarded::Whole(r) if keep_copy => Forwarded::Whole(r),
+                    Forwarded::Whole(mut r) => {
+                        crate::upstream::apply_response_rules(
+                            route,
+                            &req.forward_path,
+                            &req.request_target,
+                            &mut r,
+                        );
+                        Forwarded::Whole(r)
+                    }
+                    Forwarded::Stream(mut s) => {
+                        crate::upstream::apply_response_header_rules(route, &mut s.head);
+                        Forwarded::Stream(s)
+                    }
+                })
+                .map_err(|e| ("", e))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cert_store::BookChange;
+    use crate::config::{AppSpec, TlsSite, build_route};
+    use crate::request::TlsClient;
+    use wafio_domain::ip_address::parse_ip_address;
+
+    const LISTED: &[u8] = b"t13d0000h2_000000000000_000000000000";
+
+    fn route(edge: bool, proxy_config: &str) -> Route {
+        build_route(&AppSpec {
+            app_id: "a".into(),
+            listen_host: String::new(),
+            listen_port: 0,
+            upstream: "http://127.0.0.1:1".into(),
+            mode: "block".into(),
+            proxy_config: proxy_config.as_bytes().to_vec(),
+            rules_json: Vec::new(),
+            fcgi_doc_root: String::new(),
+            fcgi_index: String::new(),
+            fcgi_keep_conn: false,
+            maintenance: Vec::new(),
+            analysis: Arc::new(crate::testing::analysis_setup(b"{}")),
+            tls: edge.then(|| TlsSite {
+                listen: "0.0.0.0:443".into(),
+                hosts: vec!["shop.test".into()],
+                certificate: BookChange::Keep,
+                redirect_listen: None,
+                canonical_host: None,
+            }),
+            compression: None,
+            static_files: None,
+            cache: None,
+            session_cookies: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    /// A request that carries `X-JA4` and `X-JA3` headers and the outcome of a TLS handshake whose
+    /// hello gave `ja4`.
+    fn request(ja4: Option<&str>) -> InboundRequest {
+        let mut req = InboundRequest {
+            tls: Some(Arc::new(TlsClient {
+                server_name: "shop.test".into(),
+                ja4: ja4.map(str::to_owned),
+            })),
+            ..InboundRequest::default()
+        };
+        req.headers.insert(b"X-JA4".to_vec(), vec![LISTED.to_vec()]);
+        req.headers
+            .insert(b"X-JA3".to_vec(), vec![b"ja3-from-header".to_vec()]);
+        req
+    }
+
+    fn peer(ip: &str) -> IpAddress {
+        parse_ip_address(ip.as_bytes()).unwrap()
+    }
+
+    /// A client of an app the agent serves over HTTPS writes the fingerprint headers itself, so
+    /// they count only from a peer that `proxy_config` trusts as a proxy. This is reached when the
+    /// handshake gave no JA4 (a hello that spans two TLS records).
+    #[test]
+    fn an_app_served_by_the_agent_reads_fingerprint_headers_only_from_a_trusted_proxy() {
+        let req = request(None);
+        let from_header = (LISTED.to_vec(), b"ja3-from-header".to_vec());
+        let nothing = (Vec::new(), Vec::new());
+        let (client, proxy) = (peer("203.0.113.9"), peer("10.1.2.3"));
+
+        // The agent is the edge and trusts no proxy: nobody may name a fingerprint.
+        let alone = route(true, "");
+        assert_eq!(read_client_fingerprints(&req, &alone, &client), nothing);
+        assert_eq!(read_client_fingerprints(&req, &alone, &proxy), nothing);
+
+        // It trusts proxies on private addresses: a public client still may not, a proxy may.
+        let trusting = route(true, r#"{"trust_forwarded":true}"#);
+        assert_eq!(read_client_fingerprints(&req, &trusting, &client), nothing);
+        assert_eq!(
+            read_client_fingerprints(&req, &trusting, &proxy),
+            from_header
+        );
+
+        // An app the agent is not the edge of reads the headers from any peer, as before.
+        let behind = route(false, "");
+        assert_eq!(
+            read_client_fingerprints(&req, &behind, &client),
+            from_header
+        );
+    }
+
+    #[test]
+    fn the_ja4_of_the_handshake_wins_over_a_header_even_from_a_trusted_proxy() {
+        let trusting = route(true, r#"{"trust_forwarded":true}"#);
+        let req = request(Some("t13d1516h2_8daaf6152771_02713d6af862"));
+        assert_eq!(
+            read_client_fingerprints(&req, &trusting, &peer("10.1.2.3")),
+            (b"t13d1516h2_8daaf6152771_02713d6af862".to_vec(), Vec::new())
+        );
     }
 }

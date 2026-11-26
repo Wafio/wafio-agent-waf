@@ -50,10 +50,16 @@ async fn run() -> std::io::Result<()> {
         rules_json: Vec::new(),
         fcgi_doc_root: String::new(),
         fcgi_index: String::new(),
+        fcgi_keep_conn: false,
         maintenance: arg("--maintenance-file")
             .and_then(|f| std::fs::read(f).ok())
             .unwrap_or_default(),
         analysis: Arc::new(wafio_proxy::testing::analysis_setup(br#"{}"#)),
+        tls: None,
+        compression: None,
+        static_files: None,
+        cache: None,
+        session_cookies: Vec::new(),
     };
     proxy.apply(vec![app]).map_err(std::io::Error::other)?;
     upgrade::notify_ready();

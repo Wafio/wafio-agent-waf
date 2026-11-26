@@ -1,6 +1,6 @@
 //! The inline proxy: process-wide dependencies plus the per-app listeners.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::TcpListener as StdListener;
 use std::os::fd::RawFd;
 use std::sync::Arc;
@@ -12,9 +12,15 @@ use wafio_agent_pages::challenge_handler::CaptchaVerifier;
 use wafio_agent_pages::goodbot::VerifiedBotChecker;
 use wafio_agent_pages::iprep::ReputationChecker;
 
-use crate::config::{AppSpec, Route, build_route};
+use crate::cache::{CacheHost, CacheLimits, valid_app_id};
+use crate::cert_store::CertBook;
+use crate::config::{AppSpec, Route, TlsSite, build_route};
 use crate::decision::DecisionSink;
-use crate::listeners::{ROUTE_DRAIN_GRACE, RouteManager, RouteSpec};
+use crate::edge_stats::{CompressionCounters, EdgeStats};
+use crate::https::{RedirectTarget, TLS_HANDSHAKE_TIMEOUT};
+use crate::listeners::{ROUTE_DRAIN_GRACE, RouteManager, RouteSpec, Serves};
+use crate::route::CONNECTION_LIMIT;
+use crate::static_files::{DISK_DEADLINE, DiskGate};
 
 /// Process-wide dependencies, set once at start.
 pub struct ProxyOptions {
@@ -31,6 +37,16 @@ pub struct ProxyOptions {
     pub inherited: HashMap<String, StdListener>,
     /// Drain timeout of a removed or shut down route.
     pub drain_timeout: Duration,
+    /// How long a client of an HTTPS listener has for its first TLS record and the handshake.
+    pub tls_handshake_timeout: Duration,
+    /// Connections one listener serves at once; more are closed (a plain listener answers 503).
+    pub connection_limit: usize,
+    /// Blocking threads that the folders of static files may use at once (twice the workers, at
+    /// least 8, unless set). A request that finds none free for 100 ms goes to the application.
+    pub disk_slots: usize,
+    /// The cache directory the apps with a response cache keep their copies in; `None` = no app
+    /// has a cache, whatever its bundle says.
+    pub cache: Option<Arc<CacheHost>>,
 }
 
 impl ProxyOptions {
@@ -42,6 +58,10 @@ impl ProxyOptions {
             captcha: None,
             inherited: HashMap::new(),
             drain_timeout: ROUTE_DRAIN_GRACE,
+            tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
+            connection_limit: CONNECTION_LIMIT,
+            disk_slots: DiskGate::default_slots(),
+            cache: None,
         }
     }
 }
@@ -54,10 +74,19 @@ pub(crate) struct Shared {
     pub captcha: Option<Arc<dyn CaptchaVerifier + Send + Sync>>,
     pub connector: Connector,
     pub transport: TransportConnector,
+    /// The certificates of every TLS listener, by app.
+    pub book: Arc<CertBook>,
+    /// What the edge parts of each app count.
+    pub edge: EdgeStats,
+    /// The blocking threads the folders of static files and the cache share.
+    pub disk: DiskGate,
+    /// The directory of the response caches.
+    pub cache: Option<Arc<CacheHost>>,
 }
 
 pub struct Proxy {
     manager: RouteManager,
+    shared: Arc<Shared>,
 }
 
 fn format_host_port(host: &str, port: u16) -> String {
@@ -77,28 +106,84 @@ impl Proxy {
             captcha: opts.captcha,
             connector: Connector::new(None),
             transport: TransportConnector::new(None),
+            book: Arc::default(),
+            edge: EdgeStats::default(),
+            disk: DiskGate::new(opts.disk_slots, DISK_DEADLINE),
+            cache: opts.cache,
         });
         Proxy {
-            manager: RouteManager::new(shared, opts.drain_timeout, opts.inherited),
+            shared: shared.clone(),
+            manager: RouteManager::new(
+                shared,
+                opts.drain_timeout,
+                opts.tls_handshake_timeout,
+                opts.connection_limit,
+                opts.inherited,
+            ),
         }
     }
 
-    /// Makes the live listeners exactly the bundle's apps with a listen port. Every route is
-    /// built and every new socket bound first; any error changes nothing. Kept listeners switch
-    /// to the new route for their next request, removed ones stop accepting at once and drain;
-    /// a FastCGI request still running on a replaced route finishes on its own connection. The
-    /// binary publishes its executors (stores for the next bundle) only after `Ok`. Must run
-    /// inside the tokio runtime.
+    /// Makes the live listeners exactly the bundle's apps with a listen port, plus the HTTPS and
+    /// redirect listeners of the apps that have a `tls` site; such an app opens no plain listener
+    /// of its own. Every route is built, every certificate read and every new socket bound first;
+    /// any error changes nothing. Kept
+    /// listeners switch to the new route for their next request, removed ones stop accepting at
+    /// once and drain; FastCGI pools of replaced routes are closed, and a request still running
+    /// there finishes on its own connection. The binary publishes its executors (stores for the
+    /// next bundle) only after `Ok`. Must run inside the tokio runtime.
     pub fn apply(&self, apps: Vec<AppSpec>) -> Result<(), String> {
         let mut specs = Vec::new();
         let mut addresses = HashSet::new();
         let mut proxy_cfgs = Vec::new();
+        let mut https: BTreeMap<String, Vec<(Arc<Route>, TlsSite)>> = BTreeMap::new();
+        let mut redirects: BTreeMap<String, HashMap<String, RedirectTarget>> = BTreeMap::new();
         for app in &apps {
-            let route = build_route(app).map_err(|e| {
+            let mut route = build_route(app).map_err(|e| {
                 tracing::warn!("[waf-agent] {e}");
                 "invalid app route in WAF bundle".to_string()
             })?;
+            if let (Some(host), Some(cache)) = (&self.shared.cache, route.cache.as_mut()) {
+                cache.app = host.app(&app.app_id);
+            }
+            let route = Arc::new(route);
             proxy_cfgs.push(route.proxy_config.clone());
+            if let Some(site) = &app.tls {
+                let Some(port) = site
+                    .listen
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse().ok())
+                else {
+                    tracing::warn!(
+                        "[waf-agent] app {}: TLS listen address has no port",
+                        app.app_id
+                    );
+                    return Err("invalid TLS site settings".into());
+                };
+                if let Some(address) = &site.redirect_listen {
+                    let hosts = redirects.entry(address.clone()).or_default();
+                    let target = RedirectTarget {
+                        port,
+                        app_id: app.app_id.clone(),
+                        canonical_host: site.canonical_host.clone(),
+                    };
+                    for host in &site.hosts {
+                        let other = hosts.insert(host.to_ascii_lowercase(), target.clone());
+                        if other.is_some_and(|other| other != target) {
+                            tracing::warn!(
+                                "[waf-agent] app {}: host {host} redirects to two places",
+                                app.app_id
+                            );
+                            return Err("invalid TLS site settings".into());
+                        }
+                    }
+                }
+                https
+                    .entry(site.listen.clone())
+                    .or_default()
+                    .push((route.clone(), site.clone()));
+                // The bundle's address is not served: the app answers on its HTTPS listener only.
+                continue;
+            }
             if app.listen_port == 0 {
                 continue;
             }
@@ -113,12 +198,51 @@ impl Proxy {
             }
             specs.push(RouteSpec {
                 address: addr,
-                route: Arc::new(route),
+                serves: Serves::App(route),
             });
         }
+        specs.extend(https.into_iter().map(|(address, sites)| RouteSpec {
+            address,
+            serves: Serves::Tls(sites),
+        }));
+        specs.extend(redirects.into_iter().map(|(address, hosts)| RouteSpec {
+            address,
+            serves: Serves::Redirect(hosts),
+        }));
         self.manager.apply(specs)?;
+        if let Some(host) = &self.shared.cache {
+            let limits: Vec<CacheLimits> = apps
+                .iter()
+                .filter_map(|a| {
+                    let spec = a.cache.as_ref()?;
+                    valid_app_id(&a.app_id).then(|| spec.limits(&a.app_id))
+                })
+                .collect();
+            host.commit(&limits);
+        }
         wafio_agent_io::ip_jail_guard::install_trusted_proxy_configs(proxy_cfgs);
+        self.shared
+            .edge
+            .retain(&apps.iter().map(|a| a.app_id.as_str()).collect());
         Ok(())
+    }
+
+    /// What the compression of `app_id` did over the last hour; `None` for an app that never
+    /// compressed or counted anything since this process started.
+    pub fn compression_counters(&self, app_id: &str) -> Option<CompressionCounters> {
+        let now = u64::try_from(crate::decision::now_unix()).unwrap_or(0);
+        Some(self.shared.edge.get(app_id)?.compression_counters(now))
+    }
+
+    /// The certificates the TLS listeners serve, by app id, and the validation answers they give.
+    pub fn certificates(&self) -> Arc<CertBook> {
+        self.manager.certificates()
+    }
+
+    /// The address and the error kind behind the last `apply` that failed with
+    /// `listeners::BIND_ERROR`. Read it before the next apply.
+    pub fn bind_failure(&self) -> Option<(String, std::io::ErrorKind)> {
+        self.manager.bind_failure()
     }
 
     /// Live listen addresses.
@@ -134,6 +258,13 @@ impl Proxy {
     /// The listening sockets by address, for `upgrade::spawn_successor`.
     pub fn handover_fds(&self) -> Vec<(String, RawFd)> {
         self.manager.handover_fds()
+    }
+
+    /// Stops accepting and returns once no accept loop of this process accepts any more;
+    /// connections already accepted go on until `shutdown`. Later `apply` calls fail.
+    /// `handed_over`: a successor serves the same sockets (close, never shut down).
+    pub async fn stop_accepting(&self, handed_over: bool) {
+        self.manager.stop_accepting(handed_over).await;
     }
 
     /// Stops accepting and drains; later `apply` calls fail.

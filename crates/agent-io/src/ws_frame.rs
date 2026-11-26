@@ -237,7 +237,7 @@ pub struct WsConnection {
     close_lock: Mutex<()>,
 }
 
-fn random_u64() -> u64 {
+pub(crate) fn random_u64() -> u64 {
     let mut h = RandomState::new().build_hasher();
     h.write_u64(Instant::now().elapsed().as_nanos() as u64);
     h.finish()

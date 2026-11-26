@@ -1,18 +1,16 @@
-//! Connection cap, timeout and upstream host tests, plus protocol tests against a fake FastCGI
+//! Pool, timeout and upstream host tests, plus protocol tests against a fake FastCGI
 //! responder.
 
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use tokio::io::ReadBuf;
 use tokio::net::TcpListener;
 
 use super::*;
 
-/// No-op connection for pool accounting: reads EOF, accepts writes (or fails them), records
-/// when it is dropped (closed).
+/// No-op connection for pool accounting: has no input to read, accepts writes (or fails them),
+/// records when it is dropped (closed).
 struct FakeConn {
     closed: Arc<AtomicBool>,
     broken_write: bool,
@@ -30,7 +28,7 @@ impl AsyncRead for FakeConn {
         _: &mut Context<'_>,
         _: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+        Poll::Pending
     }
 }
 
@@ -52,22 +50,47 @@ impl AsyncWrite for FakeConn {
 /// A pool whose dial hands out fake connections; the flags record closes.
 type CloseFlags = Arc<Mutex<Vec<Arc<AtomicBool>>>>;
 
-fn fake_pool(max_conns: i64) -> (Arc<FastCgiConnectionPool>, CloseFlags) {
+fn fake_pool_with(
+    max_conns: i64,
+    keep_conn: bool,
+    broken_write: bool,
+    deadlines: FastCgiDeadlines,
+) -> (Arc<FastCgiConnectionPool>, CloseFlags) {
     let flags: CloseFlags = Arc::default();
     let f = flags.clone();
-    let pool =
-        FastCgiConnectionPool::new("tcp", "fake-addr", max_conns, FastCgiDeadlines::default())
-            .with_dial(move || {
-                let closed = Arc::new(AtomicBool::new(false));
-                f.lock().unwrap().push(closed.clone());
-                Box::pin(async move {
-                    Ok(Box::new(FakeConn {
-                        closed,
-                        broken_write: false,
-                    }) as Box<dyn FcgiStream>)
-                })
-            });
+    let mut pool =
+        FastCgiConnectionPool::new("tcp", "fake-addr", max_conns, deadlines).with_dial(move || {
+            let closed = Arc::new(AtomicBool::new(false));
+            f.lock().unwrap().push(closed.clone());
+            Box::pin(async move {
+                Ok(Box::new(FakeConn {
+                    closed,
+                    broken_write,
+                }) as Box<dyn FcgiStream>)
+            })
+        });
+    Arc::get_mut(&mut pool).expect("unshared pool").keep_conn = keep_conn;
     (pool, flags)
+}
+
+/// A pool that closes every connection after its reply (the default).
+fn fake_pool(max_conns: i64) -> (Arc<FastCgiConnectionPool>, CloseFlags) {
+    fake_pool_with(max_conns, false, false, FastCgiDeadlines::default())
+}
+
+/// A pool with `keep_conn`; an idle connection lives `ttl`.
+fn kept_pool(max_conns: i64, ttl: Duration) -> (Arc<FastCgiConnectionPool>, CloseFlags) {
+    let deadlines = FastCgiDeadlines {
+        max_idle_age: ttl,
+        ..Default::default()
+    };
+    fake_pool_with(max_conns, true, false, deadlines)
+}
+
+fn force_stale(p: &FastCgiConnectionPool) {
+    let mut st = p.lock();
+    let n = st.idle.len();
+    st.idle[n - 1].last_used_at = Instant::now() - Duration::from_secs(120);
 }
 
 #[tokio::test]
@@ -106,35 +129,131 @@ async fn pool_exhausted_after_wait() {
     );
 }
 
-/// A write that fails is not retried: the one connection is closed, its slot is free and the error
-/// is the write error. PHP-FPM may already be running the script, so a second copy could run it twice.
+/// A write that fails is not retried, with or without `keep_conn`: the one connection is closed,
+/// its slot is free and the error is the write error. PHP-FPM may already be running the script, so a
+/// second copy could run it twice.
 #[tokio::test]
 async fn a_failed_write_is_not_retried() {
-    let flags: CloseFlags = Arc::default();
-    let dialled = flags.clone();
-    let pool = FastCgiConnectionPool::new("tcp", "fake-addr", 1, FastCgiDeadlines::default())
-        .with_dial(move || {
-            let closed = Arc::new(AtomicBool::new(false));
-            dialled.lock().unwrap().push(closed.clone());
-            Box::pin(async move {
-                Ok(Box::new(FakeConn {
-                    closed,
-                    broken_write: true,
-                }) as Box<dyn FcgiStream>)
-            })
-        });
-    let err = pool
-        .send_request(b"POST", b"/", b"h", b"r", &[], b"body")
-        .await
-        .unwrap_err();
-    assert_eq!(err, "broken pipe");
-    let all = flags.lock().unwrap();
-    assert_eq!(all.len(), 1, "the request was sent again");
-    assert!(
-        all[0].load(Ordering::SeqCst),
-        "the connection was left open"
+    for keep_conn in [false, true] {
+        let (pool, flags) = fake_pool_with(1, keep_conn, true, FastCgiDeadlines::default());
+        let err = pool
+            .send_request(b"POST", b"/", b"h", b"r", &[], b"body")
+            .await
+            .unwrap_err();
+        assert_eq!(err, "broken pipe");
+        let all = flags.lock().unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "the request was sent again, keep_conn {keep_conn}"
+        );
+        assert!(
+            all[0].load(Ordering::SeqCst),
+            "the connection was left open, keep_conn {keep_conn}"
+        );
+        assert_eq!((pool.open_connection_count(), pool.idle_count()), (0, 0));
+    }
+}
+
+#[tokio::test]
+async fn a_pool_without_keep_conn_closes_a_returned_connection() {
+    let (p, flags) = fake_pool(4);
+    let c = p.get().await.unwrap();
+    p.put(c);
+    assert!(flags.lock().unwrap()[0].load(Ordering::SeqCst));
+    assert_eq!((p.open_connection_count(), p.idle_count()), (0, 0));
+}
+
+#[tokio::test]
+async fn stale_idle_no_slot_leak() {
+    const MAX: i64 = 8;
+    let (p, _) = kept_pool(MAX, Duration::from_secs(60));
+    for i in 0..MAX + 4 {
+        let c = p
+            .get()
+            .await
+            .unwrap_or_else(|e| panic!("get() iteration {i}: {e}"));
+        p.put(c);
+        force_stale(&p);
+        assert_eq!(p.open_connection_count(), 1, "iteration {i}");
+    }
+    p.close();
+    assert_eq!(p.open_connection_count(), 0);
+}
+
+#[tokio::test]
+async fn fresh_idle_reuses_slot() {
+    let (p, _) = kept_pool(4, Duration::from_secs(60));
+    let first = p.get().await.unwrap();
+    let id = first.id;
+    p.put(first);
+    let c = p.get().await.unwrap();
+    assert_eq!(c.id, id, "fresh idle connection was not reused");
+    assert_eq!(p.open_connection_count(), 1);
+    p.close();
+}
+
+#[tokio::test]
+async fn lifo() {
+    let (p, _) = kept_pool(4, Duration::from_secs(60));
+    let mut conns = Vec::new();
+    for _ in 0..3 {
+        conns.push(p.get().await.unwrap());
+    }
+    let last = conns[2].id;
+    for c in conns {
+        p.put(c);
+    }
+    assert_eq!(p.get().await.unwrap().id, last);
+    p.close();
+}
+
+#[tokio::test]
+async fn shrinks_after_burst() {
+    let ttl = Duration::from_millis(250);
+    let (p, flags) = kept_pool(16, ttl);
+    let mut burst = Vec::new();
+    for _ in 0..10 {
+        burst.push(p.get().await.unwrap());
+    }
+    for c in burst {
+        p.put(c);
+    }
+    let end = Instant::now() + 4 * ttl;
+    while Instant::now() < end {
+        let c = p.get().await.unwrap();
+        p.put(c);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        p.open_connection_count(),
+        1,
+        "open connections under light traffic"
     );
-    assert_eq!(pool.open_connection_count(), 0);
+    let closed = flags.lock().unwrap()[..10]
+        .iter()
+        .filter(|f| f.load(Ordering::SeqCst))
+        .count();
+    assert!(closed >= 9, "burst connections closed: {closed}");
+    let deadline = Instant::now() + 20 * ttl;
+    while p.open_connection_count() != 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!((p.open_connection_count(), p.idle_count()), (0, 0));
+    p.close();
+}
+
+#[tokio::test]
+async fn put_after_close() {
+    let (p, flags) = kept_pool(4, Duration::from_secs(60));
+    let c = p.get().await.unwrap();
+    p.close();
+    p.put(c);
+    assert!(
+        flags.lock().unwrap()[0].load(Ordering::SeqCst),
+        "connection returned after close was not closed"
+    );
+    assert_eq!((p.open_connection_count(), p.idle_count()), (0, 0));
 }
 
 #[test]
@@ -149,6 +268,7 @@ fn honours_configured_timeouts() {
             write: s(120),
             dial: s(3),
             slot_wait: s(7),
+            max_idle_age: s(15),
             unlimited: false,
         },
     );
@@ -159,6 +279,7 @@ fn honours_configured_timeouts() {
             write: s(120),
             dial: s(3),
             slot_wait: s(7),
+            max_idle_age: s(15),
             unlimited: false
         }
     );
@@ -176,6 +297,7 @@ fn honours_configured_timeouts() {
             write: s(30),
             dial: s(5),
             slot_wait: s(5),
+            max_idle_age: s(60),
             unlimited: false
         }
     );
@@ -208,6 +330,7 @@ fn honours_configured_timeouts() {
             write: Duration::ZERO,
             dial: s(5),
             slot_wait: s(5),
+            max_idle_age: s(60),
             unlimited: true
         }
     );
@@ -399,6 +522,7 @@ fn parse_upstream_forms() {
         "fcgi:unix:/run/php/fpm.sock?root=/var/www&index=app.php",
         "",
         "",
+        false,
         4,
         FastCgiDeadlines::default(),
     )
@@ -415,6 +539,7 @@ fn parse_upstream_forms() {
         "fcgi:unix:/run/php/fpm.sock:",
         "/srv",
         "i.php",
+        false,
         4,
         FastCgiDeadlines::default(),
     )
@@ -427,8 +552,15 @@ fn parse_upstream_forms() {
         ),
         ("/run/php/fpm.sock", &b"/srv"[..], &b"i.php"[..])
     );
-    let p =
-        parse_upstream_spec("fcgi://127.0.0.1", "", "", 4, FastCgiDeadlines::default()).unwrap();
+    let p = parse_upstream_spec(
+        "fcgi://127.0.0.1",
+        "",
+        "",
+        false,
+        4,
+        FastCgiDeadlines::default(),
+    )
+    .unwrap();
     assert_eq!(
         (p.network.as_str(), p.address.as_str(), p.index.as_slice()),
         ("tcp", "127.0.0.1:9000", &b"index.php"[..])
@@ -437,6 +569,7 @@ fn parse_upstream_forms() {
         "fcgi://php:9001?root=/a",
         "",
         "",
+        false,
         4,
         FastCgiDeadlines::default(),
     )
@@ -453,7 +586,7 @@ fn parse_upstream_forms() {
         "fcgi:///path",
     ] {
         assert!(
-            parse_upstream_spec(bad, "", "", 1, FastCgiDeadlines::default()).is_err(),
+            parse_upstream_spec(bad, "", "", false, 1, FastCgiDeadlines::default()).is_err(),
             "{bad}"
         );
     }
@@ -483,7 +616,7 @@ fn normalize_path_matches_reference() {
 
 /// A fake PHP-FPM that never closes a connection itself, so a closed connection is one the client
 /// closed. It answers each request with STDERR, STDOUT and END_REQUEST records that carry the request
-/// id `reply_id(record type)`, and reports the params and stdin.
+/// id `reply_id(record type, id of the request)`, and reports the params and stdin.
 struct FakeFpm {
     addr: std::net::SocketAddr,
     /// Connections accepted.
@@ -492,27 +625,46 @@ struct FakeFpm {
     closed: Arc<AtomicU64>,
     /// The flags byte of each FCGI_BEGIN_REQUEST.
     begin_flags: Arc<Mutex<Vec<u8>>>,
+    /// The request id of each FCGI_BEGIN_REQUEST.
+    begin_ids: Arc<Mutex<Vec<u16>>>,
     requests: tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, Vec<u8>)>,
 }
 
-async fn fake_responder(reply_id: impl Fn(u8) -> u16 + Send + Sync + 'static) -> FakeFpm {
+async fn fake_responder(reply_id: impl Fn(u8, u16) -> u16 + Send + Sync + 'static) -> FakeFpm {
+    fake_responder_with(false, reply_id).await
+}
+
+/// With `smuggle`, a second, complete reply for request 1 follows END_REQUEST in the same write, as
+/// when an unfixed PHP-FPM runs the body bytes the application left unread as a request.
+async fn fake_responder_with(
+    smuggle: bool,
+    reply_id: impl Fn(u8, u16) -> u16 + Send + Sync + 'static,
+) -> FakeFpm {
     let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = ln.local_addr().unwrap();
     let accepted = Arc::new(AtomicU64::new(0));
     let closed = Arc::new(AtomicU64::new(0));
     let begin_flags: Arc<Mutex<Vec<u8>>> = Arc::default();
-    let (acc, clo, flags) = (accepted.clone(), closed.clone(), begin_flags.clone());
+    let begin_ids: Arc<Mutex<Vec<u16>>> = Arc::default();
+    let (acc, clo) = (accepted.clone(), closed.clone());
+    let (flags, ids) = (begin_flags.clone(), begin_ids.clone());
     let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
     let reply_id = Arc::new(reply_id);
     tokio::spawn(async move {
         loop {
             let (mut c, _) = ln.accept().await.unwrap();
             acc.fetch_add(1, Ordering::SeqCst);
-            let (tx, clo, flags, reply_id) =
-                (tx.clone(), clo.clone(), flags.clone(), reply_id.clone());
+            let (tx, clo, flags, ids, reply_id) = (
+                tx.clone(),
+                clo.clone(),
+                flags.clone(),
+                ids.clone(),
+                reply_id.clone(),
+            );
             tokio::spawn(async move {
                 loop {
                     let (mut params, mut stdin) = (Vec::new(), Vec::new());
+                    let mut id = 0u16;
                     loop {
                         let mut h = [0u8; 8];
                         if c.read_exact(&mut h).await.is_err() {
@@ -525,7 +677,11 @@ async fn fake_responder(reply_id: impl Fn(u8) -> u16 + Send + Sync + 'static) ->
                         c.read_exact(&mut content).await.unwrap();
                         content.truncate(len);
                         match h[1] {
-                            FCGI_BEGIN_REQUEST => flags.lock().unwrap().push(content[2]),
+                            FCGI_BEGIN_REQUEST => {
+                                id = u16::from_be_bytes([h[2], h[3]]);
+                                ids.lock().unwrap().push(id);
+                                flags.lock().unwrap().push(content[2]);
+                            }
                             FCGI_PARAMS => params.extend(content),
                             FCGI_STDIN if len == 0 => break,
                             FCGI_STDIN => stdin.extend(content),
@@ -537,7 +693,7 @@ async fn fake_responder(reply_id: impl Fn(u8) -> u16 + Send + Sync + 'static) ->
                     send_record(
                         &mut out,
                         None,
-                        reply_id(FCGI_STDERR),
+                        reply_id(FCGI_STDERR, id),
                         FCGI_STDERR,
                         b"PHP notice",
                     )
@@ -545,21 +701,36 @@ async fn fake_responder(reply_id: impl Fn(u8) -> u16 + Send + Sync + 'static) ->
                     .unwrap();
                     let mut stdout = b"Status: 201 Created\r\nX-Echo: yes\r\n\r\n".to_vec();
                     stdout.extend_from_slice(&stdin);
-                    send_record(&mut out, None, reply_id(FCGI_STDOUT), FCGI_STDOUT, &stdout)
-                        .await
-                        .unwrap();
-                    send_empty_record(&mut out, None, reply_id(FCGI_STDOUT), FCGI_STDOUT)
+                    send_record(
+                        &mut out,
+                        None,
+                        reply_id(FCGI_STDOUT, id),
+                        FCGI_STDOUT,
+                        &stdout,
+                    )
+                    .await
+                    .unwrap();
+                    send_empty_record(&mut out, None, reply_id(FCGI_STDOUT, id), FCGI_STDOUT)
                         .await
                         .unwrap();
                     send_record(
                         &mut out,
                         None,
-                        reply_id(FCGI_END_REQUEST),
+                        reply_id(FCGI_END_REQUEST, id),
                         FCGI_END_REQUEST,
                         &[0; 8],
                     )
                     .await
                     .unwrap();
+                    if smuggle {
+                        let late = b"Status: 200 OK\r\n\r\nsmuggled";
+                        send_record(&mut out, None, 1, FCGI_STDOUT, late)
+                            .await
+                            .unwrap();
+                        send_record(&mut out, None, 1, FCGI_END_REQUEST, &[0; 8])
+                            .await
+                            .unwrap();
+                    }
                     let _ = c.write_all(&out).await;
                 }
             });
@@ -570,6 +741,7 @@ async fn fake_responder(reply_id: impl Fn(u8) -> u16 + Send + Sync + 'static) ->
         accepted,
         closed,
         begin_flags,
+        begin_ids,
         requests,
     }
 }
@@ -605,11 +777,12 @@ fn decode_params(mut b: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 #[tokio::test]
 async fn do_request_against_fake_responder() {
-    let mut fpm = fake_responder(|_| FCGI_REQUEST_ID).await;
+    let mut fpm = fake_responder(|_, _| FCGI_REQUEST_ID).await;
     let pool = parse_upstream_spec(
         &format!("fcgi://{}", fpm.addr),
         "/srv",
         "",
+        false,
         4,
         FastCgiDeadlines::default(),
     )
@@ -649,7 +822,7 @@ async fn do_request_against_fake_responder() {
 
 #[tokio::test]
 async fn each_request_gets_its_own_connection_and_flags_zero() {
-    let fpm = fake_responder(|_| FCGI_REQUEST_ID).await;
+    let fpm = fake_responder(|_, _| FCGI_REQUEST_ID).await;
     let pool =
         FastCgiConnectionPool::new("tcp", &fpm.addr.to_string(), 4, FastCgiDeadlines::default());
     for _ in 0..2 {
@@ -669,6 +842,11 @@ async fn each_request_gets_its_own_connection_and_flags_zero() {
         [0, 0],
         "FCGI_BEGIN_REQUEST flags"
     );
+    assert_eq!(
+        *fpm.begin_ids.lock().unwrap(),
+        [FCGI_REQUEST_ID; 2],
+        "without keep_conn every request is request 1"
+    );
     wait_for(&fpm.closed, 2).await;
     assert_eq!(
         fpm.closed.load(Ordering::SeqCst),
@@ -683,7 +861,8 @@ async fn each_request_gets_its_own_connection_and_flags_zero() {
 #[tokio::test]
 async fn a_record_for_another_request_fails_the_request() {
     for (record, other) in [(FCGI_STDERR, 2), (FCGI_STDOUT, 0), (FCGI_END_REQUEST, 7)] {
-        let fpm = fake_responder(move |t| if t == record { other } else { FCGI_REQUEST_ID }).await;
+        let fpm =
+            fake_responder(move |t, _| if t == record { other } else { FCGI_REQUEST_ID }).await;
         let pool = FastCgiConnectionPool::new(
             "tcp",
             &fpm.addr.to_string(),
@@ -707,6 +886,181 @@ async fn a_record_for_another_request_fails_the_request() {
             "connection left open, record type {record}"
         );
     }
+}
+
+/// A pool with `keep_conn` in front of `fpm`.
+fn kept_upstream(fpm: &FakeFpm) -> Arc<FastCgiConnectionPool> {
+    parse_upstream_spec(
+        &format!("fcgi://{}", fpm.addr),
+        "/srv",
+        "",
+        true,
+        4,
+        FastCgiDeadlines::default(),
+    )
+    .unwrap()
+}
+
+/// One GET through `pool`.
+async fn get_once(pool: &Arc<FastCgiConnectionPool>) -> Result<FastCgiReply, String> {
+    pool.send_request(b"GET", b"/", b"site", b"203.0.113.9", &[], b"")
+        .await
+}
+
+#[tokio::test]
+async fn a_kept_connection_is_reused_and_every_request_has_its_own_random_id() {
+    let fpm = fake_responder(|_, id| id).await;
+    let pool = kept_upstream(&fpm);
+    let body = vec![b'x'; 70_000];
+    let first = pool
+        .send_request(b"POST", b"/up.php", b"site", b"203.0.113.9", &[], &body)
+        .await
+        .unwrap();
+    assert_eq!((first.status, first.body), (201, body));
+    for _ in 0..7 {
+        assert_eq!(get_once(&pool).await.unwrap().status, 201);
+    }
+    assert_eq!(
+        fpm.accepted.load(Ordering::SeqCst),
+        1,
+        "FCGI_KEEP_CONN connection not reused"
+    );
+    assert_eq!(*fpm.begin_flags.lock().unwrap(), [FCGI_KEEP_CONN; 8]);
+    let ids = fpm.begin_ids.lock().unwrap().clone();
+    assert!(ids.iter().all(|&id| id != 0), "{ids:?}");
+    assert!(
+        ids.iter().any(|&id| id != ids[0]),
+        "the request id never changed: {ids:?}"
+    );
+    assert_eq!((pool.open_connection_count(), pool.idle_count()), (1, 1));
+    assert_eq!(fpm.closed.load(Ordering::SeqCst), 0);
+    pool.close();
+    wait_for(&fpm.closed, 1).await;
+    assert_eq!(
+        fpm.closed.load(Ordering::SeqCst),
+        1,
+        "close() left the idle connection open"
+    );
+    assert_eq!(pool.open_connection_count(), 0);
+}
+
+/// A kept connection that has input left after the reply is closed instead of pooled, so the next
+/// request cannot read a reply that belongs to a request the application never got from the client.
+#[tokio::test]
+async fn a_kept_connection_with_unread_input_is_closed_not_pooled() {
+    let fpm = fake_responder_with(true, |_, id| id).await;
+    let pool = kept_upstream(&fpm);
+    let first = get_once(&pool).await.unwrap();
+    assert_eq!((first.status, first.body.len()), (201, 0));
+    assert_eq!(
+        (pool.open_connection_count(), pool.idle_count()),
+        (0, 0),
+        "a connection with input waiting is closed, not pooled"
+    );
+    let second = get_once(&pool).await.unwrap();
+    assert_eq!((second.status, second.body.len()), (201, 0));
+    assert_eq!(fpm.accepted.load(Ordering::SeqCst), 2);
+}
+
+/// A reply record with another request id fails the request, whichever record it is, and the kept
+/// connection is closed.
+#[tokio::test]
+async fn a_reply_for_another_request_id_fails_a_kept_connection() {
+    for record in [FCGI_STDERR, FCGI_STDOUT, FCGI_END_REQUEST] {
+        let fpm =
+            fake_responder(move |t, id| if t == record { id.wrapping_add(1) } else { id }).await;
+        let pool = kept_upstream(&fpm);
+        let err = get_once(&pool).await.unwrap_err();
+        let id = fpm.begin_ids.lock().unwrap()[0];
+        assert_eq!(
+            err,
+            format!(
+                "fcgi: reply record for request {}, expected {id}",
+                id.wrapping_add(1)
+            ),
+            "record type {record}"
+        );
+        assert_eq!((pool.open_connection_count(), pool.idle_count()), (0, 0));
+        wait_for(&fpm.closed, 1).await;
+        assert_eq!(
+            fpm.closed.load(Ordering::SeqCst),
+            1,
+            "connection left open, record type {record}"
+        );
+    }
+}
+
+/// Waits until the oldest idle connection of `pool` has input to read.
+async fn wait_for_input(pool: &FastCgiConnectionPool) {
+    let t = Instant::now();
+    while !pool.lock().idle[0].has_unread_input() {
+        assert!(t.elapsed() < Duration::from_secs(2), "no input arrived");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_idle_connection_that_got_input_or_was_closed_is_not_reused() {
+    let ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut pool = FastCgiConnectionPool::new(
+        "tcp",
+        &ln.local_addr().unwrap().to_string(),
+        4,
+        FastCgiDeadlines::default(),
+    );
+    Arc::get_mut(&mut pool).unwrap().keep_conn = true;
+    let c = pool.get().await.unwrap();
+    let (mut peer, _) = ln.accept().await.unwrap();
+    let first = c.id;
+    pool.put(c);
+    assert_eq!(pool.idle_count(), 1, "a connection with no input is pooled");
+    peer.write_all(b"x").await.unwrap();
+    wait_for_input(&pool).await;
+    let c = pool.get().await.unwrap();
+    assert_ne!(c.id, first, "a connection with input was reused");
+    assert_eq!(pool.open_connection_count(), 1);
+
+    let (peer, _) = ln.accept().await.unwrap();
+    let second = c.id;
+    pool.put(c);
+    drop(peer);
+    wait_for_input(&pool).await;
+    let c = pool.get().await.unwrap();
+    assert_ne!(c.id, second, "a connection the peer closed was reused");
+    assert_eq!(pool.open_connection_count(), 1);
+    drop(c);
+}
+
+/// A task that spent its budget on ready reads polls every tokio stream as Pending. The check for
+/// waiting input must not read that as "no input".
+#[tokio::test]
+async fn input_is_seen_after_the_task_budget_is_spent() {
+    let (near, mut far) = tokio::io::duplex(64);
+    let near = Mutex::new(Some(near));
+    let mut pool = FastCgiConnectionPool::new("tcp", "fake-addr", 4, FastCgiDeadlines::default())
+        .with_dial(move || {
+            let stream = near.lock().unwrap().take().expect("dialled once");
+            Box::pin(async move { Ok(Box::new(stream) as Box<dyn FcgiStream>) })
+        });
+    Arc::get_mut(&mut pool).unwrap().keep_conn = true;
+    let conn = pool.get().await.unwrap();
+    far.write_all(b"x").await.unwrap();
+    let mut conn = Some(conn);
+    std::future::poll_fn(|cx| {
+        let mut source = tokio::io::repeat(0);
+        let mut byte = [0u8; 1];
+        for _ in 0..1000 {
+            let _ = Pin::new(&mut source).poll_read(cx, &mut ReadBuf::new(&mut byte));
+        }
+        assert!(
+            !tokio::task::coop::has_budget_remaining(),
+            "the task budget was not spent"
+        );
+        pool.put(conn.take().unwrap());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(pool.idle_count(), 0, "a connection with input was pooled");
 }
 
 #[tokio::test]

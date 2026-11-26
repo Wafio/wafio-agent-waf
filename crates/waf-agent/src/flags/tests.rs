@@ -39,7 +39,7 @@ fn parse(args: &[&str]) -> AgentArgs {
 #[test]
 fn defaults_match_documented_values() {
     let f = parse(&[]);
-    assert_eq!(f.jail_threshold, 5);
+    assert_eq!(f.jail_threshold, 0);
     assert_eq!(f.jail_window_sec, 60);
     assert_eq!(f.jail_duration_sec, 3600);
     assert_eq!(f.jail_url, "http://127.0.0.1:18089/api/ebpf/blocklist");
@@ -178,6 +178,22 @@ fn env_fills_only_empty_flags() {
     assert_eq!(f.resolved_security_data_dir(), "/srv/data");
     assert!(f.legacy_data_dir_warning().is_none());
     assert!(f.check_required().is_ok());
+}
+
+#[test]
+fn the_tls_sites_file_is_gone_and_its_variable_gets_one_warning() {
+    assert!(Cli::try_parse_from(["wafio-waf-agent", "--tls-sites-file", "x"]).is_err());
+    let warning = |vars: &[(&'static str, &'static str)]| {
+        parse(&[])
+            .fill_from_env(&env(vars, &[]))
+            .into_iter()
+            .filter(|l| l.contains("WAFIO_TLS_SITES_FILE"))
+            .collect::<Vec<_>>()
+    };
+    assert!(warning(&[]).is_empty());
+    let lines = warning(&[("WAFIO_TLS_SITES_FILE", "/etc/wafio/tls-sites.json")]);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("no longer read") && lines[0].contains("dashboard"));
 }
 
 #[test]
@@ -420,4 +436,59 @@ fn engine_env_and_component_paths() {
     assert_eq!(paths["ua"], "/ua");
     assert_eq!(paths["ja3"], "");
     assert_eq!(paths.len(), 8);
+}
+
+#[test]
+fn the_acme_directory_is_the_one_of_lets_encrypt_unless_named_and_must_be_https() {
+    assert_eq!(
+        parse(&[]).resolved_acme_directory().unwrap(),
+        "https://acme-v02.api.letsencrypt.org/directory"
+    );
+    // The flag, and the environment when the flag is not given; the flag wins.
+    let f = parse(&["--acme-directory", "https://acme.test:14000/dir"]);
+    assert_eq!(
+        f.resolved_acme_directory().unwrap(),
+        "https://acme.test:14000/dir"
+    );
+    let mut f = parse(&[]);
+    f.fill_from_env(&env(
+        &[("WAFIO_ACME_DIRECTORY", "https://env.test/dir")],
+        &[],
+    ));
+    assert_eq!(f.resolved_acme_directory().unwrap(), "https://env.test/dir");
+    let mut f = parse(&["--acme-directory=https://flag.test/dir"]);
+    f.fill_from_env(&env(
+        &[("WAFIO_ACME_DIRECTORY", "https://env.test/dir")],
+        &[],
+    ));
+    assert_eq!(
+        f.resolved_acme_directory().unwrap(),
+        "https://flag.test/dir"
+    );
+    // The account key and every request go there: nothing but https is taken, from either.
+    for bad in [
+        "http://acme.test/dir",
+        "HTTP://acme.test/dir",
+        "ftp://acme.test/dir",
+        "acme.test/dir",
+        "https://",
+        "//acme.test",
+    ] {
+        let e = parse(&["--acme-directory", bad])
+            .resolved_acme_directory()
+            .unwrap_err();
+        assert!(
+            e.contains("--acme-directory") && e.contains("https"),
+            "{bad}: {e}"
+        );
+        let mut f = parse(&[]);
+        f.fill_from_env(&env(&[("WAFIO_ACME_DIRECTORY", bad)], &[]));
+        assert!(f.resolved_acme_directory().is_err(), "{bad}");
+    }
+    assert!(
+        parse(&["--acme-directory", "HTTPS://acme.test/dir"])
+            .resolved_acme_directory()
+            .is_ok(),
+        "the scheme is not case sensitive"
+    );
 }

@@ -5,6 +5,7 @@
 //! challenge) and hands the apps to [`crate::Proxy::apply`] as [`AppSpec`]s. Everything that
 //! needs Pingora or the FastCGI pool (upstream parsing, timeouts, pools) is built here.
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,10 +21,16 @@ use wafio_agent_pages::challenge::ChallengeSettings;
 use wafio_application::AnalyzeConfig;
 use wafio_domain::text_helpers::quote;
 use wafio_domain::{
-    ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config, timeout_or_default_ms,
+    ProxyConfig, is_unlimited, parse_maintenance, parse_proxy_config, strip_path_prefix_fault,
+    timeout_or_default_ms,
 };
 
+use crate::cache::{AppCache, CacheSpec, RouteCache, Settings};
+use crate::cert_store::BookChange;
 use crate::maintenance::MaintenanceRoute;
+use crate::redirect::MainHost;
+use crate::signed_in::SessionNames;
+use crate::static_files::{StaticFolder, StaticSpec};
 
 /// What one app's requests are analysed with. Immutable once applied; a bundle replaces it as
 /// a whole.
@@ -58,9 +65,67 @@ pub struct AppSpec {
     pub rules_json: Vec<u8>,
     pub fcgi_doc_root: String,
     pub fcgi_index: String,
+    /// Keep FastCGI connections open between requests (nginx `fastcgi_keep_conn`); off closes
+    /// each one after its reply. Read only for an `fcgi:` upstream.
+    pub fcgi_keep_conn: bool,
     /// The `maintenance` object of the bundle app; empty = none.
     pub maintenance: Vec<u8>,
     pub analysis: Arc<AppAnalysisSetup>,
+    /// The agent serves the app over HTTPS itself (its bundle entry has a `tls` object) and opens
+    /// no listener at the bundle's address for it; `None` = only the bundle listener, as before.
+    pub tls: Option<TlsSite>,
+    /// Compression of the answers the upstream sends whole; `None` = off.
+    pub compression: Option<CompressionSpec>,
+    /// Files of a folder that the app answers itself; `None` = none.
+    pub static_files: Option<StaticSpec>,
+    /// The response cache, checked; `None` = off.
+    pub cache: Option<CacheSpec>,
+    /// Names of the cookies that mark a visitor as signed in, besides the ones the agent knows
+    /// (the cache's own `session_cookies` count too). They decide what is compressed and what is
+    /// kept.
+    pub session_cookies: Vec<String>,
+}
+
+/// The compression settings of one app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressionSpec {
+    /// Answers shorter than this go as they are. At most [`MAX_MIN_COMPRESS_BYTES`].
+    pub min_bytes: usize,
+}
+
+/// The largest `CompressionSpec::min_bytes`: 1 MiB.
+pub const MAX_MIN_COMPRESS_BYTES: usize = 1 << 20;
+
+/// One app's HTTPS settings, from the bundle entry of the app.
+#[derive(Clone)]
+pub struct TlsSite {
+    /// `host:port` of the TLS listener (an IPv6 host in brackets); apps naming the same address
+    /// share it.
+    pub listen: String,
+    /// The host names the app answers for: lower case, no port, no trailing dot. SNI and `Host`
+    /// are matched against them.
+    pub hosts: Vec<String>,
+    /// What this apply does to the certificate the book serves for the app: replaces it, leaves
+    /// it (the one served before, or nothing), or removes it.
+    pub certificate: BookChange,
+    /// `host:port` of a plain listener that redirects these hosts to HTTPS once the app has a real
+    /// certificate and answers HTTP-01 validations; `None` = no such listener.
+    pub redirect_listen: Option<String>,
+    /// The main host name: one of `hosts`, lower case. A request under another of the hosts is
+    /// redirected to it, on both listeners. `None` = no redirect.
+    pub canonical_host: Option<String>,
+}
+
+/// Prints no certificate: the entry holds a private key.
+impl fmt::Debug for TlsSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsSite")
+            .field("listen", &self.listen)
+            .field("hosts", &self.hosts)
+            .field("redirect_listen", &self.redirect_listen)
+            .field("canonical_host", &self.canonical_host)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) enum Target {
@@ -107,6 +172,18 @@ pub struct Route {
     /// `Some` while maintenance mode is on for the app, with its pages built.
     pub(crate) maintenance: Option<MaintenanceRoute>,
     pub(crate) analysis: Arc<AppAnalysisSetup>,
+    /// The agent is the edge for this app (it terminates TLS): fingerprint headers count only
+    /// from a trusted proxy.
+    pub(crate) edge: bool,
+    /// Where the other host names of the app are sent; `None` = nowhere.
+    pub(crate) main_host: Option<MainHost>,
+    pub(crate) compression: Option<CompressionSpec>,
+    /// The folder that answers `GET` and `HEAD` after the verdict, if the app has one.
+    pub(crate) static_files: Option<Arc<StaticFolder>>,
+    /// The response cache of the app; `Proxy::apply` binds its store.
+    pub(crate) cache: Option<RouteCache>,
+    /// The cookie names the app says are sessions.
+    pub(crate) session: SessionNames,
     pub(crate) target: Target,
     /// `timeouts.upstream_ms` resolved (default 30 s); ignored when `upstream_unlimited`.
     pub(crate) upstream_timeout: Duration,
@@ -123,6 +200,18 @@ pub struct Route {
 impl Route {
     pub fn app_id(&self) -> &str {
         &self.app_id
+    }
+
+    /// The settings and store of the cache when it is on and has a store to keep copies in.
+    pub(crate) fn cache_active(&self) -> Option<(&Settings, &Arc<AppCache>)> {
+        let cache = self.cache.as_ref()?;
+        Some((&cache.settings, cache.app.as_ref()?))
+    }
+
+    /// Whether the route sends the app's other host names to a main host or takes a path prefix
+    /// off what the upstream sees.
+    pub fn redirects(&self) -> bool {
+        self.main_host.is_some() || !self.proxy_config.strip_path_prefix.is_empty()
     }
 
     /// The HTTP upstream's address (resolved per dial, one-minute DNS cache).
@@ -227,6 +316,32 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
             e.0
         )
     })?;
+    if let Some(why) = strip_path_prefix_fault(&pxy.strip_path_prefix) {
+        return Err(format!(
+            "app {}: strip_path_prefix {why}",
+            quote(app.app_id.as_bytes())
+        ));
+    }
+    if app
+        .compression
+        .is_some_and(|c| c.min_bytes > MAX_MIN_COMPRESS_BYTES)
+    {
+        return Err(format!(
+            "app {}: compression min_bytes must be at most {MAX_MIN_COMPRESS_BYTES}",
+            quote(app.app_id.as_bytes())
+        ));
+    }
+    let main_host = match &app.tls {
+        Some(site) => {
+            let port = site
+                .listen
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse().ok());
+            // `Proxy::apply` refuses a listen address without a port; the route is built before it.
+            port.and_then(|port| MainHost::new(site, port))
+        }
+        None => None,
+    };
     let ws = parse_ws_app_policy(&app.rules_json)
         .map_err(|e| format!("app {}: {e}", quote(app.app_id.as_bytes())))?;
     let upstream_to =
@@ -242,11 +357,13 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
                 timeout_or_default_ms(pxy.timeouts.connect_ms, 5000).max(0) as u64,
             ),
             slot_wait: Duration::from_millis(pxy.conn_wait_ms.max(0) as u64),
+            max_idle_age: resolve_idle_timeout(pxy.idle_conn_ms),
         };
         let pool = parse_upstream_spec(
             upstream,
             &app.fcgi_doc_root,
             &app.fcgi_index,
+            app.fcgi_keep_conn,
             pxy.max_conns,
             to,
         )
@@ -284,6 +401,19 @@ pub fn build_route(app: &AppSpec) -> Result<Route, String> {
         ws,
         maintenance: parse_maintenance(&app.maintenance).map(MaintenanceRoute::new),
         analysis: app.analysis.clone(),
+        edge: app.tls.is_some(),
+        main_host,
+        compression: app.compression,
+        static_files: app
+            .static_files
+            .as_ref()
+            .map(|spec| Arc::new(StaticFolder::new(&app.app_id, spec))),
+        cache: app.cache.as_ref().map(RouteCache::new),
+        session: SessionNames::new(
+            app.session_cookies
+                .iter()
+                .chain(app.cache.iter().flat_map(|c| &c.session_cookies)),
+        ),
         target,
         upstream_timeout: upstream_to,
         upstream_unlimited,

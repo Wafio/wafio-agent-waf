@@ -29,14 +29,48 @@ fn read(name: &str) -> Vec<u8> {
     std::fs::read(fixture(name)).unwrap()
 }
 
+/// The state directory of one test, in memory where the host has /dev/shm. The link writes the
+/// bundle cache with an fsync after it acks a bundle, off the stream. A test that reads the cache
+/// waits for the write, and on tmpfs the fsync returns at once, so the waits measure the link and
+/// not the host's disk. The cache's own disk handling is tested in the crate's bundle cache tests.
 fn tmpdir(tag: &str) -> PathBuf {
     let n = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let d = std::env::temp_dir().join(format!("wafio-link-{tag}-{}-{n}", std::process::id()));
+    let shm = Path::new("/dev/shm");
+    let base = if shm.is_dir() {
+        shm.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    let d = base.join(format!("wafio-link-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Removes the state directory of a test whose link is done. The cache write of an applied bundle
+/// runs after its ack, so it is finished first: a write still running would put files back.
+async fn clean_up(link: &ControlLink, state: PathBuf) {
+    link.finish_cache_write().await;
+    std::fs::remove_dir_all(state).unwrap();
+}
+
+/// The cache once it holds `generation`: the link acks a bundle before it writes the cache.
+async fn cached(state: &Path, generation: i64) -> CachedBundle {
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(c) = load_bundle_cache(state, &|_| Ok(()))
+            && c.generation == generation
+        {
+            return c;
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "generation {generation} not cached within a minute"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 // ── fake control plane ──────────────────────────────────────────────────────
@@ -73,6 +107,17 @@ impl Conn {
                 return a;
             }
         }
+    }
+
+    /// The next `n` acks, in the order they arrive, with the heartbeats left out.
+    async fn next_acks(&mut self, n: usize) -> Vec<CommandAck> {
+        let mut acks = Vec::new();
+        while acks.len() < n {
+            if let Some(Out::Ack(a)) = self.next_non_heartbeat().await.kind {
+                acks.push(a);
+            }
+        }
+        acks
     }
 
     async fn send(&self, k: In) {
@@ -196,6 +241,27 @@ struct Sink {
     fail: Mutex<Option<BundleError>>,
     /// What the full decode (`check`) says about a document.
     check_error: Mutex<Option<String>>,
+    /// The start and the end of every apply and install, in the order they ran.
+    log: Mutex<Vec<String>>,
+    /// Every apply and install takes this long, so a handler that does not wait for the one
+    /// before it shows up as an overlap in `log`.
+    delay: Mutex<Duration>,
+    /// The key each install carried when the sink got it, by command id.
+    keys: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Installs this sink refuses, by command id.
+    refuse: Mutex<HashMap<String, AckCode>>,
+    /// The install under this command id makes the sink panic.
+    panic_on: Mutex<Option<String>>,
+    /// What `statuses` hands the link each time it asks.
+    edge_statuses: Mutex<Vec<EdgeStatus>>,
+    /// The `every_app` argument of each `statuses` call.
+    edge_asks: Mutex<Vec<bool>>,
+    /// Every purge the sink got.
+    purges: Mutex<Vec<CachePurge>>,
+    /// Purges this sink refuses, by command id.
+    purge_refusals: Mutex<HashMap<String, PurgeCode>>,
+    /// The purge under this command id makes the sink panic.
+    purge_panics_on: Mutex<Option<String>>,
 }
 
 impl BundleSink for Sink {
@@ -203,15 +269,62 @@ impl BundleSink for Sink {
         if let Some(e) = self.fail.lock().unwrap().clone() {
             return Err(e);
         }
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("apply {generation} start"));
+        std::thread::sleep(*self.delay.lock().unwrap());
         self.applied
             .lock()
             .unwrap()
             .push((String::from_utf8(json.to_vec()).unwrap(), generation));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("apply {generation} end"));
         Ok(())
     }
 
     fn check(&self, _: &[u8]) -> Result<(), String> {
         self.check_error.lock().unwrap().clone().map_or(Ok(()), Err)
+    }
+}
+
+impl CertificateSink for Sink {
+    fn install(&self, install: &mut CertificateInstall) -> Result<(), AckCode> {
+        let id = install.command_id.clone();
+        self.log.lock().unwrap().push(format!("install {id} start"));
+        std::thread::sleep(*self.delay.lock().unwrap());
+        self.keys
+            .lock()
+            .unwrap()
+            .push((id.clone(), install.key_pem.clone()));
+        if self.panic_on.lock().unwrap().as_deref() == Some(id.as_str()) {
+            panic!("sink failed");
+        }
+        self.log.lock().unwrap().push(format!("install {id} end"));
+        match self.refuse.lock().unwrap().get(&id) {
+            Some(code) => Err(*code),
+            None => Ok(()),
+        }
+    }
+}
+
+impl EdgeSink for Sink {
+    fn statuses(&self, every_app: bool) -> Vec<EdgeStatus> {
+        self.edge_asks.lock().unwrap().push(every_app);
+        self.edge_statuses.lock().unwrap().clone()
+    }
+
+    fn purge(&self, purge: &CachePurge) -> Result<(), PurgeCode> {
+        self.purges.lock().unwrap().push(purge.clone());
+        if self.purge_panics_on.lock().unwrap().as_deref() == Some(purge.command_id.as_str()) {
+            panic!("sink failed");
+        }
+        match self.purge_refusals.lock().unwrap().get(&purge.command_id) {
+            Some(code) => Err(*code),
+            None => Ok(()),
+        }
     }
 }
 
@@ -286,15 +399,28 @@ fn config(addr: &str, server_name: &str, client: &str, state_dir: &Path) -> Cont
 }
 
 fn link(cfg: ControlConfig, sink: Arc<Sink>, sec: Arc<Sec>) -> Arc<ControlLink> {
-    ControlLink::new(
+    link_writing(cfg, sink, sec, Arc::new(save_bundle_cache))
+}
+
+/// [`link`] with `write` as the way a bundle reaches the cache directory.
+fn link_writing(
+    cfg: ControlConfig,
+    sink: Arc<Sink>,
+    sec: Arc<Sec>,
+    write: CacheWrite,
+) -> Arc<ControlLink> {
+    ControlLink::with_cache_write(
         cfg,
         Hooks {
-            bundles: sink,
+            bundles: sink.clone(),
+            edge: sink.clone(),
+            certificates: sink,
             stats: Arc::new(Stats),
             security_data: sec,
             redact,
             on_dial: |_| {},
         },
+        write,
     )
 }
 
@@ -419,9 +545,8 @@ async fn stream_session_end_to_end() {
     let a = c.next_ack("init-1").await;
     assert!(a.ok && a.error.is_empty(), "{a:?}");
     assert_eq!(*sink.applied.lock().unwrap(), vec![(bundle.to_string(), 7)]);
-    let cached = load_bundle_cache(&state, &|_| Ok(())).unwrap();
-    assert_eq!(cached.generation, 7);
-    assert_eq!(BundleProbe::parse(&cached.bundle).unwrap().generation, 7);
+    let on_disk = cached(&state, 7).await;
+    assert_eq!(BundleProbe::parse(&on_disk.bundle).unwrap().generation, 7);
     assert_eq!(link.bundle_status(), ("live".to_string(), 7));
 
     // A management command is applied and acked but never cached or counted as config.
@@ -434,6 +559,8 @@ async fn stream_session_end_to_end() {
     }))
     .await;
     assert!(c.next_ack("u1").await.ok);
+    // A write for the command, if the link queued one, is finished before the file is read.
+    link.finish_cache_write().await;
     assert_eq!(
         load_bundle_cache(&state, &|_| Ok(())).unwrap().generation,
         7
@@ -549,7 +676,7 @@ async fn stream_session_end_to_end() {
     assert_eq!(hello(c.next().await.unwrap()).bundle_generation, 7);
 
     task.abort();
-    std::fs::remove_dir_all(state).unwrap();
+    clean_up(&link, state).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -677,7 +804,7 @@ async fn starts_from_cached_bundle() {
     )
     .unwrap();
     let l = link(cfg, Arc::default(), Arc::default());
-    assert!(l.install_cached_bundle());
+    assert_eq!(l.install_cached_bundle(), CacheStart::Applied);
     assert_eq!(l.bundle_status(), ("cache_stale".to_string(), 42));
 
     let sink = Arc::new(Sink::default());
@@ -687,7 +814,7 @@ async fn starts_from_cached_bundle() {
         sink,
         Arc::default(),
     );
-    assert!(!l.install_cached_bundle());
+    assert_eq!(l.install_cached_bundle(), CacheStart::NotApplied);
     assert_eq!(l.bundle_status(), (String::new(), 0));
     assert_eq!(l.heartbeat(None).bundle_source, None);
 
@@ -697,7 +824,8 @@ async fn starts_from_cached_bundle() {
         Arc::default(),
         Arc::default(),
     );
-    assert!(!l.is_cached_bundle_usable() && !l.install_cached_bundle());
+    assert!(!l.is_cached_bundle_usable());
+    assert_eq!(l.install_cached_bundle(), CacheStart::NotApplied);
     std::fs::remove_dir_all(state).unwrap();
 }
 
@@ -768,7 +896,7 @@ async fn undecodable_bundles_are_acked_with_the_decoder_error_text() {
     assert_eq!(link.bundle_status(), (String::new(), 0));
 
     task.abort();
-    std::fs::remove_dir_all(state).unwrap();
+    clean_up(&link, state).await;
 }
 
 /// A control message may be 4 MiB; a bigger one ends the stream, and the link opens a new one
@@ -826,7 +954,7 @@ async fn a_bundle_over_four_mebibytes_ends_the_stream() {
     );
 
     task.abort();
-    std::fs::remove_dir_all(state).unwrap();
+    clean_up(&link, state).await;
 }
 
 /// Conformance scenario `grpc-fetch-security-data`: the server's refusal of
@@ -873,6 +1001,591 @@ async fn malware_download_refusals_report_the_refusal_text() {
         let a = c.next_ack("fsd-1").await;
         assert_eq!((a.ok, a.error.as_str()), (false, want), "{status}");
         task.abort();
-        std::fs::remove_dir_all(state).unwrap();
+        clean_up(&link, state).await;
     }
+}
+
+fn bundle_message(id: &str, generation: i64) -> In {
+    In::Bundle(BundleUpdate {
+        command_id: id.into(),
+        generation,
+        bundle_json: format!(r#"{{"generation":{generation},"apps":[]}}"#).into(),
+    })
+}
+
+fn install_message(id: &str) -> In {
+    In::CertificateInstall(CertificateInstall {
+        command_id: id.into(),
+        app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+        certificate_id: "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77".into(),
+        chain_pem: b"chain".to_vec(),
+        key_pem: format!("key of {id}").into_bytes(),
+        leaf_sha256: "ab".repeat(32),
+    })
+}
+
+/// An install is handled between the bundles around it, in the order the stream delivered them,
+/// and the acks go out in that order. Each handler takes time, so one that ran ahead of the one
+/// before it would show as an overlap in the sink's log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn installs_and_bundles_keep_stream_order() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("order");
+    let sink = Arc::new(Sink::default());
+    *sink.delay.lock().unwrap() = Duration::from_millis(40);
+    sink.refuse
+        .lock()
+        .unwrap()
+        .insert("i2".into(), AckCode::KeyMismatch);
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+
+    for m in [
+        bundle_message("b1", 1),
+        install_message("i1"),
+        bundle_message("b2", 2),
+        install_message("i2"),
+    ] {
+        c.send(m).await;
+    }
+    let acks = c.next_acks(4).await;
+    assert_eq!(
+        acks.iter()
+            .map(|a| (a.command_id.as_str(), a.ok, a.error.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("b1", true, ""),
+            ("i1", true, ""),
+            ("b2", true, ""),
+            ("i2", false, "key_mismatch"),
+        ]
+    );
+    assert_eq!(
+        *sink.log.lock().unwrap(),
+        vec![
+            "apply 1 start",
+            "apply 1 end",
+            "install i1 start",
+            "install i1 end",
+            "apply 2 start",
+            "apply 2 end",
+            "install i2 start",
+            "install i2 end",
+        ]
+    );
+    // The sink got each key whole: it is zeroed only after the sink returned.
+    assert_eq!(
+        *sink.keys.lock().unwrap(),
+        vec![
+            ("i1".to_string(), b"key of i1".to_vec()),
+            ("i2".to_string(), b"key of i2".to_vec()),
+        ]
+    );
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+/// A sink that panics is a refusal the control plane may retry, and the link goes on with the
+/// next message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_certificate_sink_is_acked_write_failed_and_the_stream_goes_on() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("panic");
+    let sink = Arc::new(Sink::default());
+    *sink.panic_on.lock().unwrap() = Some("boom".into());
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+    // The first heartbeat, with the host info, is read first so the Ping reply is the next one.
+    heartbeat(c.next().await.unwrap());
+
+    c.send(install_message("boom")).await;
+    c.send(install_message("fine")).await;
+    let acks = c.next_acks(2).await;
+    assert_eq!(
+        acks.iter()
+            .map(|a| (a.command_id.as_str(), a.ok, a.error.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("boom", false, "write_failed"), ("fine", true, "")]
+    );
+    assert_eq!(sink.keys.lock().unwrap()[0].1, b"key of boom");
+    c.send(In::Ping(Ping { nonce: 1 })).await;
+    assert!(heartbeat(c.next().await.unwrap()).host_info_json.is_empty());
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+/// A control plane that never sends an install, as one that predates the message, sees what it
+/// saw before: no new Hello feature, no certificate status, the same acks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_plane_that_sends_no_install_sees_no_certificate_traffic() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("older");
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        Arc::default(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    let h = hello(c.next().await.unwrap());
+    assert!(h.features.is_empty(), "{:?}", h.features);
+    heartbeat(c.next().await.unwrap());
+
+    c.send(bundle_message("b1", 1)).await;
+    c.send(In::Bundle(BundleUpdate {
+        command_id: "u1".into(),
+        generation: 0,
+        bundle_json: br#"{"management_only":true}"#.to_vec(),
+    }))
+    .await;
+    c.send(In::Ping(Ping { nonce: 2 })).await;
+    let mut seen = Vec::new();
+    loop {
+        match c.next().await.expect("stream open").kind {
+            Some(Out::Heartbeat(hb)) if hb.host_info_json.is_empty() => break,
+            other => seen.push(other),
+        }
+    }
+    let acks: Vec<_> = seen
+        .iter()
+        .map(|k| match k {
+            Some(Out::Ack(a)) => (a.command_id.as_str(), a.ok, a.error.as_str()),
+            other => panic!("unexpected message {other:?}"),
+        })
+        .collect();
+    assert_eq!(acks, vec![("b1", true, ""), ("u1", true, "")]);
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+/// A status handed to the link while a stream is up goes out on it with its fields as given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reported_certificate_status_goes_out_on_the_stream() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("status");
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        Arc::default(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+    assert!(link.connected());
+
+    let status = CertificateStatus {
+        app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+        source: "uploaded".into(),
+        state: "missing".into(),
+        certificate_id: "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77".into(),
+        unix_time: 1_700_000_000,
+        ..Default::default()
+    };
+    link.report_certificate_status(status.clone());
+    let got = loop {
+        match c.next().await.expect("stream open").kind {
+            Some(Out::CertificateStatus(s)) => break s,
+            Some(Out::Heartbeat(_)) => {}
+            other => panic!("unexpected message {other:?}"),
+        }
+    };
+    assert_eq!(got, status);
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+fn edge_status(app: &str, generation: i64) -> EdgeStatus {
+    EdgeStatus {
+        app_id: app.into(),
+        generation,
+        features: vec![EdgeFeatureState {
+            feature: "compression".into(),
+            state: "applied".into(),
+            ..Default::default()
+        }],
+        compression: Some(EdgeCompressionCounters {
+            responses: 3,
+            skipped_streamed: 1,
+            bytes_saved: 4096,
+        }),
+        unix_time: 1_700_000_000,
+        ..Default::default()
+    }
+}
+
+/// The next edge status, with the heartbeats and acks before it left out.
+async fn next_edge_status(c: &mut Conn) -> EdgeStatus {
+    loop {
+        match c.next().await.expect("stream open").kind {
+            Some(Out::EdgeStatus(s)) => return s,
+            Some(Out::Heartbeat(_) | Out::Ack(_)) => {}
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+}
+
+/// The statuses of the edge sink go out when a stream comes up, after each live bundle and when
+/// the agent asks, one message per app, as the sink made them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_statuses_go_out_on_connect_after_a_bundle_and_on_request() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("edge");
+    let sink = Arc::new(Sink::default());
+    let (a, b) = (
+        "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11",
+        "5d0c1e52-8f5b-4c0e-bd0a-6a3a1e2f9b77",
+    );
+    *sink.edge_statuses.lock().unwrap() = vec![edge_status(a, 4), edge_status(b, 4)];
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+
+    let first = next_edge_status(&mut c).await;
+    assert_eq!(first, edge_status(a, 4));
+    assert_eq!(next_edge_status(&mut c).await, edge_status(b, 4));
+
+    // A live bundle: the sink is asked again, after the bundle is applied.
+    *sink.edge_statuses.lock().unwrap() = vec![edge_status(a, 5)];
+    c.send(bundle_message("b1", 5)).await;
+    assert_eq!(next_edge_status(&mut c).await, edge_status(a, 5));
+
+    link.report_edge();
+    assert_eq!(next_edge_status(&mut c).await, edge_status(a, 5));
+    let asks = sink.edge_asks.lock().unwrap().clone();
+    assert!(
+        asks.len() >= 3 && asks.iter().all(|&every_app| every_app),
+        "a new stream, a live bundle and a request all ask for every app: {asks:?}"
+    );
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+/// A purge is handed to the sink whole and acked with its code, `""` when it is done. A sink that
+/// panics is `busy` (the control plane sends it again), and the link goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cache_purge_is_acked_with_the_code_of_the_sink() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("purge");
+    let sink = Arc::new(Sink::default());
+    {
+        let mut refusals = sink.purge_refusals.lock().unwrap();
+        refusals.insert("gone".into(), PurgeCode::NotInBundle);
+        refusals.insert("off".into(), PurgeCode::CacheOff);
+        refusals.insert("bad".into(), PurgeCode::Invalid);
+        refusals.insert("later".into(), PurgeCode::Busy);
+    }
+    *sink.purge_panics_on.lock().unwrap() = Some("boom".into());
+    let link = link(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+
+    let ids = ["done", "gone", "off", "bad", "later", "boom", "after"];
+    for id in ids {
+        c.send(In::CachePurge(CachePurge {
+            command_id: id.into(),
+            app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+            scope: "prefix".into(),
+            url: format!("/shop/{id}"),
+        }))
+        .await;
+    }
+    let acks = c.next_acks(ids.len()).await;
+    assert_eq!(
+        acks.iter()
+            .map(|a| (a.command_id.as_str(), a.ok, a.error.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("done", true, ""),
+            ("gone", false, "not_in_bundle"),
+            ("off", false, "cache_off"),
+            ("bad", false, "invalid"),
+            ("later", false, "busy"),
+            ("boom", false, "busy"),
+            ("after", true, ""),
+        ]
+    );
+    let got = sink.purges.lock().unwrap().clone();
+    assert_eq!(got.len(), ids.len());
+    assert_eq!(
+        got[0],
+        CachePurge {
+            command_id: "done".into(),
+            app_id: "0b7a3f0e-3c47-4a45-9d61-2a1f5f0c8e11".into(),
+            scope: "prefix".into(),
+            url: "/shop/done".into(),
+        }
+    );
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+/// A cache write that a test holds back: it notes the generation it was asked to write, waits until
+/// the test lets it go, and then writes the file as the link does.
+#[derive(Default)]
+struct HeldWrites {
+    started: Mutex<Vec<i64>>,
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl HeldWrites {
+    fn writer(self: &Arc<Self>) -> CacheWrite {
+        let held = self.clone();
+        Arc::new(
+            move |dir: &Path, bundle: &[u8], generation: i64, now: SystemTime| {
+                held.started.lock().unwrap().push(generation);
+                let mut open = held.open.lock().unwrap();
+                while !*open {
+                    let (guard, wait) = held.opened.wait_timeout(open, 6 * WAIT).unwrap();
+                    open = guard;
+                    if wait.timed_out() {
+                        return Err("the test never let the write go".into());
+                    }
+                }
+                drop(open);
+                save_bundle_cache(dir, bundle, generation, now)
+            },
+        )
+    }
+
+    fn let_go(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    fn started(&self) -> Vec<i64> {
+        self.started.lock().unwrap().clone()
+    }
+}
+
+/// Waits until `done` is true, for at most a minute.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < end,
+            "{what}: not within a minute"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// With the cache write held back for the whole test, the ack of a bundle and the acks of the
+/// commands behind it still go out, and the file is not there yet. Of the bundles that arrive
+/// while the write is held, only the newest is written once it goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_cache_write_holds_back_neither_the_ack_of_a_bundle_nor_the_commands_after_it() {
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("slow-write");
+    let held = Arc::new(HeldWrites::default());
+    let link = link_writing(
+        config(&addr, "localhost", "client", &state),
+        Arc::default(),
+        Arc::default(),
+        held.writer(),
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+
+    c.send(bundle_message("b1", 1)).await;
+    let a = c.next_ack("b1").await;
+    assert!(a.ok, "{a:?}");
+    until("the first write to start", || held.started() == [1]).await;
+    let file = state.join(BUNDLE_CACHE_FILE_NAME);
+    assert!(!file.exists(), "the ack came while the write was held");
+
+    // Commands sent after the bundle: an install, a management command, and three more bundles.
+    c.send(install_message("i1")).await;
+    assert!(c.next_ack("i1").await.ok);
+    c.send(In::Bundle(BundleUpdate {
+        command_id: "u1".into(),
+        generation: 0,
+        bundle_json: br#"{"management_only":true,"unblock_entries":[{"type":"blockpolicy","key":"1.2.3.4"}]}"#
+            .to_vec(),
+    }))
+    .await;
+    assert!(c.next_ack("u1").await.ok);
+    for generation in 2..=4 {
+        let id = format!("b{generation}");
+        c.send(bundle_message(&id, generation)).await;
+        assert!(c.next_ack(&id).await.ok);
+    }
+    assert!(!file.exists(), "every ack came while the write was held");
+    assert_eq!(link.bundle_status(), ("live".to_string(), 4));
+
+    held.let_go();
+    cached(&state, 4).await;
+    link.finish_cache_write().await;
+    assert_eq!(
+        held.started(),
+        [1, 4],
+        "the bundles of generations 2 and 3 were replaced while they waited"
+    );
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+/// Every line the link logs at info or above, from any thread: the cache writer logs from a thread
+/// of its own, which a subscriber set for one thread would miss.
+fn logged_lines() -> &'static Mutex<Vec<String>> {
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static ONCE: std::sync::Once = std::sync::Once::new();
+
+    struct Collect;
+    impl tracing::Subscriber for Collect {
+        // Only the lines of this crate: the frame events of h2, hyper and tonic would fill the list.
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.target().starts_with("wafio_control") && *meta.level() <= tracing::Level::INFO
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(&mut self, _: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{v:?} "));
+                }
+            }
+            let mut text = Text(String::new());
+            event.record(&mut text);
+            LINES.lock().unwrap().push(text.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    ONCE.call_once(|| tracing::subscriber::set_global_default(Collect).unwrap());
+    &LINES
+}
+
+/// A write that fails is logged and does not undo the bundle: it is acked and in force. The write
+/// of the next bundle goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_cache_write_is_logged_and_the_next_bundle_writes_again() {
+    let lines = logged_lines();
+    let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+    let state = tmpdir("write-fails");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let write: CacheWrite = Arc::new(
+        move |dir: &Path, bundle: &[u8], generation: i64, now: SystemTime| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err("no space left on device (marker 4711)".into())
+            } else {
+                save_bundle_cache(dir, bundle, generation, now)
+            }
+        },
+    );
+    let sink = Arc::new(Sink::default());
+    let link = link_writing(
+        config(&addr, "localhost", "client", &state),
+        sink.clone(),
+        Arc::default(),
+        write,
+    );
+    let task = link.start();
+    let mut c = next_conn(&mut conns).await;
+    hello(c.next().await.unwrap());
+
+    c.send(bundle_message("b1", 1)).await;
+    assert!(c.next_ack("b1").await.ok);
+    until("the failure to be logged", || {
+        lines.lock().unwrap().iter().any(|l| {
+            l.contains(
+                "cache write failed (bundle still applied): no space left on device (marker 4711)",
+            )
+        })
+    })
+    .await;
+    assert_eq!(link.bundle_status(), ("live".to_string(), 1));
+    assert_eq!(sink.applied.lock().unwrap().len(), 1);
+    assert!(!state.join(BUNDLE_CACHE_FILE_NAME).exists());
+
+    c.send(bundle_message("b2", 2)).await;
+    assert!(c.next_ack("b2").await.ok);
+    cached(&state, 2).await;
+    task.abort();
+    clean_up(&link, state).await;
+}
+
+/// A stop that cuts the stream while a bundle is still being applied. Dropping the runtime waits
+/// for the apply on its blocking thread, which then queues its cache write after every wait inside
+/// the runtime has returned: the wait that follows the drop is the one that gets the bundle on the
+/// disk.
+#[test]
+fn a_bundle_that_finishes_applying_after_the_stream_is_cut_is_cached_once_the_runtime_is_gone() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let state = tmpdir("cut-in-apply");
+    let slow_write: CacheWrite = Arc::new(
+        |dir: &Path, bundle: &[u8], generation: i64, now: SystemTime| {
+            std::thread::sleep(Duration::from_millis(300));
+            save_bundle_cache(dir, bundle, generation, now)
+        },
+    );
+    let file = state.join(BUNDLE_CACHE_FILE_NAME);
+    let link = rt.block_on(async {
+        let (addr, mut conns) = start_fake(FakeOptions::default()).await;
+        let sink = Arc::new(Sink::default());
+        *sink.delay.lock().unwrap() = Duration::from_millis(1500);
+        let link = link_writing(
+            config(&addr, "localhost", "client", &state),
+            sink.clone(),
+            Arc::default(),
+            slow_write,
+        );
+        let task = link.start();
+        let mut c = next_conn(&mut conns).await;
+        hello(c.next().await.unwrap());
+        c.send(bundle_message("b1", 1)).await;
+        until("the apply to start", || {
+            sink.log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "apply 1 start")
+        })
+        .await;
+        task.abort();
+        // Nothing is queued yet, so this returns at once, as the one in the agent's shutdown does.
+        link.finish_cache_write().await;
+        assert!(!file.exists());
+        link
+    });
+    drop(rt);
+    link.finish_cache_write_blocking();
+    assert_eq!(
+        load_bundle_cache(&state, &|_| Ok(())).unwrap().generation,
+        1,
+        "the bundle that finished applying during the drop is on the disk"
+    );
+    std::fs::remove_dir_all(state).unwrap();
 }

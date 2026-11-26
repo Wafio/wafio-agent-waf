@@ -21,11 +21,89 @@ pub struct BundleApp {
     pub proxy_config: Vec<u8>,
     pub fcgi_doc_root: String,
     pub fcgi_index: String,
+    /// Keep FastCGI connections open between requests; the control plane sends the key only
+    /// when it is on.
+    pub fcgi_keep_conn: bool,
     pub custom_gui_rules: Vec<Vec<u8>>,
     pub custom_script_rules: Vec<Vec<u8>>,
     pub custom_tuning_rules: Vec<Vec<u8>>,
     /// Raw JSON of the maintenance object, present only while maintenance mode is on; empty = absent.
     pub maintenance: Vec<u8>,
+    /// The app is served over HTTPS by the agent itself: present only in gateway mode.
+    pub tls: Option<TlsEntry>,
+    /// Compression of the answers; absent or null is off.
+    pub compression: Option<CompressionEntry>,
+    /// Files served from a folder; absent or null is off.
+    pub static_files: Option<StaticFilesEntry>,
+    /// The response cache; absent or null is off.
+    pub cache: Option<CacheEntry>,
+    /// Names of the cookies that hold a visitor's session, besides the ones the agent knows. They
+    /// decide what is compressed and what is kept, so they are sent whether or not the cache is on.
+    pub session_cookies: Vec<String>,
+}
+
+/// The `compression` object of an app as sent. `{}` is off: only `enabled: true` turns it on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompressionEntry {
+    pub enabled: bool,
+    /// `None` = not sent: the default applies.
+    pub min_bytes: Option<i64>,
+}
+
+/// The `static_files` object of an app as sent: the control plane sends it only while it is on,
+/// and `enabled: true` is what turns it on here too. The folder is not checked here
+/// (`wafio_proxy::StaticSpec::check` does that against the disk).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StaticFilesEntry {
+    pub enabled: bool,
+    pub root: String,
+    /// `app` or `not_found`; empty is `app`.
+    pub missing: String,
+    /// Seconds of browser cache time; 0 sets none.
+    pub max_age_s: i64,
+}
+
+/// The `cache` object of an app as sent, before any check (`wafio_proxy::CacheSpec::check` does
+/// that). The control plane sends it only while it is on and fills every number in; a number that
+/// is absent takes the default here too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub enabled: bool,
+    pub default_ttl_s: Option<i64>,
+    pub stale_if_error_s: Option<i64>,
+    pub disk_bytes: Option<i64>,
+    pub memory_bytes: Option<i64>,
+    pub max_object_bytes: Option<i64>,
+    pub session_cookies: Vec<String>,
+    pub rules: Vec<CacheRuleEntry>,
+}
+
+/// One path rule of the cache.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheRuleEntry {
+    pub prefix: String,
+    /// `cache` or `bypass`.
+    pub action: String,
+    pub ttl_s: i64,
+    pub signed_in: bool,
+}
+
+/// The `tls` object of an app as sent, before any check (`crate::tls::entry`). It never carries key
+/// material or a chain: the agent keeps the bundle in plain text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlsEntry {
+    pub listen: String,
+    pub hosts: Vec<String>,
+    pub redirect_listen: String,
+    /// `""`, `acme` or `uploaded`.
+    pub source: String,
+    /// The certificate of an uploaded source, by id and by the SHA-256 of its leaf.
+    pub certificate_id: String,
+    pub leaf_sha256: String,
+    /// A new id asks the agent to order a certificate now.
+    pub acme_request_id: String,
+    /// The main host name; `""` = none.
+    pub canonical_host: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -147,7 +225,7 @@ fn raw_slice(
     })
 }
 
-const APP_FIELDS: [&str; 15] = [
+const APP_FIELDS: [&str; 21] = [
     "app_id",
     "listen_host",
     "listen_port",
@@ -163,7 +241,165 @@ const APP_FIELDS: [&str; 15] = [
     "custom_script_rules",
     "custom_tuning_rules",
     "maintenance",
+    "fcgi_keep_conn",
+    "tls",
+    "compression",
+    "static_files",
+    "cache",
+    "session_cookies",
 ];
+
+const TLS_FIELDS: [&str; 8] = [
+    "listen",
+    "hosts",
+    "redirect_listen",
+    "source",
+    "certificate_id",
+    "leaf_sha256",
+    "acme_request_id",
+    "canonical_host",
+];
+
+fn decode_tls(d: &mut DecodeTrace, v: &Value, t: &mut TlsEntry) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.TLSEntry",
+        "TLSEntry",
+        &TLS_FIELDS,
+        |d, i, v| {
+            match i {
+                0 => json_decode::string(d, v, &mut t.listen),
+                1 => json_decode::strings(d, v, &mut t.hosts)?,
+                2 => json_decode::string(d, v, &mut t.redirect_listen),
+                3 => json_decode::string(d, v, &mut t.source),
+                4 => json_decode::string(d, v, &mut t.certificate_id),
+                5 => json_decode::string(d, v, &mut t.leaf_sha256),
+                6 => json_decode::string(d, v, &mut t.acme_request_id),
+                _ => json_decode::string(d, v, &mut t.canonical_host),
+            }
+            Ok(())
+        },
+    )
+}
+
+fn decode_compression(
+    d: &mut DecodeTrace,
+    v: &Value,
+    c: &mut CompressionEntry,
+) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.CompressionEntry",
+        "CompressionEntry",
+        &["enabled", "min_bytes"],
+        |d, i, v| {
+            match i {
+                0 => json_decode::boolean(d, v, &mut c.enabled),
+                _ => {
+                    let mut n = 0;
+                    json_decode::int(d, v, &mut n);
+                    if !json_decode::is_null(v) {
+                        c.min_bytes = Some(n);
+                    }
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+fn decode_static_files(
+    d: &mut DecodeTrace,
+    v: &Value,
+    f: &mut StaticFilesEntry,
+) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.StaticFilesEntry",
+        "StaticFilesEntry",
+        &["enabled", "root", "missing", "max_age_s"],
+        |d, i, v| {
+            match i {
+                0 => json_decode::boolean(d, v, &mut f.enabled),
+                1 => json_decode::string(d, v, &mut f.root),
+                2 => json_decode::string(d, v, &mut f.missing),
+                _ => json_decode::int(d, v, &mut f.max_age_s),
+            }
+            Ok(())
+        },
+    )
+}
+
+/// An optional number: `None` for null, so that an absent number is told from a zero.
+fn optional_int(d: &mut DecodeTrace, v: &Value, out: &mut Option<i64>) {
+    let mut n = 0;
+    json_decode::int(d, v, &mut n);
+    *out = (!json_decode::is_null(v)).then_some(n);
+}
+
+fn decode_cache_rule(
+    d: &mut DecodeTrace,
+    v: &Value,
+    r: &mut CacheRuleEntry,
+) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.CacheRuleEntry",
+        "CacheRuleEntry",
+        &["prefix", "action", "ttl_s", "signed_in"],
+        |d, i, v| {
+            match i {
+                0 => json_decode::string(d, v, &mut r.prefix),
+                1 => json_decode::string(d, v, &mut r.action),
+                2 => json_decode::int(d, v, &mut r.ttl_s),
+                _ => json_decode::boolean(d, v, &mut r.signed_in),
+            }
+            Ok(())
+        },
+    )
+}
+
+fn decode_cache(d: &mut DecodeTrace, v: &Value, c: &mut CacheEntry) -> Result<(), JsonDecodeError> {
+    json_decode::object(
+        d,
+        v,
+        "agent.CacheEntry",
+        "CacheEntry",
+        &[
+            "enabled",
+            "default_ttl_s",
+            "stale_if_error_s",
+            "disk_bytes",
+            "memory_bytes",
+            "max_object_bytes",
+            "session_cookies",
+            "rules",
+        ],
+        |d, i, v| {
+            match i {
+                0 => json_decode::boolean(d, v, &mut c.enabled),
+                1 => optional_int(d, v, &mut c.default_ttl_s),
+                2 => optional_int(d, v, &mut c.stale_if_error_s),
+                3 => optional_int(d, v, &mut c.disk_bytes),
+                4 => optional_int(d, v, &mut c.memory_bytes),
+                5 => optional_int(d, v, &mut c.max_object_bytes),
+                6 => json_decode::strings(d, v, &mut c.session_cookies)?,
+                _ => json_decode::slice(
+                    d,
+                    v,
+                    &mut c.rules,
+                    "[]agent.CacheRuleEntry",
+                    decode_cache_rule,
+                )?,
+            }
+            Ok(())
+        },
+    )
+}
 
 fn decode_app(
     d: &mut DecodeTrace,
@@ -193,7 +429,13 @@ fn decode_app(
                 11 => raw_slice(d, sp, v, &mut a.custom_gui_rules)?,
                 12 => raw_slice(d, sp, v, &mut a.custom_script_rules)?,
                 13 => raw_slice(d, sp, v, &mut a.custom_tuning_rules)?,
-                _ => a.maintenance = sp.raw(v),
+                14 => a.maintenance = sp.raw(v),
+                15 => json_decode::boolean(d, v, &mut a.fcgi_keep_conn),
+                16 => json_decode::optional(d, v, &mut a.tls, decode_tls)?,
+                17 => json_decode::optional(d, v, &mut a.compression, decode_compression)?,
+                18 => json_decode::optional(d, v, &mut a.static_files, decode_static_files)?,
+                19 => json_decode::optional(d, v, &mut a.cache, decode_cache)?,
+                _ => json_decode::strings(d, v, &mut a.session_cookies)?,
             }
             Ok(())
         },
@@ -307,6 +549,217 @@ mod tests {
         );
         assert!(b.apps[1].maintenance.is_empty(), "absent stays empty");
         assert_eq!(b.apps[2].maintenance, b"null".to_vec());
+    }
+
+    #[test]
+    fn fcgi_keep_conn_is_read_and_defaults_to_off() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"x","fcgi_keep_conn":true,"maintenance":{"enabled":true}},
+               {"app_id":"y"},{"app_id":"z","fcgi_keep_conn":false}]}"#,
+        )
+        .unwrap();
+        let on: Vec<bool> = b.apps.iter().map(|a| a.fcgi_keep_conn).collect();
+        assert_eq!(on, [true, false, false]);
+        assert_eq!(b.apps[0].maintenance, br#"{"enabled":true}"#.to_vec());
+        assert!(b.apps[1].maintenance.is_empty());
+    }
+
+    #[test]
+    fn the_tls_object_is_read_with_unknown_keys_ignored_and_wrong_types_refused() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"x","tls":{"listen":"0.0.0.0:443","Hosts":["a.example.com","b.example.com"],
+               "redirect_listen":"0.0.0.0:80","source":"uploaded","certificate_id":"c1","leaf_sha256":"ab",
+               "acme_request_id":"r1","Canonical_Host":"a.example.com","future":{"k":[1]}}},{"app_id":"y"},{"app_id":"z","tls":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            b.apps[0].tls,
+            Some(TlsEntry {
+                listen: "0.0.0.0:443".into(),
+                hosts: vec!["a.example.com".into(), "b.example.com".into()],
+                redirect_listen: "0.0.0.0:80".into(),
+                source: "uploaded".into(),
+                certificate_id: "c1".into(),
+                leaf_sha256: "ab".into(),
+                acme_request_id: "r1".into(),
+                canonical_host: "a.example.com".into(),
+            })
+        );
+        assert_eq!(b.apps[1].tls, None, "absent");
+        assert_eq!(b.apps[2].tls, None, "null");
+        let empty = decode_bundle(br#"{"apps":[{"tls":{}}]}"#).unwrap();
+        assert_eq!(empty.apps[0].tls, Some(TlsEntry::default()));
+
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"tls":{"hosts":"a.example.com"}}]}"#).unwrap_err(),
+            "apps.tls.hosts: expected an array of strings, got a string"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"tls":{"listen":443}}]}"#).unwrap_err(),
+            "apps.tls.listen: expected a string, got a number"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"tls":"yes"}]}"#).unwrap_err(),
+            "apps.tls: expected an object, got a string"
+        );
+    }
+
+    #[test]
+    fn the_compression_object_is_read_and_only_enabled_true_turns_it_on() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"a","compression":{"enabled":true,"min_bytes":2048}},
+               {"app_id":"b","compression":{"enabled":true}},
+               {"app_id":"c","compression":{}},
+               {"app_id":"d","compression":null},
+               {"app_id":"e"},
+               {"app_id":"f","compression":{"Enabled":true,"MIN_BYTES":0,"future":1}},
+               {"app_id":"g","compression":{"enabled":true,"min_bytes":null}}]}"#,
+        )
+        .unwrap();
+        let on = |enabled, min_bytes| Some(CompressionEntry { enabled, min_bytes });
+        let got: Vec<_> = b.apps.iter().map(|a| a.compression.clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                on(true, Some(2048)),
+                on(true, None),
+                on(false, None),
+                None,
+                None,
+                on(true, Some(0)),
+                on(true, None),
+            ]
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"compression":{"min_bytes":"10"}}]}"#).unwrap_err(),
+            "apps.compression.min_bytes: expected an integer, got a string"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"compression":true}]}"#).unwrap_err(),
+            "apps.compression: expected an object, got a boolean"
+        );
+    }
+
+    #[test]
+    fn the_static_files_object_is_read_and_only_enabled_true_turns_it_on() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"a","static_files":{"enabled":true,"root":"/var/www/a","missing":"not_found","max_age_s":3600}},
+               {"app_id":"b","static_files":{"enabled":true,"root":"/srv/b"}},
+               {"app_id":"c","static_files":{}},
+               {"app_id":"d","static_files":null},
+               {"app_id":"e"},
+               {"app_id":"f","static_files":{"Enabled":true,"ROOT":"/x","future":1}}]}"#,
+        )
+        .unwrap();
+        let entry = |enabled, root: &str, missing: &str, max_age_s| {
+            Some(StaticFilesEntry {
+                enabled,
+                root: root.into(),
+                missing: missing.into(),
+                max_age_s,
+            })
+        };
+        let got: Vec<_> = b.apps.iter().map(|a| a.static_files.clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                entry(true, "/var/www/a", "not_found", 3600),
+                entry(true, "/srv/b", "", 0),
+                entry(false, "", "", 0),
+                None,
+                None,
+                entry(true, "/x", "", 0),
+            ]
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"static_files":{"max_age_s":"10"}}]}"#).unwrap_err(),
+            "apps.static_files.max_age_s: expected an integer, got a string"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"static_files":{"root":5}}]}"#).unwrap_err(),
+            "apps.static_files.root: expected a string, got a number"
+        );
+        assert_eq!(
+            decode_bundle(br#"{"apps":[{"static_files":"/var/www"}]}"#).unwrap_err(),
+            "apps.static_files: expected an object, got a string"
+        );
+    }
+
+    #[test]
+    fn the_cache_object_and_the_session_cookie_names_are_read() {
+        let b = decode_bundle(
+            br#"{"apps":[{"app_id":"a","session_cookies":["MyAuth","sb-token"],"cache":{"enabled":true,"default_ttl_s":60,"stale_if_error_s":0,"disk_bytes":33554432,"memory_bytes":null,"max_object_bytes":1024,"session_cookies":["Sid"],"rules":[{"prefix":"/blog/","action":"cache","ttl_s":120,"signed_in":true},{"prefix":"/admin/","action":"bypass","ttl_s":0,"signed_in":false}]}},
+               {"app_id":"b","cache":{"enabled":true}},
+               {"app_id":"c","cache":{}},
+               {"app_id":"d","cache":null,"session_cookies":null},
+               {"app_id":"e","cache":{"Enabled":true,"RULES":[{"PREFIX":"/x","future":1}],"future":2}}]}"#,
+        )
+        .unwrap();
+        let a = &b.apps[0];
+        assert_eq!(a.session_cookies, ["MyAuth", "sb-token"]);
+        let cache = a.cache.clone().unwrap();
+        assert_eq!(
+            (
+                cache.enabled,
+                cache.default_ttl_s,
+                cache.stale_if_error_s,
+                cache.disk_bytes,
+                cache.memory_bytes,
+                cache.max_object_bytes
+            ),
+            (true, Some(60), Some(0), Some(33_554_432), None, Some(1024)),
+            "a number that is absent or null is not a zero"
+        );
+        assert_eq!(cache.session_cookies, ["Sid"]);
+        assert_eq!(
+            cache.rules,
+            vec![
+                CacheRuleEntry {
+                    prefix: "/blog/".into(),
+                    action: "cache".into(),
+                    ttl_s: 120,
+                    signed_in: true
+                },
+                CacheRuleEntry {
+                    prefix: "/admin/".into(),
+                    action: "bypass".into(),
+                    ttl_s: 0,
+                    signed_in: false
+                },
+            ]
+        );
+        assert_eq!(
+            b.apps[1].cache,
+            Some(CacheEntry {
+                enabled: true,
+                ..CacheEntry::default()
+            })
+        );
+        assert_eq!(b.apps[2].cache, Some(CacheEntry::default()), "{{}} is off");
+        assert!(b.apps[3].cache.is_none() && b.apps[3].session_cookies.is_empty());
+        let e = b.apps[4].cache.clone().unwrap();
+        assert!(e.enabled);
+        assert_eq!(e.rules[0].prefix, "/x");
+        for (bad, why) in [
+            (
+                r#"{"apps":[{"cache":{"disk_bytes":"big"}}]}"#,
+                "apps.cache.disk_bytes: expected an integer, got a string",
+            ),
+            (
+                r#"{"apps":[{"cache":{"rules":[{"ttl_s":"x"}]}}]}"#,
+                "apps.cache.rules.ttl_s: expected an integer, got a string",
+            ),
+            (
+                r#"{"apps":[{"cache":"on"}]}"#,
+                "apps.cache: expected an object, got a string",
+            ),
+            (
+                r#"{"apps":[{"session_cookies":[1]}]}"#,
+                "apps.session_cookies: expected a string, got a number",
+            ),
+        ] {
+            assert_eq!(decode_bundle(bad.as_bytes()).unwrap_err(), why, "{bad}");
+        }
     }
 
     #[test]

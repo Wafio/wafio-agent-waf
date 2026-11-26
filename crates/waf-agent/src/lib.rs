@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod bundle;
+pub mod cache;
 pub mod challenge_key;
 pub mod duration_text;
 pub mod engine_lib;
@@ -28,6 +29,7 @@ mod setup_ja4;
 mod setup_malware;
 pub mod siem;
 pub mod stderr_log;
+pub mod tls;
 
 use std::process::ExitCode;
 
@@ -78,11 +80,17 @@ pub fn main_entry() -> ExitCode {
 /// Startup up to exporting the engine environment, single-threaded; then the Tokio runtime.
 fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     stderr_log::init();
+    // Keeps the keys of the served certificates out of core dumps and away from ptrace.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = nix::sys::prctl::set_dumpable(false) {
+        tracing::info!("[tls] WARNING: cannot keep key material out of core dumps: {e}");
+    }
     for l in f.fill_from_env(&flags::OsEnv) {
         tracing::info!("{l}");
     }
     f.check_required()?;
     f.check_paths()?;
+    f.resolved_acme_directory()?;
     let metrics_addr =
         std::env::var(wafio_agent_io::metrics::LISTEN_ADDRESS_ENV).unwrap_or_default();
     if !metrics_addr.is_empty() {
@@ -92,6 +100,15 @@ fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     if let Some(w) = f.legacy_data_dir_warning() {
         tracing::info!("{w}");
     }
+    let keys = match tls::dir::KeyDir::open_default() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            tracing::info!(
+                "[tls] WARNING: this agent does not serve apps over HTTPS: key directory {e}"
+            );
+            None
+        }
+    };
     engine_lib::load_at_start(&f.engine_lib)?;
     for (k, v) in f.engine_env() {
         // SAFETY: no other thread exists yet (the runtime is built below); the engine crates
@@ -104,5 +121,10 @@ fn start(mut f: flags::AgentArgs) -> Result<(), String> {
     let rt = wafio_proxy::runtime_builder()
         .build()
         .map_err(|e| e.to_string())?;
-    rt.block_on(run::run_waf_agent(f, metrics_addr))
+    let res = rt.block_on(run::run_waf_agent(f, metrics_addr, keys));
+    // The drop waits for an apply on a blocking thread; the write that apply queues is waited for
+    // after it.
+    drop(rt);
+    run::finish_cache_write_blocking();
+    res
 }

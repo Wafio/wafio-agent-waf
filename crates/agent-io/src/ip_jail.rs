@@ -7,11 +7,12 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::client_ip::strip_port;
 use crate::ip_jail_guard::{
-    JAIL_EXEMPT_FORWARDED, jail_exemption_reason, log_jail_exemption, note_jail_exemption,
+    JAIL_EXEMPT_FORWARDED, JAIL_EXEMPT_FORWARDED_REMOTE_PEER, jail_exemption_reason,
+    log_jail_exemption, note_jail_exemption,
 };
 
 /// Jails `ip` for `ttl`. Called on its own thread, may block.
@@ -288,12 +289,42 @@ pub fn check_host_agent_token(in_process: bool, token_file: &str) -> Result<(), 
 
 type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
 
+/// Runs `enforce` on its own thread; a panic is counted and logged, never propagated.
+fn spawn_enforce(enforce: Enforce, ip: String, ttl: Duration) {
+    std::thread::spawn(move || {
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enforce(&ip, ttl)))
+        {
+            if let Some(hook) = AGENT_PANIC_HOOK.get() {
+                hook();
+            }
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            tracing::error!("[ip-jail] enforce panic recovered: {msg}");
+        }
+    });
+}
+
+/// Logs once that a kernel block target has no host-agent enforcer; the WAF block still applies.
+fn log_kernel_target_without_enforcer() {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::warn!(
+            "[ip-jail] block policy target kernel is set but no host-agent jail is configured (--jail-url); blocks stay in the WAF only"
+        )
+    });
+}
+
 pub struct JailTracker {
     threshold: i64,
     window: Duration,
     duration: Duration,
     max_tracked_ips: usize,
     events: Mutex<HashMap<String, Vec<Instant>>>,
+    /// Per IP, the end of the block window last pushed for a kernel block target.
+    pushed: Mutex<HashMap<String, SystemTime>>,
     enforce: Option<Enforce>,
     now: Clock,
 }
@@ -314,6 +345,7 @@ impl JailTracker {
             duration,
             max_tracked_ips: max_ips,
             events: Mutex::new(HashMap::new()),
+            pushed: Mutex::new(HashMap::new()),
             enforce,
             now: Box::new(Instant::now),
         }
@@ -355,23 +387,48 @@ impl JailTracker {
             fire
         };
         if fire && let Some(enforce) = self.enforce.clone() {
-            let (ip, ttl) = (ip.to_string(), self.duration);
-            std::thread::spawn(move || {
-                if let Err(p) =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| enforce(&ip, ttl)))
-                {
-                    if let Some(hook) = AGENT_PANIC_HOOK.get() {
-                        hook();
-                    }
-                    let msg = p
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| p.downcast_ref::<String>().cloned())
-                        .unwrap_or_default();
-                    tracing::error!("[ip-jail] enforce panic recovered: {msg}");
-                }
-            });
+            spawn_enforce(enforce, ip.to_string(), self.duration);
         }
+    }
+
+    /// Jails `ip` until `until`, the end of a block window of a kernel block target. The guard
+    /// exemptions apply; a window already pushed for `ip` is not pushed again.
+    pub fn jail_until(&self, ip: &str, until: SystemTime) {
+        if ip.is_empty() {
+            return;
+        }
+        let now = (self.now)();
+        let reason = jail_exemption_reason(now, ip);
+        if !reason.is_empty() {
+            note_jail_exemption(reason);
+            log_jail_exemption(now, ip, reason);
+            return;
+        }
+        let Some(enforce) = self.enforce.clone() else {
+            log_kernel_target_without_enforcer();
+            return;
+        };
+        let wall = SystemTime::now();
+        {
+            let mut pushed = self.pushed.lock().unwrap_or_else(|e| e.into_inner());
+            if pushed.get(ip).is_some_and(|p| *p >= until) {
+                return;
+            }
+            if pushed.len() >= self.max_tracked_ips {
+                pushed.retain(|_, p| *p > wall);
+                if pushed.len() >= self.max_tracked_ips
+                    && let Some(k) = pushed.keys().next().cloned()
+                {
+                    pushed.remove(&k);
+                }
+            }
+            pushed.insert(ip.to_string(), until);
+        }
+        let ttl = until
+            .duration_since(wall)
+            .unwrap_or_default()
+            .max(Duration::from_secs(1));
+        spawn_enforce(enforce, ip.to_string(), ttl);
     }
 
     /// In-window block events for `ip`.
@@ -431,6 +488,32 @@ pub fn report_block_to_jail(
         return;
     }
     jail.record_block(strip_port(remote_addr));
+}
+
+/// Pushes the client of a kernel-target block window to the host agent jail until `until`. A client
+/// named by forwarded headers is pushed only when the TCP peer is loopback (a web server on this
+/// host); behind any other proxy the address is not the one the kernel would drop.
+pub fn report_kernel_block_to_jail(
+    jail: Option<&JailTracker>,
+    until: SystemTime,
+    client_forwarded: bool,
+    peer_loopback: bool,
+    remote_addr: &str,
+) {
+    let Some(jail) = jail else {
+        log_kernel_target_without_enforcer();
+        return;
+    };
+    if client_forwarded && !peer_loopback {
+        note_jail_exemption(JAIL_EXEMPT_FORWARDED_REMOTE_PEER);
+        log_jail_exemption(
+            Instant::now(),
+            remote_addr,
+            JAIL_EXEMPT_FORWARDED_REMOTE_PEER,
+        );
+        return;
+    }
+    jail.jail_until(strip_port(remote_addr), until);
 }
 
 #[cfg(test)]

@@ -30,10 +30,12 @@ use wafio_bytetext::base64::STANDARD;
 use wafio_bytetext::url::{self, unescape_path_segment};
 use wafio_control::proxy_env::{self, ProxyConfig, ProxyUrl, TunnelError};
 
-/// A response: status and the (possibly capped) body.
+/// A response: status, the headers of the answer and the (possibly capped) body. After a
+/// followed redirect they are those of the last answer.
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
+    pub headers: http::HeaderMap,
     pub body: Vec<u8>,
 }
 
@@ -394,26 +396,70 @@ pub struct RequestOptions<'a> {
 
 /// How a request reaches its server.
 struct Plan {
-    peer: HttpPeer,
+    /// Every address of the server's name, tried in the order it resolved; a tunnel has one.
+    peers: Vec<HttpPeer>,
     /// The request line carries the absolute URI (plain HTTP through an HTTP proxy).
     absolute: bool,
     /// `Proxy-Authorization` for that proxy.
     proxy_auth: Option<String>,
 }
 
-/// `host:port` resolved by the system (blocking lookup off the runtime).
-async fn lookup(host: &str, port: u16, what: &'static str) -> Result<std::net::SocketAddr, String> {
+/// Every address of `host:port`, in the order the system resolved them (blocking lookup off the
+/// runtime).
+async fn lookup(
+    host: &str,
+    port: u16,
+    what: &'static str,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     let addr = proxy_env::format_host_port(host, &port.to_string());
     let host = host.to_string();
     tokio::task::spawn_blocking(move || {
         use std::net::ToSocketAddrs;
-        addr.to_socket_addrs()
+        let addrs: Vec<_> = addr
+            .to_socket_addrs()
             .map_err(|e| format!("{what}: resolve {host}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("{what}: resolve {host}: no address found"))
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("{what}: resolve {host}: no address found"));
+        }
+        Ok(addrs)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The first of `peers` that `connect` reaches. Only a failed connect moves on to the next address
+/// (a host whose IPv6 route is broken still answers on IPv4); a TLS or later error is the answer,
+/// and so is the error of the last address tried.
+async fn first_connected<T, F, Fut>(
+    peers: &[HttpPeer],
+    deadline: tokio::time::Instant,
+    mut connect: F,
+) -> Result<T, String>
+where
+    F: FnMut(HttpPeer) -> Fut,
+    Fut: std::future::Future<Output = pingora::Result<T>>,
+{
+    let mut last = "connect: no address".to_string();
+    for p in peers {
+        match connect(p.clone()).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = e.to_string();
+                let not_reached = matches!(
+                    e.etype(),
+                    pingora::ErrorType::ConnectTimedout
+                        | pingora::ErrorType::ConnectRefused
+                        | pingora::ErrorType::ConnectNoRoute
+                        | pingora::ErrorType::ConnectError
+                );
+                if !not_reached || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last)
 }
 
 fn peer(addr: std::net::SocketAddr, tls: bool, sni: &str) -> HttpPeer {
@@ -426,9 +472,9 @@ fn peer(addr: std::net::SocketAddr, tls: bool, sni: &str) -> HttpPeer {
 async fn plan(t: &Target, ua: &str, proxies: &ProxyConfig) -> Result<Plan, String> {
     let scheme = if t.tls { "https" } else { "http" };
     let Some(p) = proxies.proxy_for(scheme, &t.host, &t.port_text)? else {
-        let addr = lookup(&t.host, t.port, "connect").await?;
+        let addrs = lookup(&t.host, t.port, "connect").await?;
         return Ok(Plan {
-            peer: peer(addr, t.tls, &t.host),
+            peers: addrs.into_iter().map(|a| peer(a, t.tls, &t.host)).collect(),
             absolute: false,
             proxy_auth: None,
         });
@@ -440,11 +486,14 @@ async fn plan(t: &Target, ua: &str, proxies: &ProxyConfig) -> Result<Plan, Strin
             .port
             .parse()
             .unwrap_or(if p.scheme == "https" { 443 } else { 80 });
-        let addr = lookup(&p.host, port, "connect")
+        let addrs = lookup(&p.host, port, "connect")
             .await
             .map_err(|e| format!("connect to proxy: {e}"))?;
         return Ok(Plan {
-            peer: peer(addr, p.scheme == "https", &p.host),
+            peers: addrs
+                .into_iter()
+                .map(|a| peer(a, p.scheme == "https", &p.host))
+                .collect(),
             absolute: true,
             proxy_auth: p.basic_authorization(),
         });
@@ -455,7 +504,7 @@ async fn plan(t: &Target, ua: &str, proxies: &ProxyConfig) -> Result<Plan, Strin
     let mut peer = peer(([0, 0, 0, 0], 0).into(), t.tls, &t.host);
     peer.options.custom_l4 = Some(Arc::new(Tunnel(std::sync::Mutex::new(Some(stream)))));
     Ok(Plan {
-        peer,
+        peers: vec![peer],
         absolute: false,
         proxy_auth: None,
     })
@@ -604,15 +653,16 @@ async fn once(
     proxies: &ProxyConfig,
     deadline: tokio::time::Instant,
     in_body: &std::sync::atomic::AtomicBool,
-) -> Result<(u16, Option<String>, Vec<u8>), String> {
+) -> Result<(u16, http::HeaderMap, Vec<u8>), String> {
     let (body, headers, cap) = (o.body, o.headers, o.cap);
     let t = parse(url)?;
     let plan = plan(&t, ua, proxies).await?;
     let connector = Connector::new(None);
-    let (mut s, _) = connector
-        .get_http_session(&plan.peer)
-        .await
-        .map_err(|e| e.to_string())?;
+    let c = &connector;
+    let (mut s, _) = first_connected(&plan.peers, deadline, |p| async move {
+        c.get_http_session(&p).await
+    })
+    .await?;
     // Whatever is left of the one deadline the whole exchange shares.
     let timeout = deadline
         .saturating_duration_since(tokio::time::Instant::now())
@@ -655,15 +705,9 @@ async fn once(
     }
     s.finish_request_body().await.map_err(|e| e.to_string())?;
     s.read_response_header().await.map_err(|e| e.to_string())?;
-    let (status, location) = {
+    let (status, headers) = {
         let h = s.response_header().ok_or("no response header")?;
-        (
-            h.status.as_u16(),
-            h.headers
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from),
-        )
+        (h.status.as_u16(), h.headers.clone())
     };
     in_body.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut body = Vec::new();
@@ -680,7 +724,7 @@ async fn once(
         }
     }
     s.shutdown().await;
-    Ok((status, location, body))
+    Ok((status, headers, body))
 }
 
 /// `method` on `url`, following redirects (at most 10 requests; 301/302/303 turn any method
@@ -748,7 +792,7 @@ pub async fn request_via(
             Ok(r) => Ok(r),
             Err(_) => Err(()),
         };
-        let (status, location, body) = match outcome {
+        let (status, headers, body) = match outcome {
             Ok(r) => r?,
             // The body read reports the bare cause; before that the error names the method and URL.
             Err(()) if in_body.load(std::sync::atomic::Ordering::Relaxed) => {
@@ -765,6 +809,10 @@ pub async fn request_via(
             }
         };
         last.clone_from(&url);
+        let location = headers
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
         match (status, location) {
             // A 3xx without a Location (or an empty one) is returned as it is.
             (301 | 302 | 303 | 307 | 308, Some(loc)) if o.follow && !loc.is_empty() => {
@@ -777,7 +825,13 @@ pub async fn request_via(
                     o.body = None;
                 }
             }
-            _ => return Ok(Response { status, body }),
+            _ => {
+                return Ok(Response {
+                    status,
+                    headers,
+                    body,
+                });
+            }
         }
     }
     Err(format!(
@@ -837,6 +891,49 @@ pub(crate) fn block_on<T>(f: impl std::future::Future<Output = T>) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_address_moves_on_to_the_next_and_a_tls_error_does_not() {
+        let peers: Vec<HttpPeer> = (1..=2)
+            .map(|i| peer(([127, 0, 0, i], 443).into(), true, "h"))
+            .collect();
+        fn fail<T>(t: pingora::ErrorType) -> pingora::Result<T> {
+            Err(pingora::Error::explain(t, "test"))
+        }
+        let later = tokio::time::Instant::now() + Duration::from_secs(60);
+        let run = |first: pingora::ErrorType, deadline| {
+            let mut tried = 0;
+            let got = block_on(first_connected(&peers, deadline, |_| {
+                tried += 1;
+                std::future::ready(if tried == 1 {
+                    fail(first.clone())
+                } else {
+                    Ok(tried)
+                })
+            }));
+            (got.map_err(|e| e.contains("test")), tried)
+        };
+        assert_eq!(run(pingora::ErrorType::ConnectRefused, later), (Ok(2), 2));
+        assert_eq!(run(pingora::ErrorType::ConnectTimedout, later), (Ok(2), 2));
+        assert_eq!(run(pingora::ErrorType::ConnectNoRoute, later), (Ok(2), 2));
+        assert_eq!(
+            run(pingora::ErrorType::TLSHandshakeFailure, later),
+            (Err(true), 1)
+        );
+        assert_eq!(run(pingora::ErrorType::InvalidCert, later), (Err(true), 1));
+        let past = tokio::time::Instant::now();
+        assert_eq!(
+            run(pingora::ErrorType::ConnectRefused, past),
+            (Err(true), 1)
+        );
+        let mut tried = 0;
+        let all_refused = block_on(first_connected(&peers, later, |_| {
+            tried += 1;
+            std::future::ready(fail::<()>(pingora::ErrorType::ConnectRefused))
+        }));
+        assert!(all_refused.unwrap_err().contains("test"));
+        assert_eq!(tried, 2);
+    }
 
     #[test]
     fn url_parts_and_redirects() {
@@ -1223,6 +1320,92 @@ mod tests {
             "a 303 keeps HEAD: {}",
             heads[1]
         );
+    }
+
+    /// What an ACME client needs: its headers and body go out as they are, and the headers of the
+    /// answer come back (a nonce, a location, the links), also those of a redirect that is not
+    /// followed.
+    #[test]
+    fn request_headers_and_a_body_go_out_and_the_headers_of_the_answer_come_back() {
+        let (port, seen) = serve(|i, _| {
+            match i {
+            0 => "HTTP/1.1 201 Created\r\nReplay-Nonce: n1\r\nLink: <https://ca/up>;rel=\"up\"\r\nLink: <https://ca/alt>;rel=\"alternate\"\r\nContent-Length: 2\r\n\r\nok".into(),
+            _ => "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nReplay-Nonce: n2\r\nContent-Length: 0\r\n\r\n".into(),
+        }
+        });
+        let url = format!("http://127.0.0.1:{port}/new-order");
+        let send = |url: &str| {
+            block_on(request_with(
+                "POST",
+                url,
+                "t/1",
+                &RequestOptions {
+                    body: Some(("application/jose+json", b"{}")),
+                    headers: &[("X-Thing", "1"), ("Accept", "application/json")],
+                    follow: false,
+                    cap: 1 << 20,
+                    truncate: false,
+                    timeout: Duration::from_secs(10),
+                },
+            ))
+            .unwrap()
+        };
+        let r = send(&url);
+        let h = seen.recv().unwrap();
+        assert!(h.starts_with("POST /new-order HTTP/1.1\r\n"), "{h}");
+        assert_eq!(header(&h, "content-type"), ["application/jose+json"]);
+        assert_eq!(header(&h, "content-length"), ["2"]);
+        assert_eq!(header(&h, "x-thing"), ["1"]);
+        assert_eq!(header(&h, "accept"), ["application/json"]);
+        assert_eq!(header(&h, "user-agent"), ["t/1"]);
+        assert_eq!((r.status, r.body.as_slice()), (201, &b"ok"[..]));
+        assert_eq!(r.headers["replay-nonce"], "n1");
+        let links: Vec<_> = r.headers.get_all("link").iter().collect();
+        assert_eq!(links.len(), 2, "every header of one name is kept");
+        // A redirect is returned as it is when it is not to be followed, with its headers.
+        let r = send(&url);
+        assert_eq!(
+            (r.status, r.headers["location"].to_str().unwrap()),
+            (302, "/elsewhere")
+        );
+        assert_eq!(r.headers["replay-nonce"], "n2");
+        assert_eq!(seen.try_iter().count(), 1, "one request, not two");
+    }
+
+    /// An answer is read whole up to the cap: past it the read is an error, or, when the caller
+    /// asks to truncate, the body is cut there.
+    #[test]
+    fn an_answer_over_the_cap_is_an_error_unless_the_caller_truncates() {
+        let body = "x".repeat(500);
+        let reply = move |_, _| format!("HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n{body}");
+        let get = |url: &str, cap: usize, truncate: bool| {
+            block_on(request_with(
+                "GET",
+                url,
+                "t/1",
+                &RequestOptions {
+                    body: None,
+                    headers: &[],
+                    follow: true,
+                    cap,
+                    truncate,
+                    timeout: Duration::from_secs(10),
+                },
+            ))
+        };
+        let (port, _) = serve(reply.clone());
+        let url = format!("http://127.0.0.1:{port}/");
+        assert_eq!(
+            get(&url, 500, false).unwrap().body.len(),
+            500,
+            "exactly the cap is fine"
+        );
+        let (port, _) = serve(reply.clone());
+        let e = get(&format!("http://127.0.0.1:{port}/"), 499, false).unwrap_err();
+        assert_eq!(e, "response body larger than 499 bytes");
+        let (port, _) = serve(reply);
+        let r = get(&format!("http://127.0.0.1:{port}/"), 100, true).unwrap();
+        assert_eq!((r.status, r.body.len()), (200, 100));
     }
 
     /// The timeout is one deadline for the whole exchange, redirects included, and its text

@@ -1,131 +1,16 @@
 //! FastCGI routes through the public API (the client's own protocol tests are agent-io's):
 //! CGI params from the forwarded request-target, client headers, one connection for each
-//! request with no FCGI_KEEP_CONN, PHP-FPM end to end when `php-fpm8.3` (or $WAFIO_TEST_PHP_FPM)
-//! exists.
+//! request with no FCGI_KEEP_CONN by default, connections kept and reused when the app asks
+//! for it, idle connections reaped after `idle_conn_ms`, the pool closed when the route goes,
+//! PHP-FPM end to end when `php-fpm8.3` (or $WAFIO_TEST_PHP_FPM) exists.
 
 mod common;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
-#[derive(Clone, Default)]
-struct Fake {
-    accepts: Arc<AtomicUsize>,
-    open: Arc<AtomicUsize>,
-    /// The flags byte of each FCGI_BEGIN_REQUEST.
-    begin_flags: Arc<Mutex<Vec<u8>>>,
-    params: Arc<Mutex<Vec<HashMap<String, String>>>>,
-}
-
-/// Minimal FastCGI responder: echoes stdin, `X-Conn: <connection number>`. It never closes a connection
-/// itself, so `open` falls only when the agent closes one.
-async fn fake_fcgi() -> (SocketAddr, Fake) {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    let f = Fake::default();
-    let f2 = f.clone();
-    tokio::spawn(async move {
-        loop {
-            let (mut s, _) = l.accept().await.unwrap();
-            let id = f2.accepts.fetch_add(1, Ordering::SeqCst) + 1;
-            f2.open.fetch_add(1, Ordering::SeqCst);
-            let f3 = f2.clone();
-            tokio::spawn(async move {
-                'conn: loop {
-                    let (mut params, mut stdin) = (Vec::new(), Vec::new());
-                    loop {
-                        let mut h = [0u8; 8];
-                        if s.read_exact(&mut h).await.is_err() {
-                            break 'conn;
-                        }
-                        let len = (h[4] as usize) << 8 | h[5] as usize;
-                        let mut c = vec![0; len + h[6] as usize];
-                        s.read_exact(&mut c).await.unwrap();
-                        c.truncate(len);
-                        match (h[1], len) {
-                            (1, _) => f3.begin_flags.lock().unwrap().push(c[2]),
-                            (4, _) => params.extend_from_slice(&c),
-                            (5, 0) => break,
-                            (5, _) => stdin.extend_from_slice(&c),
-                            _ => {}
-                        }
-                    }
-                    f3.params.lock().unwrap().push(decode_params(&params));
-                    let mut out = format!(
-                        "Status: 201 Created\r\nX-Conn: {id}\r\nContent-Type: text/plain\r\n\r\n"
-                    )
-                    .into_bytes();
-                    out.extend_from_slice(&stdin);
-                    let mut w = Vec::new();
-                    for chunk in out.chunks(65535) {
-                        w.extend_from_slice(&[
-                            1,
-                            6,
-                            0,
-                            1,
-                            (chunk.len() >> 8) as u8,
-                            chunk.len() as u8,
-                            0,
-                            0,
-                        ]);
-                        w.extend_from_slice(chunk);
-                    }
-                    w.extend_from_slice(&[
-                        1, 6, 0, 1, 0, 0, 0, 0, 1, 3, 0, 1, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    ]);
-                    if s.write_all(&w).await.is_err() {
-                        break;
-                    }
-                }
-                f3.open.fetch_sub(1, Ordering::SeqCst);
-            });
-        }
-    });
-    (addr, f)
-}
-
-fn decode_params(mut b: &[u8]) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    let len = |b: &mut &[u8]| {
-        if b[0] < 128 {
-            let n = b[0] as usize;
-            *b = &b[1..];
-            n
-        } else {
-            let n = (u32::from_be_bytes([b[0], b[1], b[2], b[3]]) & 0x7fff_ffff) as usize;
-            *b = &b[4..];
-            n
-        }
-    };
-    while !b.is_empty() {
-        let (k, v) = (len(&mut b), len(&mut b));
-        m.insert(
-            String::from_utf8_lossy(&b[..k]).into(),
-            String::from_utf8_lossy(&b[k..k + v]).into(),
-        );
-        b = &b[k + v..];
-    }
-    m
-}
-
-fn fcgi_app(
-    port: u16,
-    upstream: String,
-    doc_root: &str,
-    proxy_config: &str,
-) -> wafio_proxy::AppSpec {
-    let mut a = app("php", port, &upstream);
-    a.fcgi_doc_root = doc_root.into();
-    a.proxy_config = proxy_config.as_bytes().to_vec();
-    a
-}
 
 #[tokio::test]
 async fn route_answers_over_fastcgi_with_cgi_params() {
@@ -229,6 +114,65 @@ async fn no_connection_stays_open_after_a_request() {
 }
 
 #[tokio::test]
+async fn an_app_that_keeps_connections_reuses_one_with_keep_conn_set() {
+    let (addr, fake) = fake_fcgi().await;
+    let (_h, proxy) = Harness::serve(vec![keeping_connections(fcgi_app(
+        free_port(),
+        format!("fcgi://{addr}"),
+        "/srv",
+        "",
+    ))]);
+    let mut c = Client::connect(proxy).await.unwrap();
+    for _ in 0..3 {
+        let resp = c.send(&get("/")).await.unwrap();
+        assert_eq!((resp.status, resp.header("x-conn")), (201, Some("1")));
+    }
+    assert_eq!(fake.accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(*fake.begin_flags.lock().unwrap(), [1, 1, 1]);
+    assert_eq!(fake.open.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn idle_connection_is_reaped_and_route_removal_closes_the_pool() {
+    let (addr, fake) = fake_fcgi().await;
+    let (p1, p2) = (free_port(), free_port());
+    let (h, proxy) = Harness::serve(vec![keeping_connections(fcgi_app(
+        p1,
+        format!("fcgi://{addr}"),
+        "/srv",
+        r#"{"idle_conn_ms":200}"#,
+    ))]);
+    assert_eq!(one(proxy, &get("/")).await.status, 201);
+    assert_eq!(fake.open.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fake.open.load(Ordering::SeqCst),
+        0,
+        "reaper closed the idle connection (slot released)"
+    );
+
+    // A long-lived pool: its kept connection pins a PHP-FPM worker until the route goes.
+    h.proxy
+        .apply(vec![keeping_connections(fcgi_app(
+            p2,
+            format!("fcgi://{addr}"),
+            "/srv",
+            "",
+        ))])
+        .unwrap();
+    let p2: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
+    assert_eq!(one(p2, &get("/")).await.status, 201);
+    assert_eq!(fake.open.load(Ordering::SeqCst), 1);
+    h.proxy.apply(vec![]).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fake.open.load(Ordering::SeqCst),
+        0,
+        "pooled FastCGI connection of the removed route closed"
+    );
+}
+
+#[tokio::test]
 async fn fastcgi_down_is_502() {
     let port = free_port();
     let (h, proxy) = Harness::serve(vec![fcgi_app(
@@ -265,8 +209,11 @@ impl Drop for Fpm {
 }
 
 fn start_fpm(bin: &str, max_children: usize) -> Fpm {
+    let port = free_port();
+    // One directory per server: the tests run in parallel, and two servers reading one config
+    // would both listen on the same address.
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("fpm-{}", std::process::id()));
+        .join(format!("fpm-{}-{port}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("www")).unwrap();
     std::fs::write(
@@ -274,7 +221,7 @@ fn start_fpm(bin: &str, max_children: usize) -> Fpm {
         "<?php http_response_code(201); header('X-Worker: '.getmypid()); echo $_SERVER['REQUEST_METHOD'], ' ', $_SERVER['SCRIPT_FILENAME'], ' ', file_get_contents('php://input');",
     )
     .unwrap();
-    let addr = format!("127.0.0.1:{}", free_port());
+    let addr = format!("127.0.0.1:{port}");
     let conf = format!(
         "[global]\npid = {d}/fpm.pid\nerror_log = {d}/fpm.log\ndaemonize = no\n[www]\nlisten = {addr}\npm = static\npm.max_children = {max_children}\nclear_env = no\n",
         d = dir.display()
@@ -329,5 +276,38 @@ async fn php_fpm_end_to_end() {
     for _ in 0..5 {
         let r = c.send(&get("/")).await.unwrap();
         assert_eq!(r.status, 201, "{:?}", r.text());
+    }
+}
+
+#[tokio::test]
+async fn php_fpm_with_keep_conn_serves_every_request_from_one_worker() {
+    let Some(bin) = php_fpm() else {
+        return eprintln!("skipped: no php-fpm");
+    };
+    let fpm = start_fpm(&bin, 2);
+    let (_h, proxy) = Harness::serve(vec![keeping_connections(fcgi_app(
+        free_port(),
+        format!("fcgi://{}", fpm.addr),
+        &fpm.root.display().to_string(),
+        "",
+    ))]);
+    let mut c = Client::connect(proxy).await.unwrap();
+    let r1 = c
+        .send(&post("/app/route", "text/plain", b"hello"))
+        .await
+        .unwrap();
+    assert_eq!(r1.status, 201, "{:?}", r1.text());
+    assert_eq!(
+        r1.text(),
+        format!("POST {}/index.php hello", fpm.root.display())
+    );
+    let worker = r1.header("x-worker").unwrap().to_string();
+    for _ in 0..5 {
+        let r = c.send(&get("/")).await.unwrap();
+        assert_eq!(
+            r.header("x-worker"),
+            Some(worker.as_str()),
+            "the kept connection stays on one worker"
+        );
     }
 }

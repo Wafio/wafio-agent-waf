@@ -14,6 +14,31 @@ path = "src/main.rs"
 # An agent that accepts an engine library owned by the user it runs as. For tests that cannot be root; a release build
 # never enables it.
 test-owner = ["wafio-engine-loader/test-owner"]
+# An agent whose key directory is the one WAFIO_TEST_TLS_DIR names, for tests that cannot own the fixed path; a release
+# build never enables it.
+test-tls = []
+# An agent that waits WAFIO_TEST_CACHE_WRITE_DELAY_MS milliseconds before it writes the bundle cache, for tests that signal it
+# while a write is pending; a release build never enables it.
+test-cache-delay = []
+# An agent whose response cache directory is the one WAFIO_TEST_CACHE_DIR names, for tests that cannot make the fixed one; a
+# release build never enables it.
+test-response-cache = []
+
+# These start the binary with a key directory of its own, which only a build with test-tls reads from the environment; the
+# control plane test also expects the Hello of an agent that has one, and starts it with a cache directory of its own
+# (test-response-cache); the part of it that holds cache writes back needs test-cache-delay as well and is left out of a build
+# without it.
+[[test]]
+name = "tls_bundle"
+required-features = ["test-tls"]
+
+[[test]]
+name = "control_plane"
+required-features = ["test-tls", "test-response-cache"]
+
+[[test]]
+name = "cache_perf"
+required-features = ["test-tls", "test-response-cache"]
 
 [dependencies]
 wafio-agent-io.workspace = true
@@ -33,16 +58,26 @@ uddin-waf.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
+http.workspace = true
+http-body.workspace = true
+instant-acme.workspace = true
 libc.workspace = true
 nix.workspace = true
 mimalloc.workspace = true
 pingora.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+x509-parser.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 sha2.workspace = true
+# start_paused: the status pacing is seconds and minutes long.
+tokio = { workspace = true, features = ["test-util"] }
 tonic.workspace = true
 wafio-proto.workspace = true
